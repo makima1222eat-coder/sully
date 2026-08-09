@@ -303,11 +303,11 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     // ── 6. 思考链提示词 ───────────────────────────────────
     const thinkingActive = !!thinkingChain?.enabled;
     if (thinkingActive) {
-        const userName = (userProfile?.name && userProfile.name.trim()) || '用户';
+        const userName = (userProfile?.name && userProfile.name.trim()) || 'the user';
         systemPrompt += `\n\n${buildThinkingChainPrompt(char.name, userName)}`;
         const extra = (thinkingChain?.customPrompt || '').trim();
         if (extra) {
-            systemPrompt += `\n\n## 用户对内心独白的额外要求\n${extra}`;
+            systemPrompt += `\n\n## ${userName}'s Extra Requirements for the Inner Monologue\n${extra}`;
         }
     }
 
