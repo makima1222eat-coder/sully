@@ -88,7 +88,7 @@ describe('DatePrompts.buildSessionPayload', () => {
         expect(sysOf(off.messages)).not.toContain('深挖，别填充');
         expect(off.messages[off.messages.length - 1].content).not.toContain('本轮线索');
         // ContextBuilder 的全 App 通用精简版（表达底线）不受 digDeeper 开关影响，常驻
-        expect(sysOf(off.messages)).toContain('表达底线');
+        expect(sysOf(off.messages)).toContain('Expression Baseline');
     });
 
     it('消息结构为 [system, ...history, user]，末尾带 System Note；reroll 的 note 不同', async () => {

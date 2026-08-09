@@ -57,13 +57,13 @@ describe('timelyByWorker —— 时效段交给 worker，前端这份不重复�
     it('timelyByWorker: 时钟与真实世界块不进 volatileTail，MCP 块与 tail reminder 不注入', async () => {
         const withMode = await buildChatRequestPayload({ ...baseInput(), timelyByWorker: true });
         const joined = joinMessages(withMode.fullMessages);
-        expect(joined).not.toContain('### 当前时间 (Now)');
+        expect(joined).not.toContain('### Current Time (Now)');
         expect(joined).not.toContain('【真实世界感知系统】');
-        expect(joined).not.toContain('【今日特殊】');
+        expect(joined).not.toContain('【Special Today】');
         expect(joined).not.toContain('[外部工具已接入');
         expect(joined).not.toContain('[MCP 工具 ON');
         // 本地私有段仍在（抽一个代表：实时状态框定行本身还在，说明 volatile 段没被整段砍掉）
-        expect(joined).toContain('[System: 实时状态 (Live Context)]');
+        expect(joined).toContain('[System: Live Context]');
         // 只掐文字注入，不改「这一轮算不算 MCP 模式」——上层还靠它决定要不要带 tools。
         expect(withMode.flags.mcpChatActive).toBe(true);
     });
@@ -71,7 +71,7 @@ describe('timelyByWorker —— 时效段交给 worker，前端这份不重复�
     it('默认构建（不带 timelyByWorker）行为不变：时间块照常注入', async () => {
         const normal = await buildChatRequestPayload({ ...baseInput() });
         const joined = joinMessages(normal.fullMessages);
-        expect(joined).toContain('### 当前时间 (Now)');
+        expect(joined).toContain('### Current Time (Now)');
         // 上一条的 not.toContain 要有意义，得先确认默认构建里这几段真的在
         expect(joined).toContain('【真实世界感知系统】');
         expect(joined).toContain('[外部工具已接入');
@@ -97,11 +97,11 @@ describe('timelyByWorker —— 时效段交给 worker，前端这份不重复�
         const quietConfig = { weatherEnabled: false, newsEnabled: false } as any;
 
         const normal = await buildChatRequestPayload({ ...baseInput(), realtimeConfig: quietConfig });
-        expect(joinMessages(normal.fullMessages)).toContain('【今日特殊】');
+        expect(joinMessages(normal.fullMessages)).toContain('【Special Today】');
 
         const withMode = await buildChatRequestPayload({
             ...baseInput(), realtimeConfig: quietConfig, timelyByWorker: true,
         });
-        expect(joinMessages(withMode.fullMessages)).not.toContain('【今日特殊】');
+        expect(joinMessages(withMode.fullMessages)).not.toContain('【Special Today】');
     });
 });
