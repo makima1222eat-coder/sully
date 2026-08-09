@@ -408,6 +408,17 @@ const FIXED_PROMPT_LABEL_PREFIXES = [
     '别造谣',
     '温度:脑内比嘴上更吵',
     'Thinking 写法总则',
+    // thinkingChainPrompt 英文化后的章节头（中文旧前缀保留，兼容历史日志）
+    'Language Iron Rule',
+    "You're Not Playing the Part",
+    'Starting Point:',
+    'Multiple Things Firing at Once',
+    "Don't Rush to Comfort",
+    'No Fabricating',
+    'Temperature:',
+    'General Thinking Style Rules',
+    'Thinking Exemplar',
+    'Final Check Before Entering Thinking',
 ];
 
 export const isFixedPromptBlockLabel = (label: string): boolean =>
