@@ -389,6 +389,14 @@ const FIXED_PROMPT_LABEL_PREFIXES = [
     '最后，回到你自己',
     '【音乐互动工具】',
     '关于《彼方》',
+    // chatPrompts/context 英文化后的对应块头（中文旧前缀保留，兼容历史日志）
+    'Chat App Rules',
+    'Expression Baseline',
+    '🎤 Voice Messages',
+    'On What They Express',
+    'Finally, Return to Yourself',
+    '【Music Interaction Tools】',
+    'About 《彼方》',
     '[MCP 工具 ON',
     '[Reminder:',
     // 思考链提示词（thinkingChainPrompt.ts）的章节头

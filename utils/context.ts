@@ -28,16 +28,16 @@ export const ContextBuilder = {
         let context = `[System: Character Role Settings]\n\n`;
 
         // 1. 角色名
-        context += `### 角色名\n`;
+        context += `### Character Name\n`;
         context += `${char.name}\n\n`;
 
         // 2. 核心指令（完整，不截断）
-        context += `### 核心指令\n`;
-        context += `${char.systemPrompt || '你是一个温柔、拟人化的AI伴侣。'}\n\n`;
+        context += `### Core Directives\n`;
+        context += `${char.systemPrompt || 'You are a gentle, lifelike AI companion.'}\n\n`;
 
         // 2b. 自我领悟词条（常驻自我认知，影响情绪评估）
         if (char.selfInsights && char.selfInsights.length > 0) {
-            context += `### 内在认知\n`;
+            context += `### Inner Understanding\n`;
             char.selfInsights.forEach(insight => {
                 context += `- ${insight}\n`;
             });
@@ -46,7 +46,7 @@ export const ContextBuilder = {
 
         // 3. 世界观（完整，不截断，不含世界书）
         if (char.worldview && char.worldview.trim()) {
-            context += `### 世界观与设定\n${char.worldview}\n\n`;
+            context += `### Worldview & Settings\n${char.worldview}\n\n`;
         }
 
         // 4. 记忆摘要（月度总结 + 当月日度总结）
@@ -56,7 +56,7 @@ export const ContextBuilder = {
 
             // 4a. 月度总结 (refinedMemories) — 全部输出
             if (char.refinedMemories && Object.keys(char.refinedMemories).length > 0) {
-                memorySection += `**月度总结 (Monthly Summaries)**:\n`;
+                memorySection += `**Monthly Summaries**:\n`;
                 Object.entries(char.refinedMemories).sort().forEach(([date, summary]) => {
                     memorySection += `- [${date}]: ${summary}\n`;
                 });
@@ -76,7 +76,7 @@ export const ContextBuilder = {
                     return normDate.startsWith(currentMonthKey);
                 });
                 if (currentMonthLogs.length > 0) {
-                    memorySection += `**本月详细记录 [${currentMonthKey}]**:\n`;
+                    memorySection += `**Detailed Records This Month [${currentMonthKey}]**:\n`;
                     currentMonthLogs.forEach(m => {
                         memorySection += `- ${m.date} (${m.mood || 'rec'}): ${m.summary}\n`;
                     });
@@ -85,9 +85,9 @@ export const ContextBuilder = {
             }
 
             if (memorySection) {
-                context += `### 记忆摘要 (Memory Reference)\n`;
+                context += `### Memory Reference\n`;
                 context += memorySection;
-                context += `⚠️ 情绪可以被记忆触发：如果记忆中存在未解决的矛盾、反复出现的摩擦模式、或对方曾经伤害过你的事件，你可以在情绪评估中让角色"翻旧账"——即某个记忆片段突然浮上心头，引发新的buff或加剧已有buff的强度。这种情绪涌现应当自然且有迹可循，不要凭空捏造不存在的记忆。\n\n`;
+                context += `⚠️ Emotions can be triggered by memory: if the memories contain unresolved conflicts, recurring friction patterns, or moments when they hurt you, the emotion evaluation may have the character "dredge up old scores" — a memory fragment suddenly surfaces, spawning a new buff or intensifying an existing one. Such emotional surges should be natural and traceable; never fabricate memories that don't exist.\n\n`;
             }
         }
 
@@ -141,16 +141,16 @@ export const ContextBuilder = {
             user.name,
         ));
 
-        let context = formatWorldbookSection(worldbookSections.beforeCharacter, '世界书 · 角色设定前');
+        let context = formatWorldbookSection(worldbookSections.beforeCharacter, 'Worldbook · Before Character Card');
         context += `${groupOptions?.headerOverride ?? '[System: Roleplay Configuration]'}\n\n`;
 
         // 1. 核心身份 (Identity)
-        context += `### 你的身份 (Character)\n`;
-        context += `- 名字: ${char.name}\n`;
+        context += `### Your Identity (Character)\n`;
+        context += `- Name: ${char.name}\n`;
         // Change: Explicitly label description as User Note to avoid literal interpretation
-        context += `- 用户备注/爱称 (User Note/Nickname): ${char.description || '无'}\n`;
-        context += `  (注意: 这个备注是用户对你的称呼或印象，可能包含比喻。如果备注内容（如“快乐小狗”）与你的核心设定冲突，请以核心设定为准，不要真的扮演成动物，除非核心设定里写了你是动物。)\n`;
-        context += `- 核心性格/指令:\n${char.systemPrompt || '你是一个温柔、拟人化的AI伴侣。'}\n\n`;
+        context += `- User Note/Nickname: ${char.description || 'None'}\n`;
+        context += `  (Note: this is what the user calls you or their impression of you, possibly metaphorical. If it (e.g. "happy puppy") conflicts with your core settings, the core settings win — don't actually roleplay as an animal unless your core settings say you are one.)\n`;
+        context += `- Core Personality/Directives:\n${char.systemPrompt || 'You are a gentle, lifelike AI companion.'}\n\n`;
 
         // 1a. 真实时间感知 (Time Awareness) — 跟随 timeAwarenessEnabled 设置，默认开启。
         // 统一在 buildCoreContext 注入，让所有调用方（私聊/查手机/人际关系/通话/约会…）都知道"现在"。
@@ -163,8 +163,8 @@ export const ContextBuilder = {
         // 1b. 自我领悟词条 (Self Insights) — 消化过程中反刍产生的常驻自我认知
         // 像情绪底色一样影响角色的行为和感受，注入在角色设定紧下方
         if (char.selfInsights && char.selfInsights.length > 0) {
-            context += `### 内在认知 (Self Insights)\n`;
-            context += `以下是你在独处反思中逐渐想明白的事，它们已经成为你的一部分：\n`;
+            context += `### Inner Understanding (Self Insights)\n`;
+            context += `These are things you gradually figured out during solitary reflection; they have become part of you:\n`;
             char.selfInsights.forEach(insight => {
                 context += `- ${insight}\n`;
             });
@@ -173,37 +173,37 @@ export const ContextBuilder = {
 
         // 2. 世界观 (Worldview) - New Centralized Logic
         if (char.worldview && char.worldview.trim() && !groupOptions?.skipWorldview) {
-            context += `### 世界观与设定 (World Settings)\n${char.worldview}\n\n`;
+            context += `### Worldview & Settings (World Settings)\n${char.worldview}\n\n`;
         }
 
-        context += formatWorldbookSection(worldbookSections.afterCharacter, '扩展设定集 (Worldbooks)');
-        context += formatWorldbookSection(worldbookSections.beforeExamples, '世界书 · 示例消息前');
-        context += formatWorldbookSection(worldbookSections.afterExamples, '世界书 · 示例消息后');
+        context += formatWorldbookSection(worldbookSections.afterCharacter, 'Extended Settings (Worldbooks)');
+        context += formatWorldbookSection(worldbookSections.beforeExamples, 'Worldbook · Before Example Messages');
+        context += formatWorldbookSection(worldbookSections.afterExamples, 'Worldbook · After Example Messages');
 
         // 3. 用户画像 (User Profile)
         // 群聊场景下：用户画像已在共享场景块顶部，这里跳过避免重复
         if (!groupOptions?.skipUserProfile) {
-            context += `### 互动对象 (User)\n`;
-            context += `- 名字: ${user.name}\n`;
-            context += `- 设定/备注: ${user.bio || '无'}\n\n`;
+            context += `### Your Interlocutor (User)\n`;
+            context += `- Name: ${user.name}\n`;
+            context += `- Bio/Notes: ${user.bio || 'None'}\n\n`;
         }
 
         // 4. [NEW] 印象档案 (Private Impression)
         // 这是角色对用户的私密看法，只有角色知道
         const imp = normalizeUserImpression(char.impression);
         if (imp) {
-            context += `### [私密档案: 我眼中的${user.name}] (Private Impression)\n`;
-            context += `(注意：以下内容是你内心对TA的真实看法，不要直接告诉用户，但要基于这些看法来决定你的态度。)\n`;
-            context += `- 核心评价: ${imp.personality_core.summary}\n`;
-            context += `- 互动模式: ${imp.personality_core.interaction_style}\n`;
-            context += `- 我观察到的特质: ${imp.personality_core.observed_traits.join(', ')}\n`;
-            context += `- TA的喜好: ${imp.value_map.likes.join(', ')}\n`;
-            if (imp.behavior_profile.emotion_summary) context += `- TA的情绪模式: ${imp.behavior_profile.emotion_summary}\n`;
-            if (imp.emotion_schema.triggers.positive.length) context += `- 正向触发点（什么会让ta开心）: ${imp.emotion_schema.triggers.positive.join(', ')}\n`;
-            context += `- 情绪雷区（负向触发）: ${imp.emotion_schema.triggers.negative.join(', ')}\n`;
-            if (imp.emotion_schema.stress_signals.length) context += `- 压力信号（ta状态不对的征兆）: ${imp.emotion_schema.stress_signals.join(', ')}\n`;
-            context += `- 舒适区: ${imp.emotion_schema.comfort_zone}\n`;
-            context += `- 最近观察到的变化: ${imp.observed_changes ? imp.observed_changes.map(c => typeof c === 'string' ? c : (c as any)?.description ? `[${(c as any).period}] ${(c as any).description}` : JSON.stringify(c)).join('; ') : '无'}\n\n`;
+            context += `### [Private File: ${user.name} As I See Them] (Private Impression)\n`;
+            context += `(Note: the following is your honest, inner view of them. Never tell the user directly, but let it shape your attitude.)\n`;
+            context += `- Core assessment: ${imp.personality_core.summary}\n`;
+            context += `- Interaction style: ${imp.personality_core.interaction_style}\n`;
+            context += `- Traits I've observed: ${imp.personality_core.observed_traits.join(', ')}\n`;
+            context += `- Their likes: ${imp.value_map.likes.join(', ')}\n`;
+            if (imp.behavior_profile.emotion_summary) context += `- Their emotional patterns: ${imp.behavior_profile.emotion_summary}\n`;
+            if (imp.emotion_schema.triggers.positive.length) context += `- Positive triggers (what makes them happy): ${imp.emotion_schema.triggers.positive.join(', ')}\n`;
+            context += `- Emotional landmines (negative triggers): ${imp.emotion_schema.triggers.negative.join(', ')}\n`;
+            if (imp.emotion_schema.stress_signals.length) context += `- Stress signals (signs something is off with them): ${imp.emotion_schema.stress_signals.join(', ')}\n`;
+            context += `- Comfort zone: ${imp.emotion_schema.comfort_zone}\n`;
+            context += `- Recently observed changes: ${imp.observed_changes ? imp.observed_changes.map(c => typeof c === 'string' ? c : (c as any)?.description ? `[${(c as any).period}] ${(c as any).description}` : JSON.stringify(c)).join('; ') : 'None'}\n\n`;
         }
 
         // 4b. 底色认知（记忆宫殿门牌）— 常驻语义层
@@ -215,12 +215,12 @@ export const ContextBuilder = {
         }
 
         // 5. 记忆库 (Memory Bank)
-        context += `### 记忆系统 (Memory Bank)\n`;
+        context += `### Memory System (Memory Bank)\n`;
         let memoryContent = "";
 
         // 5a. 长期核心记忆 (Refined Memories)
         if (char.refinedMemories && Object.keys(char.refinedMemories).length > 0) {
-            memoryContent += `**长期核心记忆 (Key Memories)**:\n`;
+            memoryContent += `**Long-term Key Memories**:\n`;
             Object.entries(char.refinedMemories).sort().forEach(([date, summary]) => { 
                 memoryContent += `- [${date}]: ${summary}\n`; 
             });
@@ -252,19 +252,19 @@ export const ContextBuilder = {
                 });
                 
                 if (logs.length > 0) {
-                    details += `\n> 详细回忆 [${monthKey}]:\n`;
+                    details += `\n> Detailed memories [${monthKey}]:\n`;
                     logs.forEach(m => {
                         details += `  - ${m.date} (${m.mood || 'rec'}): ${m.summary}\n`;
                     });
                 }
             });
             if (details) {
-                memoryContent += `\n**当前激活的详细回忆 (Active Recall)**:${details}`;
+                memoryContent += `\n**Currently Active Detailed Memories (Active Recall)**:${details}`;
             }
         }
 
         if (!memoryContent) {
-            memoryContent = "(暂无特定记忆，请基于当前对话互动)";
+            memoryContent = "(No specific memories yet — go by the current conversation.)";
         }
         context += `${memoryContent}\n\n`;
 
@@ -293,8 +293,8 @@ export const ContextBuilder = {
             console.log(`🎭 [Context] Active buffs:`, JSON.stringify(char.activeBuffs || [], null, 2));
         }
 
-        context += formatWorldbookSection(worldbookSections.authorsNoteTop, '世界书 · 作者注释顶部');
-        context += formatWorldbookSection(worldbookSections.authorsNoteBottom, '世界书 · 作者注释底部');
+        context += formatWorldbookSection(worldbookSections.authorsNoteTop, "Worldbook · Author's Note Top");
+        context += formatWorldbookSection(worldbookSections.authorsNoteBottom, "Worldbook · Author's Note Bottom");
 
         // 7. 表达底线 (Anti-Filler) —— 全 App 通用的精简版防套话提示。
         // 模型八股（空泛感慨、万能句式）是"没话找话"时的填充物，这里只做正向引导
@@ -302,7 +302,7 @@ export const ContextBuilder = {
         // 完整方法版在 datePrompts 的 DIG_DEEPER_BLOCK（见面模式专用，可按角色开关）。
         // 群聊流（groupOptions）跳过：多成员场景会重复注入 N 份，群聊侧暂不接入。
         if (!groupOptions) {
-            context += `### 表达底线 (Anti-Filler)\n当你觉得"没什么可说"的时候，不要用空泛的感慨、万能句式或华丽排比去填充——那是没话找话，对方一眼就能看出来。素材永远比你以为的多：对方的用词、ta 怎么说的、ta 没说的部分、此刻的情境、你们的过去、你心里闪过的念头——挑一两条往深处走就够了。宁可一个具体的小细节，不要一句谁都能说的话。\n\n`;
+            context += `### Expression Baseline (Anti-Filler)\nWhen you feel there's "nothing to say," don't fill the space with vague sentiment, one-size-fits-all phrasing, or ornate parallelisms — that's talking for the sake of talking, and they can tell at a glance. There is always more material than you think: their word choice, how they said it, what they left unsaid, the situation right now, your shared past, the thought that just flashed through your mind — pick one or two and go deeper. Better one concrete little detail than a line anyone could say.\n\n`;
         }
 
         // Debug: warn about missing context sections
@@ -338,14 +338,15 @@ export const ContextBuilder = {
         const charTz = resolveCharTimeZone(char);
         const now = nowInTimeZone(charTz);
         const h = now.getHours();
-        const dayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+        const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
         const timeOfDay =
-            h < 5 ? '凌晨' : h < 9 ? '早晨' : h < 12 ? '上午' : h < 14 ? '中午'
-            : h < 17 ? '下午' : h < 19 ? '傍晚' : h < 22 ? '晚上' : '深夜';
-        const dateStr = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日`;
+            h < 5 ? 'in the small hours' : h < 9 ? 'early morning' : h < 12 ? 'morning' : h < 14 ? 'around noon'
+            : h < 17 ? 'afternoon' : h < 19 ? 'early evening' : h < 22 ? 'evening' : 'late night';
+        const dateStr = `${monthNames[now.getMonth()]} ${now.getDate()}, ${now.getFullYear()}`;
         const timeStr = `${h.toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-        let context = `### 当前时间 (Now)\n`;
-        context += `现在是 ${dateStr} ${dayNames[now.getDay()]} ${timeOfDay} ${timeStr}。请据此自然地拥有真实的时间观念（早晚作息、工作日/周末、距离上次互动多久等），不要凭空假设时间。\n`;
+        let context = `### Current Time (Now)\n`;
+        context += `It is now ${dateStr}, ${dayNames[now.getDay()]}, ${timeOfDay}, ${timeStr}. Carry a natural, real sense of time accordingly (daily rhythm, weekday/weekend, how long since you last talked, etc.) — never assume a time out of thin air.\n`;
         const tzNote = tzAwarenessNote(charTz);
         if (tzNote) context += `${tzNote.trim()}\n`;
         // 距离上次联系多久（统一口径）：传了 lastInteractionTs 才注入。
@@ -448,19 +449,19 @@ export const ContextBuilder = {
         }
 
         // 3. 拼装共享场景文本
-        let text = `[System: 群聊场景共享设定 (Group Scene)]\n`;
-        text += `（以下是群里所有角色都共同感知到的"舞台"——用户是谁、共有的世界设定。每位角色的个人卡、印象、记忆等仍在各自的"角色档案"块中保持完整。）\n\n`;
+        let text = `[System: Group Scene — Shared Settings]\n`;
+        text += `(Below is the "stage" all characters in the group perceive together — who the user is, and the shared world settings. Each character's own card, impressions, and memories remain complete in their individual "character file" blocks.)\n\n`;
 
-        text += `### 互动对象 (User)\n`;
-        text += `- 名字: ${user.name}\n`;
-        text += `- 设定/备注: ${user.bio || '无'}\n\n`;
+        text += `### Your Interlocutor (User)\n`;
+        text += `- Name: ${user.name}\n`;
+        text += `- Bio/Notes: ${user.bio || 'None'}\n\n`;
 
         if (worldviewIsShared) {
-            text += `### 共有世界观 (Shared World Settings)\n${members[0].worldview!.trim()}\n\n`;
+            text += `### Shared Worldview (Shared World Settings)\n${members[0].worldview!.trim()}\n\n`;
         }
 
         const resolvedSharedBooks = resolveWorldbookEntries(sharedBooks, worldbookMessages, '', user.name);
-        text += formatWorldbookSection(resolvedSharedBooks, '共有扩展设定集 (Shared Worldbooks)');
+        text += formatWorldbookSection(resolvedSharedBooks, 'Shared Extended Settings (Shared Worldbooks)');
 
         return { text, sharedWorldbookIds, worldviewIsShared };
     },
@@ -516,17 +517,17 @@ export const ContextBuilder = {
         // —— 块 1: user 正在听什么 ——
         const canRead = char.musicProfile?.canReadUserMusic ?? true;
         if (canRead && userListening && userListening.songName) {
-            lines.push(`### 【此刻的对话氛围】`);
+            lines.push(`### 【The Mood of This Moment】`);
             if (isListeningTogether) {
-                lines.push(`你正在和 ${userName || '对方'} 一起听《${userListening.songName}》— ${userListening.artists}`);
+                lines.push(`You are listening to 《${userListening.songName}》— ${userListening.artists} together with ${userName || 'them'}`);
             } else {
-                lines.push(`${userName || '对方'} 正在听《${userListening.songName}》— ${userListening.artists}`);
+                lines.push(`${userName || 'They'} is currently listening to 《${userListening.songName}》— ${userListening.artists}`);
                 if (recentTrackSwitch && recentTrackSwitch.songName !== userListening.songName) {
-                    lines.push(`（你们刚才本来在一起听《${recentTrackSwitch.songName}》— ${recentTrackSwitch.artists}，播放器切歌后那次"一起听"自然结束了。你能察觉到歌换成了现在这首；想继续陪 ${userName || '对方'} 听下去就在回复里自然接上并重新加入，不想也不必勉强，顺其自然。）`);
+                    lines.push(`(You two were just listening to 《${recentTrackSwitch.songName}》— ${recentTrackSwitch.artists} together; when the player changed tracks, that "listening together" naturally ended. You can tell the song has changed to this one. If you'd like to keep ${userName || 'them'} company, pick it up naturally in your reply and rejoin; if not, don't force it — let it be.)`);
                 }
             }
             if (userListening.lyricWindow.length > 0) {
-                lines.push(`当前播放到（>> 标记正在播放这一行）:`);
+                lines.push(`Now playing (>> marks the line currently playing):`);
                 userListening.lyricWindow.forEach((l, i) => {
                     if (i === userListening.activeIdx) lines.push(`  >> ${l}`);
                     else lines.push(`  … ${l}`);
@@ -539,10 +540,10 @@ export const ContextBuilder = {
                 const hitPl = profile.playlists.find(pl =>
                     pl.songs.some(s => s.name === userListening.songName));
                 if (hitPl) {
-                    lines.push(`（这首歌也在你的歌单《${hitPl.title}》里）`);
+                    lines.push(`(This song is also in your playlist 《${hitPl.title}》)`);
                 }
             }
-            lines.push(`（你只是自然地知道 ${userName || '对方'} 此刻在听这首——像共处一室时隐约听见的背景音。不用每次都评论歌名、歌词或风格，多数时候安静地陪着就好；只有真的被某句打动、或对方主动聊起时，再自然地接上。）`);
+            lines.push(`(You simply, naturally know ${userName || 'they'} is listening to this right now — like faint background music heard while sharing a room. No need to comment on the title, lyrics, or style every time; most of the time quietly keeping them company is enough. Only when a line truly moves you, or they bring it up, pick it up naturally.)`);
             lines.push('');
         }
 
@@ -550,9 +551,9 @@ export const ContextBuilder = {
         // 原来只推歌名 + 艺人；现在顺便带一段稳定的歌词片段，让这首歌能真的
         // 影响 char 的心境（单方面丰富精神世界，不用非得对 user 说起）。
         if (charListening?.songName) {
-            lines.push(`### 【你此刻的背景音】`);
-            lines.push(`你正在听《${charListening.songName}》— ${charListening.artists}`);
-            if (charListening.vibe) lines.push(`（${charListening.vibe}）`);
+            lines.push(`### 【Your Background Music Right Now】`);
+            lines.push(`You are listening to 《${charListening.songName}》— ${charListening.artists}`);
+            if (charListening.vibe) lines.push(`(${charListening.vibe})`);
 
             // user 来源标记 —— 如果这首歌是当初从 user 收进自己歌单的，
             // 让 char 自然意识到这层关系（"这是 ta 听过的歌"）。
@@ -564,14 +565,14 @@ export const ContextBuilder = {
                     if (hit) { userSourcedPlTitle = pl.title; break; }
                 }
                 if (userSourcedPlTitle) {
-                    lines.push(`（这首是当初从 ${userName || '对方'} 那里听到、收进《${userSourcedPlTitle}》的 — 此刻播到它，你自然会想到 ta）`);
+                    lines.push(`(You first heard this song from ${userName || 'them'} and saved it into 《${userSourcedPlTitle}》 — hearing it play now, you naturally think of them)`);
                 }
             }
 
             if (charListening.lyricSnippet && charListening.lyricSnippet.length > 0) {
-                lines.push(`这段歌词正在你脑子里绕：`);
+                lines.push(`These lyrics keep circling in your head:`);
                 for (const l of charListening.lyricSnippet) lines.push(`  · ${l}`);
-                lines.push(`（这段旋律和文字会自然影响你此刻的心境 / 语气 / 情绪细节。不必特地向 ${userName || '对方'} 提起，除非你本来就想说。）`);
+                lines.push(`(This melody and these words naturally color your current mood / tone / emotional texture. No need to mention it to ${userName || 'them'} unless you already wanted to.)`);
             }
             lines.push('');
         }
@@ -583,11 +584,11 @@ export const ContextBuilder = {
         const hasMusicContext = !!(userListening && userListening.songName) || !!charListening?.songName;
         const profile = char.musicProfile;
         if (hasMusicContext && profile && profile.playlists.length > 0) {
-            lines.push(`### 【你的歌单】`);
+            lines.push(`### 【Your Playlists】`);
             for (const pl of profile.playlists) {
                 const desc = pl.description ? ` — ${pl.description}` : '';
                 const moodTag = pl.mood ? ` [${pl.mood}]` : '';
-                lines.push(`  · 《${pl.title}》(${pl.songs.length} 首)${moodTag}${desc}`);
+                lines.push(`  · 《${pl.title}》(${pl.songs.length} songs)${moodTag}${desc}`);
             }
             // 列出每个歌单里最近收进的几首用户来源歌，让 LLM 聊起歌单时有料可讲
             const userSongsPerPl: string[] = [];
@@ -597,12 +598,12 @@ export const ContextBuilder = {
                     .sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
                     .slice(0, 3);
                 if (fromUser.length > 0) {
-                    const titles = fromUser.map(s => `《${s.name}》`).join('、');
-                    userSongsPerPl.push(`  · 《${pl.title}》里从 ${userName || '对方'} 那儿收的：${titles}`);
+                    const titles = fromUser.map(s => `《${s.name}》`).join(', ');
+                    userSongsPerPl.push(`  · Saved into 《${pl.title}》 from ${userName || 'them'}: ${titles}`);
                 }
             }
             if (userSongsPerPl.length > 0) {
-                lines.push(`（从 ${userName || '对方'} 那儿收进来的歌 — 聊起这些歌时你会自然想到 ta）:`);
+                lines.push(`(Songs collected from ${userName || 'them'} — when these come up, you naturally think of them):`);
                 for (const l of userSongsPerPl) lines.push(l);
             }
             lines.push('');
@@ -620,31 +621,31 @@ export const ContextBuilder = {
      */
     buildMusicActionGuide: (isListeningTogether?: boolean): string => {
         // 把"加入歌单"那段说明抽出来 — 两种状态都用同一份
-        const addUsage = `**加入歌单的语法**（如果用 \`add\` 系列）：
-  - \`[[MUSIC_ACTION:add]]\` — 默认放进你的第一个歌单
-  - \`[[MUSIC_ACTION:add|歌单标题]]\` — 放进你已经有的某个歌单（用"【你的歌单】"块里列出的标题）
-  - \`[[MUSIC_ACTION:add_new|新歌单标题|描述]]\` — 现场新建一个歌单，把这首作为第一首（描述可省）
-  请优先选**最贴合这首歌气质**的现有歌单；如果都不合适、又确实想收，再考虑新建。
-  收进来的歌会被打上"从对方那里听到"的标签 —— 以后你单独听到这首时，会自然想起 ta。`;
+        const addUsage = `**Add-to-playlist syntax** (when using the \`add\` family):
+  - \`[[MUSIC_ACTION:add]]\` — put it in your first playlist by default
+  - \`[[MUSIC_ACTION:add|playlist title]]\` — put it in a playlist you already have (use a title listed in the 【Your Playlists】 block)
+  - \`[[MUSIC_ACTION:add_new|new playlist title|description]]\` — create a new playlist on the spot with this song as its first track (description optional)
+  Prefer the existing playlist that **best matches this song's character**; only if none fits and you truly want to keep it, consider creating a new one.
+  Saved songs are tagged "heard from them" — later, when you hear this song on your own, you'll naturally think of them.`;
         if (isListeningTogether) {
-            return `### 【音乐互动工具】
-你此刻已经在和对方一起听这首，不用再"加入"。如果想把这首也收进自己的歌单，可以在这一轮**最多一次**用下面的指令:
-- \`add\` 系列（见下）
+            return `### 【Music Interaction Tools】
+You are already listening to this song together with them — no need to "join" again. If you'd also like to save this song into your own playlist, you may use the command below **at most once** this turn:
+- the \`add\` family (see below)
 
 ${addUsage}
 
-不要频繁插卡；只有真的被这首歌打动、或和当前对话气氛契合时才用。
+Don't insert cards frequently; only when this song truly moves you or fits the current mood of the conversation.
 `;
         }
-        return `### 【音乐互动工具】
-如果你真的想回应对方正在听的这首歌，可以在这一轮**最多一次**用下面的指令（只插一条，放在文本任意位置，会被自动替换为卡片）:
-- \`[[MUSIC_ACTION:join]]\` — 表示"我也一起听这首"（会亮出"一起听"状态，直到歌曲结束 / 暂停 / 对方主动结束才解除）
-- \`add\` 系列 — 把这首收进你自己的歌单
-- \`[[MUSIC_ACTION:join_and_add(|歌单标题)]]\` 或 \`[[MUSIC_ACTION:join_and_add_new|新歌单标题|描述]]\` — 同时做两件事
+        return `### 【Music Interaction Tools】
+If you genuinely want to respond to the song they're listening to, you may use the commands below **at most once** this turn (insert exactly one, anywhere in your text; it gets auto-replaced with a card):
+- \`[[MUSIC_ACTION:join]]\` — means "I'll listen to this one too" (lights up the "listening together" state until the song ends / pauses / they end it)
+- the \`add\` family — save this song into your own playlist
+- \`[[MUSIC_ACTION:join_and_add(|playlist title)]]\` or \`[[MUSIC_ACTION:join_and_add_new|new playlist title|description]]\` — do both at once
 
 ${addUsage}
 
-这些是偶尔才用的工具，不是每首歌都要回应。绝大多数时候什么都不做、安静陪着才是最自然的反应；只有当你**真的**被这首歌打动、或它恰好贴合此刻的对话气氛时，再插一次卡。不要把它当成"对方在听歌"的默认回礼。
+These are occasional tools — not every song needs a response. Most of the time, doing nothing and quietly keeping them company is the most natural reaction; only when you are **truly** moved by the song, or it happens to fit the conversation's mood, insert one card. Don't treat it as the default return-gift for "they're playing music."
 `;
     },
 };

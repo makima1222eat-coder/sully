@@ -81,8 +81,8 @@ describe('forFirePack —— 打包时刻的状态一律不烤进模板', () => 
     });
 
     it('「现在是 X」时间块不进（当前时间由 worker 到点填槽）', async () => {
-        expect(await build(baseChar(), false)).toContain('现在是');
-        expect(await build(baseChar(), true)).not.toContain('现在是');
+        expect(await build(baseChar(), false)).toContain('It is now');
+        expect(await build(baseChar(), true)).not.toContain('It is now');
     });
 
     it('日程当前时段不进（改由 AMSG_SLOT_SCENE 到点现挑）', async () => {
@@ -103,8 +103,8 @@ describe('forFirePack —— 打包时刻的状态一律不烤进模板', () => 
             );
             return parts.volatileState;
         };
-        expect(await withMsgs(false)).toContain('刚刚和对方结束了一通电话');
-        expect(await withMsgs(true)).not.toContain('刚刚和对方结束了一通电话');
+        expect(await withMsgs(false)).toContain('You just ended a phone call');
+        expect(await withMsgs(true)).not.toContain('You just ended a phone call');
     });
 
     it('生活记录：摘要数据留着，代记工具说明不进', async () => {
@@ -159,17 +159,17 @@ describe('彼方：用户此刻挂在哪个房间不进打包', () => {
 
     it('前台聊天照常告诉角色用户挂在哪个房间', async () => {
         const out = await buildVr(false);
-        expect(out).toContain('此刻也在《彼方》');
-        expect(out).toContain('【听歌房】');
+        expect(out).toContain('is also in 《彼方》 right now');
+        expect(out).toContain('【Music Room】');
         expect(out).toContain('发呆中');
     });
 
     it('打包时整段不进；《彼方》是什么的常驻框定照留（那个不随时间变）', async () => {
         const out = await buildVr(true);
-        expect(out).not.toContain('此刻也在《彼方》');
-        expect(out).not.toContain('【听歌房】');
+        expect(out).not.toContain('is also in 《彼方》 right now');
+        expect(out).not.toContain('【Music Room】');
         expect(out).not.toContain('发呆中');
-        expect(out).toContain('关于《彼方》');
+        expect(out).toContain('About 《彼方》');
     });
 });
 
@@ -231,12 +231,12 @@ describe('小红书：worker 够不着的服务器不写进 fire_pack', () => {
     };
 
     it('本机地址：前台照常教，打包时整段不进', async () => {
-        expect(await withServer('http://localhost:18060', false)).toContain('小红书');
-        expect(await withServer('http://localhost:18060', true)).not.toContain('小红书');
-        expect(await withServer('http://192.168.1.7:18060', true)).not.toContain('小红书');
+        expect(await withServer('http://localhost:18060', false)).toContain('Xiaohongshu');
+        expect(await withServer('http://localhost:18060', true)).not.toContain('Xiaohongshu');
+        expect(await withServer('http://192.168.1.7:18060', true)).not.toContain('Xiaohongshu');
     });
 
     it('公网地址：打包时照常带上', async () => {
-        expect(await withServer('https://xhs.example.com', true)).toContain('小红书');
+        expect(await withServer('https://xhs.example.com', true)).toContain('Xiaohongshu');
     });
 });

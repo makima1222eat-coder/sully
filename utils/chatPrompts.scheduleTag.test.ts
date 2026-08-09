@@ -32,14 +32,14 @@ const buildStable = async (
 describe('行为规范 · [schedule_message] 的教学开关', () => {
     it('默认（前台聊天）照常教', async () => {
         const stable = await buildStable();
-        expect(stable).toContain('[schedule_message | YYYY-MM-DD HH:MM:SS | fixed | 消息内容]');
-        expect(stable).toContain('定时发送消息');
+        expect(stable).toContain('[schedule_message | YYYY-MM-DD HH:MM:SS | fixed | message content]');
+        expect(stable).toContain('Scheduled messages');
     });
 
     it('forFirePack（打包主动消息模板）时整条不出现', async () => {
         const stable = await buildStable({ forFirePack: true });
         expect(stable).not.toContain('schedule_message');
-        expect(stable).not.toContain('定时发送消息');
+        expect(stable).not.toContain('Scheduled messages');
         // 只拿掉这一条，同一段里的其他动作说明得留着
         expect(stable).toContain('[[ACTION:POKE]]');
         expect(stable).toContain('[[ACTION:ADD_EVENT');
@@ -48,7 +48,7 @@ describe('行为规范 · [schedule_message] 的教学开关', () => {
     it('即时对话（timelyByWorker）且角色开着 2.0 时不教（worker 会注入云端排程工具）', async () => {
         const stable = await buildStable({ timelyByWorker: true }, charWithAmsg2);
         expect(stable).not.toContain('[schedule_message');
-        expect(stable).not.toContain('定时发送消息');
+        expect(stable).not.toContain('Scheduled messages');
         // 只拿掉这一条，同一段里的其他动作说明得留着
         expect(stable).toContain('[[ACTION:POKE]]');
         expect(stable).toContain('[[ACTION:ADD_EVENT');
@@ -56,13 +56,13 @@ describe('行为规范 · [schedule_message] 的教学开关', () => {
 
     it('即时对话但角色 2.0 关着时照教（云端没有排程工具，本地标签是唯一的定时手段）', async () => {
         const stable = await buildStable({ timelyByWorker: true });
-        expect(stable).toContain('[schedule_message | YYYY-MM-DD HH:MM:SS | fixed | 消息内容]');
-        expect(stable).toContain('定时发送消息');
+        expect(stable).toContain('[schedule_message | YYYY-MM-DD HH:MM:SS | fixed | message content]');
+        expect(stable).toContain('Scheduled messages');
     });
 
     it('本地路径（无 timelyByWorker）即便角色开着 2.0 也照教', async () => {
         const stable = await buildStable(undefined, charWithAmsg2);
-        expect(stable).toContain('[schedule_message | YYYY-MM-DD HH:MM:SS | fixed | 消息内容]');
-        expect(stable).toContain('定时发送消息');
+        expect(stable).toContain('[schedule_message | YYYY-MM-DD HH:MM:SS | fixed | message content]');
+        expect(stable).toContain('Scheduled messages');
     });
 });

@@ -51,7 +51,7 @@ describe('日程历史与私聊消息格式对齐', () => {
             }),
         ], char, user);
 
-        expect(block).toContain('交换日记');
+        expect(block).toContain('Exchange Diary');
         expect(block).toContain(card.userText);
         expect(block).toContain(card.charText);
         expect(block).not.toContain('"userText"');
@@ -71,7 +71,7 @@ describe('日程历史与私聊消息格式对齐', () => {
         ], char, user);
 
         expect(block).toContain(worldBody);
-        expect(block).toContain('共同世界「家园」');
+        expect(block).toContain('shared world 「家园」');
     });
 
     it('HTML 卡片只保留可见文字摘要，不把完整 HTML/CSS 塞进日程', () => {

@@ -35,11 +35,11 @@ describe('群聊背景注入 · 发言人真实标注', () => {
         );
         const injected = parts.volatileState;
 
-        expect(injected).toContain('你亲历的近期群聊');
+        expect(injected).toContain('Recent group chats you took part in');
         expect(injected).toContain('条条: 今晚吃火锅吗');
-        expect(injected).toContain('你（阿一）: 我要毛肚');
+        expect(injected).toContain('You (阿一): 我要毛肚');
         expect(injected).toContain('阿二: 加宽粉');
-        expect(injected).toContain('群友: 幽灵发言');
-        expect(injected).not.toContain('Member');
+        expect(injected).toContain('Groupmate: 幽灵发言');
+        expect(injected).not.toContain('Member:');
     });
 });
