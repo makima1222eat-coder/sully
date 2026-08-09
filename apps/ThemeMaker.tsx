@@ -952,7 +952,7 @@ const ThemeMaker: React.FC = () => {
                         ) : mock.kind === 'emoji' ? (
                             <div className="relative z-10 text-3xl leading-none">{mock.content}</div>
                         ) : (
-                            <div className="relative z-10 text-[15px] leading-relaxed whitespace-pre-wrap break-all" style={{ color: style.textColor }}>
+                            <div className="relative z-10 text-[15px] leading-relaxed whitespace-pre-wrap break-words" style={{ color: style.textColor }}>
                                 {mock.content}
                             </div>
                         )}
