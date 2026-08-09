@@ -966,11 +966,11 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
       expect(template).not.toContain('你身处');
     });
 
-    it('跟时间无关的几段照留（别顺手把整个「当前时刻补充」砍掉）', async () => {
+    it('当前场景和带具体时刻的排程清单也不进模板，实时世界的无时间内容照留', async () => {
       const { template } = await noTime();
-      expect(template).toContain('【当前时刻补充】');
-      expect(template).toContain(AMSG_SLOT_SCENE);
-      expect(template).toContain(AMSG_SLOT_TASK_LIST);
+      expect(template).not.toContain('【当前时刻补充】');
+      expect(template).not.toContain(AMSG_SLOT_SCENE);
+      expect(template).not.toContain(AMSG_SLOT_TASK_LIST);
       expect(template).toContain(AMSG_SLOT_REALTIME_WORLD);
       // 1.0 提示块本身还在，只是不报钟了
       expect(template).toContain('【1.0 风格主动消息提示】');
@@ -1019,6 +1019,18 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
   it('角色没开日程 → scene 为 null（槽位到点被抹平）', async () => {
     const out = await pack(baseChar());
     expect(out.scene).toBeNull();
+  });
+
+  it('角色关闭时间感知时，即使日程功能开启也不读取或携带当前作息', async () => {
+    const scheduleSpy = vi.spyOn(dailySchedule, 'getDailyScheduleForChar');
+    const out = await pack(baseChar({
+      timeAwarenessEnabled: false,
+      scheduleFeatureEnabled: true,
+    }));
+
+    expect(scheduleSpy).not.toHaveBeenCalled();
+    expect(out.scene).toBeNull();
+    expect(out.template).not.toContain(AMSG_SLOT_SCENE);
   });
 
   // 天气 / 热搜 / 今日节日跟当前时间一样是「此刻的读数」：模板里只留槽位，worker 到点

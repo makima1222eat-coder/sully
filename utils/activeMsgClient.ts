@@ -510,6 +510,7 @@ export const buildFirePack = async (
   },
 ): Promise<AmsgFirePack> => {
   const templateStub = opts?.templateStub === true;
+  const timeAware = char.timeAwarenessEnabled !== false;
   const [{ recentMessages, lastUserMessageAt }, library, schedule] = await Promise.all([
     buildTimeGapHint(char.id),
     // 表情库只喂系统提示词/近史渲染：占位模板路径整库都不用读（表情记录带图片数据，
@@ -518,7 +519,7 @@ export const buildFirePack = async (
       ? Promise.resolve({ all: [], categories: [] } as unknown as EmojiLibrary)
       : (emojiLibrary ? Promise.resolve(emojiLibrary) : readEmojiLibrary()),
     // 日程随包带原始表（不是渲染好的文字），worker 到点自己挑时段。总开关关掉的角色没有表。
-    isScheduleFeatureOn(char)
+    timeAware && isScheduleFeatureOn(char)
       ? getDailyScheduleForChar(char).catch((e) => {
           console.warn('[ActiveMsg2] 日程读取失败，这次不带作息表', char.id, e);
           return null;
@@ -536,7 +537,6 @@ export const buildFirePack = async (
   // （buildTimeAwarenessBlock 直接返回空串），主动消息这边却精确报出年月日 + 星期，
   // 是同一个开关的两套行为。关掉时这几行连槽位一起不进模板。
   // 排程工具的 send_at 说明不受影响（那份在 amsgFireSchedule）：排时间本来就得知道现在几点。
-  const timeAware = char.timeAwarenessEnabled !== false;
   // 只摘渲染会读到的字段：整份日程里还挂着每个时段缓存的小剧场台词和看板图，
   // 带上去只是白占云端状态的体积（fire_pack 本来就有几万字）。
   const scene: AmsgFireScene | null = schedule
@@ -621,7 +621,9 @@ export const buildFirePack = async (
     '',
     '【角色系统设定】',
     systemPrompt,
-    `（注意：上面角色设定里的情绪、印象等状态是最近一次聊天时的快照。${timeAware ? '此刻的时间、你正在做什么' : '你此刻正在做什么'}，以下方「当前时刻补充」为准。）`,
+    ...(timeAware
+      ? ['（注意：上面角色设定里的情绪、印象等状态是最近一次聊天时的快照。此刻的时间、你正在做什么，以下方「当前时刻补充」为准。）']
+      : []),
     '',
     '【最近对话上下文】',
     // 槽位直接黏在最后一行后面（不单独占一行）：worker 到点没有可写的自述时填空串，
@@ -637,13 +639,13 @@ export const buildFirePack = async (
           '【当前时刻补充】',
           `当前本地时间（你所在地）：${AMSG_SLOT_CURRENT_TIME}${tzNote ? `\n${tzNote}` : ''}${AMSG_SLOT_USER_CLOCK}${AMSG_SLOT_SCENE}`,
         ]
-      // 关了时间感知的架空角色：整段只剩「你在做什么 / 外面什么样」，一个钟都不给。
-      : [`【当前时刻补充】${AMSG_SLOT_SCENE}`]),
+      // 关掉时间感知时，当前场景同样不进提示词；日程活动本身也会泄漏所处时段。
+      : []),
     // 排程清单跟在时间后面：它整段都在讲「几点会发生什么」，挨着当前时刻读才对得上。
     // 没有待触发任务时 worker 填空串，这一行连带消失。
     // 最后是「外面的世界此刻什么样」（节日 / 天气 / 热搜）：跟时间同属「此刻的读数」，
     // 一样由 worker 到点现拉现填，拉不到就整段消失。
-    `${timeAware ? AMSG_SLOT_TIME_SINCE_USER : ''}${AMSG_SLOT_TASK_LIST}${AMSG_SLOT_REALTIME_WORLD}`,
+    `${timeAware ? `${AMSG_SLOT_TIME_SINCE_USER}${AMSG_SLOT_TASK_LIST}` : ''}${AMSG_SLOT_REALTIME_WORLD}`,
     '',
     legacyHint,
     '',
