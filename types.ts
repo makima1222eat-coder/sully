@@ -2679,6 +2679,17 @@ export interface CharacterProfile {
   thinkingChainCustomCss?: string;
 
   /**
+   * 【心声】(Inner Voice) 开关（per-character）。
+   * - true：提示词教模型在每轮回复开头输出一行 `[心声] …`（角色的内心独白，对方"听不见"）。
+   *   该行会被 applyAssistantPostProcessing 抽出，作为 metadata.innerVoice 落在本轮第一条
+   *   assistant 消息上，MessageItem 渲染成可展开/折叠的小条。
+   * - false / undefined：不注入提示词；模型偶尔漏出的 [心声] 行仍会被剥掉（不展示、不落库）。
+   * - 与思考链一样：metadata 不进 buildMessageHistory 的 content，因此心声**不会**注入
+   *   下一轮对话，也不会被总结/记忆等任何读 content 的下游模型看到。
+   */
+  innerVoiceEnabled?: boolean;
+
+  /**
    * 虚拟世界「彼方」的个人状态：是否自主登入、登入间隔、各本小说的独立书签等。
    * 独立于 proactiveConfig（主动发消息），互不挤占触发。
    */

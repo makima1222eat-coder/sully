@@ -67,6 +67,27 @@ const normalizeAiContent = (raw: string): string => {
     return cleaned;
 };
 
+/**
+ * 【心声】抽取：把回复里行首的 `[心声] …` / `【心声】…` 行摘出来。
+ * - voice：所有心声行正文（多行时 \n 连接；教学要求恰好一行，多的一并收拢防漏）
+ * - rest：剥掉心声行后的正文（收敛多余空行）
+ * 调用方决定 voice 的去向：开关开 → 落 metadata.innerVoice；开关关 → 直接丢弃。
+ * 两种情况下 rest 都不再含 [心声]，保证它永远不会变成聊天气泡、不进历史。
+ */
+export const extractInnerVoice = (text: string): { voice: string | null; rest: string } => {
+    if (!text || !/[\[【]\s*心声\s*[\]】]/.test(text)) return { voice: null, rest: text };
+    const voices: string[] = [];
+    const rest = text
+        .replace(/^[ \t]*[\[【]\s*心声\s*[\]】][:：]?[ \t]*(.*)$/gm, (_m, body: string) => {
+            const b = (body || '').trim();
+            if (b) voices.push(b);
+            return '';
+        })
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/^\s+/, '');
+    return { voice: voices.length ? voices.join('\n') : null, rest };
+};
+
 interface MimickedXhsShareBlock {
     title: string;
     author: string;
@@ -551,7 +572,17 @@ export async function applyAssistantPostProcessing(
     // 把一段文本 (parseAndExecuteActions / HTML 之外的部分) 渲染成气泡并落库 —— 双语 / 表情 / 引用 / 分段
     // 与原 inline 末尾逻辑一致。抽出来是为了让"执行功能前的本轮正文 A"能在二轮前先展示, 二轮结果 B 复用同一套。
     const renderAndPersist = async (rawContent: string, firstThinkingChain: string | null): Promise<void> => {
-        let firstMeta: any = firstThinkingChain ? { thinkingChain: firstThinkingChain } : null;
+        // 【心声】：行首 [心声] 行 → metadata.innerVoice（落在本批第一条气泡上）。
+        // 开关关闭时仍然剥掉（模型漏出的心声不该变成气泡），只是不落 metadata。
+        const ivResult = extractInnerVoice(rawContent);
+        rawContent = ivResult.rest;
+        const firstInnerVoice = (char as any).innerVoiceEnabled ? ivResult.voice : null;
+        let firstMeta: any = (firstThinkingChain || firstInnerVoice)
+            ? {
+                ...(firstThinkingChain ? { thinkingChain: firstThinkingChain } : {}),
+                ...(firstInnerVoice ? { innerVoice: firstInnerVoice } : {}),
+            }
+            : null;
         const takeMeta = (base: any): any => {
             const merged = firstMeta ? { ...(base || {}), ...firstMeta } : base;
             firstMeta = null;

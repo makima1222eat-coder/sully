@@ -1387,7 +1387,7 @@ const Chat: React.FC = () => {
         if ([
             'transfer', 'archive', 'settings', 'chrome-css', 'chrome-sound', 'fine-tune',
             'meetup', 'proactive', 'active-msg-2', 'schedule', 'mcd-request', 'luckin-request',
-            'html-mode-toggle', 'html-mode-settings', 'thinking-settings',
+            'html-mode-toggle', 'html-mode-settings', 'thinking-settings', 'inner-voice-toggle',
             // 独立小功能：点一下就是用了一次，跟「打开某个面板」同一性质。
             // send-emoji / select-category 这些是「挑哪一个」，不进名单。
             'poke', 'emoji-import', 'add-category', 'mcd-end', 'luckin-end',
@@ -1455,6 +1455,15 @@ const Chat: React.FC = () => {
                 // 「展示思考」按钮 → 打开思考链设置 modal（开关 / 卡片风格 / 配色 / 追加提示词）
                 if (!char) break;
                 setShowThinkingChainModal(true);
+                break;
+            }
+            case 'inner-voice-toggle': {
+                // 「心声」按钮 → 直接开关。开启后提示词教模型每轮回复前输出一行 [心声]，
+                // 落 metadata 渲染成可折叠小条，不进历史、不给总结等下游模型。
+                if (!char) break;
+                const next = !((char as any).innerVoiceEnabled);
+                updateCharacter(char.id, { innerVoiceEnabled: next } as any);
+                addToast(next ? '心声已开启：角色回复前会附一行内心独白' : '心声已关闭', next ? 'success' : 'info');
                 break;
             }
         }
@@ -3654,6 +3663,7 @@ const Chat: React.FC = () => {
                     luckinActivated={luckinActivated}
                     htmlModeEnabled={!!(char as any).htmlModeEnabled}
                     showThinkingChain={!!(char as any).showThinkingChain}
+                    innerVoiceEnabled={!!(char as any).innerVoiceEnabled}
                     inputStyle={osTheme.chatInputStyle}
                     sendButtonStyle={osTheme.chatSendButtonStyle}
                     chromeStyle={osTheme.chatChromeStyle}
