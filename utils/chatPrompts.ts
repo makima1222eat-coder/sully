@@ -427,7 +427,7 @@ ${groupLogStr}\n`;
                 const r = await NotionManager.getUserNotes(config.notionApiKey, config.notionNotesDatabaseId, 5);
                 if (!r.success || r.entries.length === 0) return '';
                 let s = `\n### 📝【${userProfile.name}最近写的笔记】\n`;
-                s += `（这些是${userProfile.name}在Notion上写的个人笔记。你可以偶尔自然地提到你看到了ta写的某篇笔记，表示关心，但不要每次都提，也不要显得在监视。如果想看某篇的详细内容，可以使用 [[READ_NOTE: 标题关键词]] 翻阅）\n`;
+                s += `（这些是${userProfile.name}在Notion上写的个人笔记。你可以偶尔自然地提到你看到了ta写的某篇笔记，但不要每次都提，也不要显得在监视。如果想看某篇的详细内容，可以使用 [[READ_NOTE: 标题关键词]] 翻阅）\n`;
                 r.entries.forEach((d, i) => { s += `${i + 1}. [${d.date}] ${d.title}\n`; });
                 s += `\n`;
                 return s;
