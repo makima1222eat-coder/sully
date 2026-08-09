@@ -247,6 +247,9 @@ export const ChatPrompts = {
         // 即时对话：这一轮交给 worker 生成，时钟和真实世界块由它在 fire 时刻补。
         // 本地私有的易变段照常烤进去（worker 拿不到，而这一刻它们是新鲜的）。
         const timelyByWorker = promptOptions?.timelyByWorker === true;
+        // 时间感知总闸：显式关闭时，任何由系统时钟派生的上下文都不能进入模型请求。
+        // 用户自己在正文里提到的日期/时间仍属于对话事实，照常保留。
+        const timeAware = char.timeAwarenessEnabled !== false;
         // ── 分段计时（定位瓶颈用）──
         const perfT0 = performance.now();
         const timings: Record<string, number> = {};
@@ -273,7 +276,10 @@ export const ChatPrompts = {
         // ── 易变状态段（volatileState）──
         // 开头一行框定，让模型明白这条出现在历史之后的 system 消息是"此刻的状态"，
         // 人设与规则仍以最上方的系统设定为准。
-        let volatileState = `\n[System: Live Context]\n(The following is the live state at this moment — the current time, what you are doing, your emotional undertone, and what's happening around you. Your persona and chat rules are in the system settings at the very top and are not repeated here.)\n\n`;
+        const liveStateSummary = timeAware
+            ? 'the current time, what you are doing, your emotional undertone, and what\'s happening around you'
+            : 'your emotional undertone and what\'s happening around you';
+        let volatileState = `\n[System: Live Context]\n(The following is the live state at this moment — ${liveStateSummary}. Your persona and chat rules are in the system settings at the very top and are not repeated here.)\n\n`;
         volatileState += ContextBuilder.buildVolatileCoreState(char, {
             includeDetailedMemories: true,
             timeOptions: { skipTimeAwareness: forFirePack || timelyByWorker },
@@ -309,14 +315,14 @@ export const ChatPrompts = {
                     // 时间行跟着角色的「时间感知」开关走：关掉的角色不该从天气块里读到
                     // 「当前真实时间」，那是这个开关本来要挡住的东西。
                     const realtimeContext = await RealtimeContextManager.buildFullContext(config, charTz, {
-                        includeTime: char.timeAwarenessEnabled !== false,
+                        includeTime: timeAware,
                     });
                     return `\n${realtimeContext}\n`;
                 }
                 // 基础当前时间 + 时差提示已由 ContextBuilder.buildCoreContext 统一注入（受 timeAwarenessEnabled
                 // 控制，按角色自定义时区折算）；这里只在关闭天气/新闻时补一条"今日特殊节日"，不再重复注入时间/时差，避免双份。
                 const specialDates = RealtimeContextManager.checkSpecialDates(charTz);
-                if (specialDates.length > 0 && char.timeAwarenessEnabled !== false) {
+                if (specialDates.length > 0 && timeAware) {
                     return `\n### 【Special Today】\n${specialDates.join('、')}\n`;
                 }
                 return '';
@@ -329,7 +335,7 @@ export const ChatPrompts = {
         // 2. 日程（被"日程注入"和"音乐氛围"两处共用，合并成一次查询）
         //    总开关关闭时跳过查询与注入，确保不额外调用任何 LLM 依赖链
         const scheduleFeatureOn = isScheduleFeatureOn(char);
-        const schedulePromise: Promise<DailySchedule | null> = scheduleFeatureOn
+        const schedulePromise: Promise<DailySchedule | null> = scheduleFeatureOn && timeAware
             ? getDailyScheduleForChar(char).catch(e => {
                 console.error('Failed to load daily schedule:', e);
                 return null;
@@ -370,12 +376,12 @@ export const ChatPrompts = {
                     // 时间戳按角色所在时区读：同一份 prompt 里私聊历史用的就是角色的钟
                     // （下面 buildMessageHistory 走 formatDate(ts, charTz)），群聊这行要是
                     // 跟着设备走，纽约角色会看到两套时间。
-                    const dateStr = ChatPrompts.formatDate(m.timestamp, charTz);
-                    // 「约 X 分钟前」是相对打包时刻算的，fire_pack 到点渲染时早就不是那个「刚才」了
-                    // ——角色会把昨天的群聊说成「刚才群里说晚上一起吃饭」。绝对时间戳留着，角色
-                    // 自己对着当前时间就能判断远近。
-                    const relativeAge = forFirePack ? '' : ` · ${formatRelativeAge(m.timestamp)}`;
-                    return `[${dateStr}${relativeAge}] [Group: ${m.groupName}] ${speakerOf(m)}: ${summarizeGroupMsgContent(m)}`;
+                    const dateStr = timeAware ? ChatPrompts.formatDate(m.timestamp, charTz) : '';
+                    // 「约 X 分钟前」是相对打包时刻算的，fire_pack 到点渲染时早就不是那个「刚才」了。
+                    // 开启时间感知时保留绝对时间供角色判断远近；关闭时两种时间标记都不发送。
+                    const relativeAge = timeAware && !forFirePack ? ` · ${formatRelativeAge(m.timestamp)}` : '';
+                    const timePrefix = timeAware ? `[${dateStr}${relativeAge}] ` : '';
+                    return `${timePrefix}[Group: ${m.groupName}] ${speakerOf(m)}: ${summarizeGroupMsgContent(m)}`;
                 }).join('\n');
                 return `\n### 【Group Chat Background · Recent group chats you took part in】
 (Below are recent, real chat logs from groups you belong to, in chronological order, with speakers labeled; lines marked "You" are things you said yourself. You lived through all of this and remember it clearly — when the other person asks about it in private chat or the topic comes up, pick it up naturally and don't pretend not to know; but there's no need to deliberately report every bit of group activity either.)
@@ -1034,6 +1040,7 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
         }
         const historySlice = effectiveHistory.slice(-limit);
         const charTz = resolveCharTimeZone(char);
+        const timeAware = char.timeAwarenessEnabled !== false;
 
         let timeGapHint = "";
         if (historySlice.length >= 2) {
@@ -1048,13 +1055,13 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                 }
             }
             // 时间感知强化开关：默认开启（undefined 视为 true），显式关掉后不再注入「距离上次聊天多久」提示
-            if (lastRealMsg && currentMsg && char.timeAwarenessEnabled !== false) timeGapHint = ChatPrompts.getTimeGapHint(lastRealMsg, currentMsg.timestamp, charTz);
+            if (lastRealMsg && currentMsg && timeAware) timeGapHint = ChatPrompts.getTimeGapHint(lastRealMsg, currentMsg.timestamp, charTz);
         }
 
         return {
             apiMessages: historySlice.map((m, index) => {
                 let content: any = m.content;
-                const timeStr = `[${ChatPrompts.formatDate(m.timestamp, charTz)}]`;
+                const timePrefix = timeAware ? `[${ChatPrompts.formatDate(m.timestamp, charTz)}] ` : '';
                 const sourceTag = (() => {
                     const source = m.metadata?.source;
                     if (source === 'call') return '[Call]';
@@ -1091,8 +1098,8 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                      // 向下兼容：如果图片数据缺失（例如只导入了文字备份），不要把空 URL 发给 API，否则会报错无法回应
                      const hasImageData = typeof m.content === 'string' && (m.content.startsWith('data:') || m.content.startsWith('http'));
                      let textPart = hasImageData
-                         ? `${timeStr} [User sent an image]`
-                         : `${timeStr} [User sent an image, but the image data is no longer available]`;
+                         ? `${timePrefix}[User sent an image]`
+                         : `${timePrefix}[User sent an image, but the image data is no longer available]`;
                      if (index === historySlice.length - 1 && timeGapHint && m.role === 'user') textPart += `\n\n${timeGapHint}`;
                      if (!hasImageData) {
                          return { role: m.role, content: textPart };
@@ -1104,7 +1111,7 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                 
                 // TODO(记录形态): 戳一戳 / 时间间隔提示等其他系统事件, 等转账的 [[记录:TRANSFER]]
                 // 观察一段时间后再迁 (transferFormat.ts 头注) —— 防线已按整个记录命名空间就位。
-                if (m.type === 'interaction') content = `${timeStr} [System: the user just poked you]`;
+                if (m.type === 'interaction') content = `${timePrefix}[System: the user just poked you]`;
                 else if (m.type === 'transfer') {
                     // 统一记录形态 [[记录:TRANSFER|to=|amount=|status=]] —— 跟输出语法
                     // [[ACTION:TRANSFER|to=|amount=]] 共用词汇表 (见 transferFormat.ts 头注)。
@@ -1113,7 +1120,7 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                     // 顺带修掉旧实现的不一致: 原始转账行现在读 live status (metadata.status),
                     // 被收/退之后不再永远显示「待你处理」。
                     const tMeta = m.metadata || {};
-                    content = `${timeStr} ${formatTransferRecord({
+                    content = `${timePrefix}${formatTransferRecord({
                         role: m.role as 'user' | 'assistant',
                         amount: tMeta.amount,
                         receipt: tMeta.receipt,
@@ -1156,7 +1163,7 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                     if (authoredByChar) authorshipLine = '\n(Note: the poster of this Spark post is your own alt account — the user is forwarding you a post you made yourself.)';
                     else if (authoredByUser) authorshipLine = '\n(Note: this Spark post was made by the user themselves.)';
 
-                    content = `${timeStr} [The user shared a Spark post]\nPoster: ${postAuthorTag}\nTitle: ${post.title}\nContent: ${post.content}\nTop comments: ${commentsSample}${identityHint}${authorshipLine}\n(Give your take on this post according to your personality — snark, interest, or disdain.)`;
+                    content = `${timePrefix}[The user shared a Spark post]\nPoster: ${postAuthorTag}\nTitle: ${post.title}\nContent: ${post.content}\nTop comments: ${commentsSample}${identityHint}${authorshipLine}\n(Give your take on this post according to your personality — snark, interest, or disdain.)`;
                 }
                 else if ((m.type as string) === 'xhs_card') {
                     const note = m.metadata?.xhsNote || {};
@@ -1173,7 +1180,7 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                         note.commentCount != null ? `${note.commentCount} comments` : '',
                         note.shareCount != null ? `${note.shareCount} shares` : '',
                     ].filter(Boolean).join(' ');
-                    content = `${timeStr} [${sender} shared a Xiaohongshu note]\nTitle: ${note.title || 'Untitled'}\nAuthor: ${note.author || 'Unknown'}\nEngagement: ${interactions}\nSummary: ${note.desc || 'None'}${commentsLine}\n${m.role === 'user' ? '(Give your take on this post according to your personality.)' : ''}`;
+                    content = `${timePrefix}[${sender} shared a Xiaohongshu note]\nTitle: ${note.title || 'Untitled'}\nAuthor: ${note.author || 'Unknown'}\nEngagement: ${interactions}\nSummary: ${note.desc || 'None'}${commentsLine}\n${m.role === 'user' ? '(Give your take on this post according to your personality.)' : ''}`;
                 }
                 else if ((m.type as string) === 'vr_card') {
                     // vr_card：你自己进入 VR 社交游戏《彼方》时留下的动态。
@@ -1181,8 +1188,8 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                     // 只留一句极简标记省 token；没启用彼方的角色（可能是旧卡片）才补完整框定兜底。
                     const body = typeof m.content === 'string' ? m.content : '';
                     content = char.vrState?.enabled
-                        ? `${timeStr} (Your activity feed inside 《彼方》)\n${body}`
-                        : `${timeStr} (System record: this is an activity post you left when you personally entered the VR social game 《彼方》 (functionally similar to VRChat) — you really did enter and take part in the game; it just happened inside the game world. When it comes up, speak of it as "something I did in 《彼方》", never as a real-life experience.)\n${body}`;
+                        ? `${timePrefix}(Your activity feed inside 《彼方》)\n${body}`
+                        : `${timePrefix}(System record: this is an activity post you left when you personally entered the VR social game 《彼方》 (functionally similar to VRChat) — you really did enter and take part in the game; it just happened inside the game world. When it comes up, speak of it as "something I did in 《彼方》", never as a real-life experience.)\n${body}`;
                 }
                 else if ((m.type as string) === 'world_card') {
                     // world_card：你在「家园」共同世界里的生活记录（卡片正文已是可读文本，
@@ -1194,20 +1201,20 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                     const frame = wMeta.mode === 'heavy'
                         ? ' (Your life record from the shared world 「家园」 (Homeland) — that world is self-contained; its relationships and events need not map onto your real chats. When it comes up, share it as your recent life.)'
                         : ' (Your life record from the shared world 「家园」 (Homeland) — things that happened while living alongside your companions in that world. When it comes up, talk about it as your own recent life.)';
-                    content = `${timeStr}${frame}\n${body}`;
+                    content = `${timePrefix}${frame.trimStart()}\n${body}`;
                 }
                 else if ((m.type as string) === 'sim_card') {
                     // sim_card：用户把一段「人格模拟」演出作为真实回忆送给你。
                     // 框定为「你真实经历过的一段过往」，让你可以在聊天中自然地拥有它带来的心情与记忆。
                     const body = typeof m.content === 'string' ? m.content : '';
-                    content = `${timeStr} (This is a stretch of your past that you genuinely lived through, treasured by the user and returned to you — treat it as your own firsthand memory. The emotions and impressions it carries are real; mention it naturally when relevant, but don't recite it word for word.)\n${body}`;
+                    content = `${timePrefix}(This is a stretch of your past that you genuinely lived through, treasured by the user and returned to you — treat it as your own firsthand memory. The emotions and impressions it carries are real; mention it naturally when relevant, but don't recite it word for word.)\n${body}`;
                 }
                 else if ((m.type as string) === 'phone_card') {
                     // phone_card：你自己手机里的内容（聊天/订单/外卖/朋友圈/智能体等数字痕迹）。
                     // 框定为「你刚看了眼自己手机、这是里面的隐私」——不暗示用户在偷看，且带一点"未必愿意被看到"的私密感。
                     const pc: any = m.metadata?.phoneCard || {};
                     const body = typeof m.content === 'string' ? m.content : '';
-                    content = `${timeStr} (You just glanced at your phone — this is content from your ${pc.app || 'phone'}. It's your own private stuff, and you may not want others to see it. Treat it as things that really are on your phone; mention it naturally if it comes up, no need to bring it up yourself.)\n${body}`;
+                    content = `${timePrefix}(You just glanced at your phone — this is content from your ${pc.app || 'phone'}. It's your own private stuff, and you may not want others to see it. Treat it as things that really are on your phone; mention it naturally if it comes up, no need to bring it up yourself.)\n${body}`;
                 }
                 else if ((m.type as string) === 'theater_card') {
                     // theater_card：用户「窥视」了你某个时段的行为小剧场。那段演出就是你当时真实在做的事，
@@ -1224,8 +1231,8 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                     // 窥视的是「哪个具体时间」——晚上看上午时不能说成"刚刚/刚才"，要落到具体日期+时段+时刻。
                     const whenPhrase = theaterWhenPhrase(tMeta.date, tMeta.slotTime);
                     content = exposed
-                        ? `${timeStr} (${uName} sent you what they secretly "peeked" at — you during 「${tMeta.activity || 'a certain time slot'}」 (${whenPhrase}). In other words, at that time, ${uName} was quietly watching you from nearby. Below is what they saw — what you were genuinely doing then:)\n${beat}\n(You now know you were seen at that time. You may react naturally in the conversation — shy, curious, mock-scolding, or feigning indifference — but don't recite the content above word for word; you don't have to bring it up immediately either.)`
-                        : `${timeStr} (This is what you were genuinely doing during 「${tMeta.activity || 'a certain time slot'}」 (${whenPhrase}) — of course you remember it yourself. Here is the scene from that time:)\n${beat}\n(Note: you do **NOT** know that ${uName} saw this. Don't act watched or spied on. This is simply your own memory of that stretch of time — being able to naturally corroborate it when related topics come up is enough; don't bring it up on your own.)`;
+                        ? `${timePrefix}(${uName} sent you what they secretly "peeked" at — you during 「${tMeta.activity || 'a certain time slot'}」 (${whenPhrase}). In other words, at that time, ${uName} was quietly watching you from nearby. Below is what they saw — what you were genuinely doing then:)\n${beat}\n(You now know you were seen at that time. You may react naturally in the conversation — shy, curious, mock-scolding, or feigning indifference — but don't recite the content above word for word; you don't have to bring it up immediately either.)`
+                        : `${timePrefix}(This is what you were genuinely doing during 「${tMeta.activity || 'a certain time slot'}」 (${whenPhrase}) — of course you remember it yourself. Here is the scene from that time:)\n${beat}\n(Note: you do **NOT** know that ${uName} saw this. Don't act watched or spied on. This is simply your own memory of that stretch of time — being able to naturally corroborate it when related topics come up is enough; don't bring it up on your own.)`;
                 }
                 else if ((m.type as string) === 'html_card') {
                     // html_card：上下文里只塞纯文字摘要，剥离掉所有 HTML，省 token、不污染 LLM 思考
@@ -1237,7 +1244,7 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                     // 注意：这行是「系统对已渲染卡片的占位描述」，刻意包成括注 + 系统记录口吻，
                     // 避免 LLM 把它当成"发卡片的正确写法"照抄（会导致它输出字面占位句 + 纯文字正文，
                     // 而不是真正的 [html]...[/html] 块）。配合 htmlPrompt 里的禁止照抄规则一起生效。
-                    content = `${timeStr} (System record: ${sender} previously sent an HTML card, already rendered in the UI; card text summary — ${preview || 'purely visual card'}. This is only a history placeholder — do not restate this line; to send another card you must wrap real HTML in [html]...[/html].)`;
+                    content = `${timePrefix}(System record: ${sender} previously sent an HTML card, already rendered in the UI; card text summary — ${preview || 'purely visual card'}. This is only a history placeholder — do not restate this line; to send another card you must wrap real HTML in [html]...[/html].)`;
                 }
                 else if ((m.type as string) === 'mcd_card') {
                     const meta: any = m.metadata || {};
@@ -1255,20 +1262,20 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                             return s + (isFinite(p) ? p * c.qty : 0);
                         }, 0);
                         const totalStr = total > 0 ? `\n  Total: ¥${total.toFixed(2)}` : '';
-                        content = `${timeStr} [${userName} picked the following items from the menu and sent them to you, awaiting your response:]\n${lines}${totalStr}\n(${userName}'s intent: they want your opinion — how are the calories, should they swap the combo — or for you to just place the order for them. Respond naturally per your persona; don't parrot this description.)`;
+                        content = `${timePrefix}[${userName} picked the following items from the menu and sent them to you, awaiting your response:]\n${lines}${totalStr}\n(${userName}'s intent: they want your opinion — how are the calories, should they swap the combo — or for you to just place the order for them. Respond naturally per your persona; don't parrot this description.)`;
                     } else if (meta.mcdCardKind === 'candidate' && meta.mcdCandidate) {
                         const c: any = meta.mcdCandidate;
                         const p = typeof c.price === 'string' ? parseFloat(c.price) : (typeof c.price === 'number' ? c.price : 0);
                         const priceStr = isFinite(p) && p > 0 ? ` ¥${p.toFixed(2)}` : '';
                         const codeStr = c.code ? ` (code:${c.code})` : '';
-                        content = `${timeStr} [${userName} spotted 「${c.name}」${priceStr}${codeStr} on the menu, hasn't decided whether to order it, and wants your opinion first]\n(Reply naturally in a line or two per your persona: recommend / talk them out of it / tease / suggest a pairing / mention the calories — all fine. This is only a candidate; don't call the ordering tool yet — wait until they actually say "that one then" or finish picking everything.)`;
+                        content = `${timePrefix}[${userName} spotted 「${c.name}」${priceStr}${codeStr} on the menu, hasn't decided whether to order it, and wants your opinion first]\n(Reply naturally in a line or two per your persona: recommend / talk them out of it / tease / suggest a pairing / mention the calories — all fine. This is only a candidate; don't call the ordering tool yet — wait until they actually say "that one then" or finish picking everything.)`;
                     } else if (meta.mcdToolName) {
-                        content = `${timeStr} [McDonald's tool result: ${meta.mcdToolName}]`;
+                        content = `${timePrefix}[McDonald's tool result: ${meta.mcdToolName}]`;
                     }
                 }
                 else if (m.type === 'emoji') {
                      const stickerName = stickerNameFromUrl(emojis, m.content);
-                     content = `${timeStr} [${m.role === 'user' ? 'User' : 'You'} 发送了表情包: ${stickerName}]`;
+                     content = `${timePrefix}[${m.role === 'user' ? 'User' : 'You'} 发送了表情包: ${stickerName}]`;
                 }
                 else if ((m.type as string) === 'chat_forward') {
                     try {
@@ -1278,47 +1285,47 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                             const text = fm.type === 'image' ? '[图片]' : fm.type === 'emoji' ? '[表情]' : (fm.content || '').slice(0, 200);
                             return `  ${sender}: ${text}`;
                         });
-                        content = `${timeStr} [The user forwarded ${fwd.count || lines.length} chat messages between them and ${fwd.fromCharName || 'another character'}]\n${lines.join('\n')}`;
+                        content = `${timePrefix}[The user forwarded ${fwd.count || lines.length} chat messages between them and ${fwd.fromCharName || 'another character'}]\n${lines.join('\n')}`;
                     } catch {
-                        content = `${timeStr} [The user forwarded a chat log]`;
+                        content = `${timePrefix}[The user forwarded a chat log]`;
                     }
                 }
                 else if ((m.type as string) === 'score_card') {
                     try {
                         const card = m.metadata?.scoreCard || JSON.parse(m.content);
                         if (card?.type === 'lifesim_reset_card') {
-                            content = `${timeStr} ${formatLifeSimResetCardForContext(card, char?.name)}`;
+                            content = `${timePrefix}${formatLifeSimResetCardForContext(card, char?.name)}`;
                         } else if (card?.type === 'diary_card') {
                             const uName = card.userName || userProfile?.name || 'The user';
                             const userText = (card.userText || '').trim();
                             const charText = (card.charText || '').trim();
                             const userBlock = userText ? `${uName}'s page reads:\n"${userText}"` : `${uName}'s page is blank`;
                             const charBlock = charText ? `Your page replies:\n"${charText}"` : `Your page is blank`;
-                            content = `${timeStr} [Exchange Diary ${card.date || ''}] ${uName} and you exchanged a diary entry through the Exchange Diary app — a formal interaction that leaves a record.\n${userBlock}\n${charBlock}\n(This genuinely happened between you two; you may bring it up naturally in later chats.)`;
+                            content = `${timePrefix}[Exchange Diary ${card.date || ''}] ${uName} and you exchanged a diary entry through the Exchange Diary app — a formal interaction that leaves a record.\n${userBlock}\n${charBlock}\n(This genuinely happened between you two; you may bring it up naturally in later chats.)`;
                         } else if (card?.type === 'guidebook_card') {
                             const diff = (card.finalAffinity ?? 0) - (card.initialAffinity ?? 0);
                             const uName = userProfile?.name || 'the user';
-                            content = `${timeStr} [Guidebook game results] You and ${uName} just played a round of the "Guidebook" dating mini-game (${card.rounds || '?'} rounds).\nEnding: 「${card.title || '???'}」\nAffinity change: ${card.initialAffinity} → ${card.finalAffinity} (${diff >= 0 ? '+' : ''}${diff})\nYour verdict: ${card.charVerdict || 'None'}\nYour new discovery about ${uName}: ${card.charNewInsight || 'None'}`;
+                            content = `${timePrefix}[Guidebook game results] You and ${uName} just played a round of the "Guidebook" dating mini-game (${card.rounds || '?'} rounds).\nEnding: 「${card.title || '???'}」\nAffinity change: ${card.initialAffinity} → ${card.finalAffinity} (${diff >= 0 ? '+' : ''}${diff})\nYour verdict: ${card.charVerdict || 'None'}\nYour new discovery about ${uName}: ${card.charNewInsight || 'None'}`;
                         } else if (card?.type === 'whiteday_card') {
                             const uName = userProfile?.name || 'The user';
                             const passedStr = card.passed ? `passed the quiz and unlocked the DIY chocolate stage` : `did not pass the quiz (${card.score}/${card.total})`;
                             const questionsText = (card.questions as any[])?.map((q: any, i: number) =>
                                 `Q${i + 1}: ${q.question}\n${uName} chose "${q.userAnswer}" (${q.isCorrect ? '✓ correct' : `✗ wrong, correct answer: ${q.correctAnswer}`})${q.review ? `\nYour comment: ${q.review}` : ''}`
                             ).join('\n') || '';
-                            content = `${timeStr} [White Day compatibility quiz results] ${uName} completed the little White Day quiz you wrote, got ${card.score}/${card.total} right, and ${passedStr}.\n${questionsText}\nYour final remarks: ${card.finalDialogue || 'None'}`;
+                            content = `${timePrefix}[White Day compatibility quiz results] ${uName} completed the little White Day quiz you wrote, got ${card.score}/${card.total} right, and ${passedStr}.\n${questionsText}\nYour final remarks: ${card.finalDialogue || 'None'}`;
                         } else {
-                            content = `${timeStr} [System card] ${m.content.slice(0, 200)}`;
+                            content = `${timePrefix}[System card] ${m.content.slice(0, 200)}`;
                         }
                     } catch {
-                        content = `${timeStr} [System card]`;
+                        content = `${timePrefix}[System card]`;
                     }
                 }
                 else if ((m.type as string) === 'trpg_card' || (m.type as string) === 'novel_card') {
                     // TRPG 跑团片段 / 笔友会小说章节：从对应 app 多选转发进来的内容。
                     // 复用 normalizeMessageContent 翻成完整文本，让角色"记得"一起玩过/写过什么。
-                    content = `${timeStr} ${normalizeMessageContent(m, char?.name || 'You', userProfile?.name || 'User')}`;
+                    content = `${timePrefix}${normalizeMessageContent(m, char?.name || 'You', userProfile?.name || 'User')}`;
                 }
-                else content = `${timeStr} ${sourceTag} ${content}`;
+                else content = `${timePrefix}${sourceTag} ${content}`;
 
                 return { role: m.role, content };
             }),

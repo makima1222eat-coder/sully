@@ -1391,12 +1391,12 @@ ${isInitialGeneration ? `
                                    <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">下面三个开关相互独立、可任意组合。改完即时生效（下一条回复起算）。</p>
                                </div>
 
-                               {/* 1. 聊天 · 时间感知强化 */}
+                               {/* 1. 聊天 · 时间感知总闸 */}
                                <div className="border-t border-slate-100 pt-3">
                                    <div className="flex items-center justify-between gap-3">
                                        <div className="min-w-0">
-                                           <p className="text-xs font-bold text-slate-700">聊天 · 时间感知强化</p>
-                                           <p className="text-[10px] text-slate-400 mt-0.5 leading-relaxed">默认开。开启后角色会记得你们多久没聊、主动贴近真实时间；关掉后这种感觉会变弱。</p>
+                                           <p className="text-xs font-bold text-slate-700">聊天 · 时间感知</p>
+                                           <p className="text-[10px] text-slate-400 mt-0.5 leading-relaxed">默认开。开启后角色会收到精确时间、消息时间戳和当前日程；关闭后系统不再向模型提供这些时间信息。</p>
                                        </div>
                                        <button
                                            onClick={() => handleChange('timeAwarenessEnabled', formData.timeAwarenessEnabled === false)}
