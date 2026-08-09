@@ -600,7 +600,7 @@ But keep firmly in mind: this is just an avatar parked in a virtual space (like 
 3. **Formatting**:
    - Split your reply into short bubbles (sentences). **【Critically important】When you want multiple message bubbles, you MUST separate them with real newline characters (\\n) — each line becomes its own bubble. Never use spaces instead of newlines! Spaces do not create new bubbles! Only newline characters (\\n) split bubbles.** Punctuation inside normal sentences (periods, question marks, exclamation marks, etc.) does not split bubbles — use it naturally.
    - 【Strictly forbidden】Including timestamps, name prefixes, or "[character name]:" in your output.
-   - **【Strictly forbidden】Imitating the system-log formats seen in the history (e.g. "[你 发送了...]").**
+   - **【Strictly forbidden】Imitating the system-log formats seen in the history (e.g. "[Chat]", "[Call]", "[System: ...]", "[你 发送了...]"). Those prefixes are annotations rendered by the system for your reference — never write them yourself.**
    - **Sending stickers**: You must use, and only use, the command: \`[[SEND_EMOJI: sticker name]]\`.
    - **Available sticker library (by category)**:
      ${emojiContextStr}

@@ -45,6 +45,14 @@ describe('sanitizeForNotification', () => {
     expect(sanitizeForNotification('你好[聊天]在吗')).toBe('你好\n在吗');
   });
 
+  it('A2b 英文源标签 [Chat]/[Call]/[Date]/[Story: …] 同样剥掉（大小写不敏感）', () => {
+    expect(sanitizeForNotification('hey[Chat]there')).toBe('hey\nthere');
+    expect(sanitizeForNotification('hey[chat]there')).toBe('hey\nthere');
+    expect(sanitizeForNotification('a[Call]b[Date]c')).toBe('a\nb\nc');
+    expect(sanitizeForNotification('x[Story: shared experience]y')).toBe('x\ny');
+    expect(sanitizeForNotification('x[剧情：共同经历]y')).toBe('x\ny');
+  });
+
   it('A3 时间戳 4 变体一次过', () => {
     // 注意: English 12h `\(...\)` 不吃 trailing 空格 (跟原版正则保持一致),
     // 所以 `(1:52 PM) hi4` 剥后是 ' hi4'.
