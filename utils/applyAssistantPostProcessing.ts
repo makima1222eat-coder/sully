@@ -60,9 +60,10 @@ const normalizeAiContent = (raw: string): string => {
     cleaned = cleaned.replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, '');
     cleaned = cleaned.replace(/\[\d{4}[-/年]\d{1,2}[-/月]\d{1,2}.*?\]/g, '');
     cleaned = cleaned.replace(/^[\w一-龥]+:\s*/, '');
-    // Strip source tags [聊天]/[通话]/[约会] leaked from history context — replace with newline to preserve intended splits
-    cleaned = cleaned.replace(/\s*\[(?:聊天|通话|约会)\]\s*/g, '\n');
-    cleaned = cleaned.replace(/\[(?:你|User|用户|System)\s*发送了表情包[:：]\s*(.*?)\]/g, '[[SEND_EMOJI: $1]]');
+    // Strip source tags [聊天]/[通话]/[约会] and English [Chat]/[Call]/[Date]/[Story: …] leaked from history context — replace with newline to preserve intended splits
+    cleaned = cleaned.replace(/\s*\[(?:聊天|通话|约会|Chat|Call|Date)\]\s*/gi, '\n');
+    cleaned = cleaned.replace(/\s*\[(?:Story|剧情)[:：][^\]\n]{0,80}\]\s*/gi, '\n');
+    cleaned = cleaned.replace(/\[(?:你|You|User|用户|System)\s*发送了表情包[:：]\s*(.*?)\]/g, '[[SEND_EMOJI: $1]]');
     return cleaned;
 };
 

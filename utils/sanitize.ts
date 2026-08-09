@@ -22,8 +22,11 @@ import { segmentTextWithProtectedBlocks } from '@rei-standard/amsg-instant';
 /** `\\n` 字面 → 真实换行. 必须先跑, 否则后续 ^ 行锚定失效. */
 const stripLiteralBackslashN = (t: string): string => t.replace(/\\n/g, '\n');
 
-/** 源标签 `[聊天]/[通话]/[约会]` → 换行 (保留分隔语义) */
-const stripSourceTags = (t: string): string => t.replace(/\s*\[(?:聊天|通话|约会)\]\s*/g, '\n');
+/** 源标签 `[聊天]/[通话]/[约会]` 及英文版 `[Chat]/[Call]/[Date]/[Story: …]` → 换行 (保留分隔语义)
+ *  英文形态是 buildMessageHistory 英文化后的历史前缀, 模型同样会模仿漏出 (含小写 [chat]). */
+const stripSourceTags = (t: string): string => t
+  .replace(/\s*\[(?:聊天|通话|约会|Chat|Call|Date)\]\s*/gi, '\n')
+  .replace(/\s*\[(?:Story|剧情)[:：][^\]\n]{0,80}\]\s*/gi, '\n');
 
 /** 4 种时间格式: 带括号 ISO / 行首裸 ISO / 中文 12h / 英文 12h */
 const stripTimestamps = (t: string): string =>
