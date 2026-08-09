@@ -2199,6 +2199,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   // 不存在；保持 undefined 即可，与"用户当时根本没在 chat 界面"的语义一致
                   htmlMode: { enabled: !!(char as any).htmlModeEnabled, customPrompt: (char as any).htmlModeCustomPrompt },
                   thinkingChain: { enabled: !!(char as any).showThinkingChain, customPrompt: (char as any).thinkingChainCustomPrompt },
+                  innerVoice: { enabled: !!(char as any).innerVoiceEnabled },
               });
               const systemPrompt = payload.systemPrompt;
               const apiMessages = payload.cleanedApiMessages;

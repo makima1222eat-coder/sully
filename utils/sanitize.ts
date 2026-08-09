@@ -22,6 +22,12 @@ import { segmentTextWithProtectedBlocks } from '@rei-standard/amsg-instant';
 /** `\\n` 字面 → 真实换行. 必须先跑, 否则后续 ^ 行锚定失效. */
 const stripLiteralBackslashN = (t: string): string => t.replace(/\\n/g, '\n');
 
+/** 【心声】行 (`[心声] …` / `【心声】…`) — 内心独白, 任何终态输出 (通知/横幅) 都不该带.
+ *  聊天主路径由 applyAssistantPostProcessing.extractInnerVoice 在更上游抽走; 这里是
+ *  没经过那条管线的路径 (worker push 等) 的兜底. */
+const stripInnerVoiceLines = (t: string): string =>
+  t.replace(/^[ \t]*[\[【]\s*心声\s*[\]】][:：]?[ \t]*.*$/gm, '').replace(/\n{3,}/g, '\n\n');
+
 /** 源标签 `[聊天]/[通话]/[约会]` 及英文版 `[Chat]/[Call]/[Date]/[Story: …]` → 换行 (保留分隔语义)
  *  英文形态是 buildMessageHistory 英文化后的历史前缀, 模型同样会模仿漏出 (含小写 [chat]). */
 const stripSourceTags = (t: string): string => t
@@ -385,8 +391,9 @@ export function sanitizeForNotification(text: string): string {
   result = stripChineseDate(result);
   result = stripRoleNamePrefix(result);
   result = stripSystemLogLeak(result);
-  // 7. 源标签 [聊天] 等
+  // 7. 源标签 [聊天] 等 + 【心声】行
   result = stripSourceTags(result);
+  result = stripInnerVoiceLines(result);
   // 8. 内部状态 / 业务标签 / 引用
   result = stripInnerState(result);
   result = stripBusinessTagsForNotification(result);

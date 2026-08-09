@@ -17,6 +17,7 @@ import { ChatPrompts } from './chatPrompts';
 import { injectMemoryPalace } from './memoryPalace/pipeline';
 import { buildHtmlPrompt } from './htmlPrompt';
 import { buildThinkingChainPrompt } from './thinkingChainPrompt';
+import { buildInnerVoicePrompt } from './innerVoicePrompt';
 import { buildMcdMiniAppContextBlock } from './mcdToolBridge';
 import type { McdMiniAppSnapshot } from './mcdToolBridge';
 import { buildLuckinMiniAppContextBlock, buildLuckinChatSystemBlock } from './luckinToolBridge';
@@ -78,6 +79,8 @@ export interface BuildChatPayloadInput {
     translationConfig?: TranslationConfig | { enabled: boolean; sourceLang: string; targetLang: string };
     htmlMode?: { enabled: boolean; customPrompt?: string };
     thinkingChain?: { enabled: boolean; customPrompt?: string };
+    /** 【心声】开关：开启时在系统提示词末尾追加 [心声] 教学块（见 utils/innerVoicePrompt.ts） */
+    innerVoice?: { enabled: boolean };
     mcdMiniSnap?: McdMiniAppSnapshot;
     luckinMiniSnap?: LuckinMiniAppSnapshot;
     /** 瑞幸聊天点单模式 (点"瑞一杯"激活, 角色直接调真实工具) */
@@ -195,7 +198,7 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
     const {
         char, userProfile, groups, historyMsgs, contextLimit,
         realtimeConfig, innerState,
-        translationConfig, htmlMode, thinkingChain, mcdMiniSnap, luckinMiniSnap, luckinChat,
+        translationConfig, htmlMode, thinkingChain, innerVoice, mcdMiniSnap, luckinMiniSnap, luckinChat,
     } = input;
     // 角色可见性必须在统一载荷层再次收口。UI 聊天、1.0 本地主动消息、2.0 推送、
     // 彼方/小小窝等调用方各自维护筛选很容易漏掉一条路径；一旦把全量表情传进来，
@@ -309,6 +312,12 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
         if (extra) {
             systemPrompt += `\n\n## ${userName}'s Extra Requirements for the Inner Monologue\n${extra}`;
         }
+    }
+
+    // ── 6b. 【心声】提示词 ─────────────────────────────────
+    // 与思考链独立：心声是「回复开头的一行内心独白」，落 metadata 展示，不进任何上下文。
+    if (innerVoice?.enabled) {
+        systemPrompt += `\n\n${buildInnerVoicePrompt(char.name)}`;
     }
 
     // ── 7. 历史消息构造 ───────────────────────────────────

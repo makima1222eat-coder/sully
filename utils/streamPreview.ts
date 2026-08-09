@@ -36,6 +36,7 @@ function isLinePreviewable(line: string): boolean {
     if (!line) return false;
     if (line.includes('[[')) return false;                    // SEND_EMOJI / QUOTE / ACTION / RECALL / XHS_* …
     if (/^\[schedule_message\s*\|/i.test(line)) return false; // 定时消息指令
+    if (/^[\[【]\s*心声\s*[\]】]/.test(line)) return false;    // 【心声】行 → 由后处理抽成 metadata，不预览
     if (/%%BILINGUAL%%|%%TRANS%%/i.test(line)) return false;
     if (/<\/?(?:[语語]音|字幕|翻译|原文|译文|think|thinking|thought)\b/i.test(line)) return false;
     return true;
