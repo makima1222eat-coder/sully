@@ -412,32 +412,13 @@ export const PsycheDecor: React.FC<{ spec: ThinkingChainStyleSpec; compact?: boo
 };
 
 // 【心声】小条：可视化 metadata.innerVoice —— 角色本轮回复前的一行内心独白（对方"听不见"）。
-// 与心象卡片（思考链）独立共存：心声更轻，默认折叠成一行预览，点击展开/收起。
+// 与心象卡片（思考链）独立共存，以轻量的灰色引用条展示。
 // 内容由 applyAssistantPostProcessing.extractInnerVoice 抽取，只落 metadata，不进任何上下文。
 export const InnerVoiceBlock: React.FC<{ voice: string }> = ({ voice }) => {
-    const [expanded, setExpanded] = useState(false);
     const trimmed = (voice || '').trim();
     if (!trimmed) return null;
-    const preview = trimmed.replace(/\s+/g, ' ');
     return (
-        <div className="sully-inner-voice mb-1.5 max-w-[85%]">
-            <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); setExpanded(v => !v); }}
-                className="w-full text-left rounded-xl border border-rose-200/80 bg-rose-50/90 px-3 py-1.5 shadow-sm active:scale-[0.99] transition-transform"
-            >
-                <span className="flex items-center gap-1.5 text-[11px] font-bold text-rose-400 select-none">
-                    <span>💗</span>
-                    <span>心声</span>
-                    <span className="ml-auto font-normal text-rose-300">{expanded ? '收起 ▴' : '展开 ▾'}</span>
-                </span>
-                {expanded ? (
-                    <p className="mt-1 text-[13px] leading-relaxed text-rose-500/90 whitespace-pre-wrap break-words">{trimmed}</p>
-                ) : (
-                    <p className="mt-0.5 text-[12px] text-rose-400/70 truncate">{preview}</p>
-                )}
-            </button>
-        </div>
+        <div className="rg-inner-voice">💭 {trimmed}</div>
     );
 };
 
