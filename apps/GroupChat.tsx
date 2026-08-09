@@ -278,7 +278,7 @@ const GroupMessageItem = React.memo(({
                 // 核心样式字段对齐私聊 MessageItem 的应用方式（decoration/voiceBar 群聊不做）
                 return (
                     <div
-                        className={`px-3.5 py-2 text-[15px] leading-relaxed shadow-sm whitespace-pre-wrap break-all relative overflow-hidden ${isUser ? '' : 'border border-black/5'}`}
+                        className={`px-3.5 py-2 text-[15px] leading-relaxed shadow-sm whitespace-pre-wrap break-words relative overflow-hidden ${isUser ? '' : 'border border-black/5'}`}
                         style={{
                             color: styleConfig.textColor,
                             backgroundColor: styleConfig.backgroundColor,
