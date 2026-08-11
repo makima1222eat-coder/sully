@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useOS } from '../context/OSContext';
 import { ArrowLeft, ArrowClockwise, Newspaper, WarningCircle, ArrowSquareOut } from '@phosphor-icons/react';
-import { DB } from '../utils/db';
 import { RealtimeContextManager } from '../utils/realtimeContext';
 import { trackEvent } from '../utils/analytics';
 import type { HotNewsSnapshot, HotNewsItem } from '../types';
@@ -13,23 +12,25 @@ const HotNewsApp: React.FC = () => {
     const [snapshot, setSnapshot] = useState<HotNewsSnapshot | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+    const regionMeta = RealtimeContextManager.getNewsRegionMeta(realtimeConfig);
 
     const load = useCallback(async () => {
         setLoading(true);
         setError(null);
         try {
-            await RealtimeContextManager.getSlottedHotNews(realtimeConfig);
-            const { id } = RealtimeContextManager.getHotNewsSlot();
-            let snap = await DB.getHotNewsSnapshot(id);
-            if (!snap) snap = await DB.getLatestHotNewsSnapshot();
+            const snap = await RealtimeContextManager.getSlottedNewsSnapshot(realtimeConfig);
             setSnapshot(snap);
-            if (!snap) setError('暂时拉不到热点（可能是网络 / 浏览器 CORS 限制）。换到安卓端、或稍后再试。');
+            if (!snap) {
+                setError(regionMeta.region === 'CN'
+                    ? '暂时拉不到热点（可能是网络 / 浏览器 CORS 限制）。换到安卓端、或稍后再试。'
+                    : `暂时拉不到${regionMeta.label}新闻。请在「实时感知 → 新闻热点」填写 Brave Search API Key。`);
+            }
         } catch (e: any) {
             setError(e?.message || '加载失败');
         } finally {
             setLoading(false);
         }
-    }, [realtimeConfig]);
+    }, [realtimeConfig, regionMeta.label, regionMeta.region]);
 
     // 手动刷新：无视时段去重，强制重拉当前时段
     const forceRefresh = useCallback(async () => {
@@ -37,19 +38,13 @@ const HotNewsApp: React.FC = () => {
         setError(null);
         trackEvent('手动刷新热点日报');
         try {
-            const { id, date, slot, label } = RealtimeContextManager.getHotNewsSlot();
-            const platforms = (realtimeConfig.newsPlatforms && realtimeConfig.newsPlatforms.length > 0)
-                ? realtimeConfig.newsPlatforms
-                : RealtimeContextManager.DEFAULT_HOTNEWS_PLATFORMS;
-            const items = await RealtimeContextManager.fetchHotNews(platforms);
-            if (items.length > 0) {
-                const fresh: HotNewsSnapshot = { id, date, slot, slotLabel: label, items, platforms, fetchedAt: Date.now() };
-                await DB.saveHotNewsSnapshot(fresh);
+            const startedAt = Date.now();
+            const fresh = await RealtimeContextManager.getSlottedNewsSnapshot(realtimeConfig, true);
+            if (fresh && fresh.fetchedAt >= startedAt) {
                 setSnapshot(fresh);
-                addToast(`已刷新 · ${label} ${items.length} 条`, 'success');
+                addToast(`已刷新 · ${regionMeta.label} ${fresh.items.length} 条`, 'success');
             } else {
-                const latest = await DB.getLatestHotNewsSnapshot();
-                setSnapshot(latest);
+                setSnapshot(fresh);
                 addToast('刷新失败，沿用上次结果', 'error');
             }
         } catch (e: any) {
@@ -57,7 +52,7 @@ const HotNewsApp: React.FC = () => {
         } finally {
             setLoading(false);
         }
-    }, [realtimeConfig, addToast]);
+    }, [realtimeConfig, addToast, regionMeta.label]);
 
     useEffect(() => { load(); }, [load]);
 
@@ -106,6 +101,7 @@ const HotNewsApp: React.FC = () => {
                 <div className="text-center pt-4 pb-3 border-b border-stone-400">
                     <p className="text-[10px] tracking-[0.4em] text-stone-500 uppercase">SullyOS Daily</p>
                     <h2 className="text-3xl font-black tracking-tight mt-1">今 日 热 点</h2>
+                    <p className="text-[11px] font-bold text-red-700 mt-1">{regionMeta.label}新闻</p>
                     {snapshot && (
                         <p className="text-[11px] text-stone-500 mt-1.5">
                             {snapshot.date} · {snapshot.slotLabel}版（{SLOT_WINDOW[snapshot.slot] || ''}） · 更新于 {fetchedTime}
@@ -176,7 +172,7 @@ const HotNewsApp: React.FC = () => {
 
                 {snapshot && (
                     <p className="text-center text-[10px] text-stone-400 mt-6 tracking-wide">
-                        — 数据来自 hot_news（news.orz.ai）多平台热榜 · 每天 6 个时段自动更新 · 点右上角可手动真·刷新 —
+                        — {regionMeta.region === 'CN' ? '数据来自 hot_news（news.orz.ai）多平台热榜' : `数据来自 Brave News · 最近 24 小时 · ${regionMeta.timezone}`} · 每天 6 个时段自动更新 · 点右上角可手动真·刷新 —
                     </p>
                 )}
             </div>

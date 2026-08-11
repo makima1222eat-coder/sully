@@ -520,6 +520,9 @@ export interface RealtimeConfig {
   newsEnabled: boolean;
   newsApiKey?: string;
   newsPlatforms?: string[];  // hot_news 热榜平台 key 列表（默认主源，免鉴权），留空用内置默认
+  newsRegion?: 'CN' | 'GB' | 'ALL'; // 中国用 hot_news；英国/全球用 Brave News
+  newsLanguage?: string;     // Brave News 搜索语言，英国/全球默认 en
+  newsTimezone?: string;     // 「今日/时段」的时区，默认随地区推导
 
   // Notion 配置
   notionEnabled: boolean;

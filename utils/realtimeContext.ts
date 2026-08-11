@@ -24,7 +24,11 @@ import {
     checkSpecialDates as checkSpecialDatesCore,
     clearGeocodeCache,
     fetchHotNews as fetchHotNewsCore,
+    fetchBraveRegionalNews,
     getHotNewsSlot as getHotNewsSlotCore,
+    getNewsScopePlatforms,
+    NEWS_REGION_META,
+    normalizeNewsRegion,
     resolveHotNewsPlatforms,
     sameHotNewsPlatforms,
     pickRandomNews,
@@ -34,6 +38,7 @@ import {
     REALTIME_NEWS_PICK_COUNT,
     type WeatherData,
     type NewsItem,
+    type NewsRegion,
 } from './realtimeWorldCore';
 import { getLocalDateKey } from './localDate';
 
@@ -42,7 +47,7 @@ import { getLocalDateKey } from './localDate';
 //   realtimeFetchCore  搜索 / Notion / 飞书的读取类纯 fetch（服务端工具循环用）
 //   realtimeWorldCore  天气 / 热搜 / 节日的取数与成段渲染（到点组 prompt 用）
 export type { SearchResult, DiaryPreview, FeishuDiaryPreview } from './realtimeFetchCore';
-export type { WeatherData, NewsItem } from './realtimeWorldCore';
+export type { WeatherData, NewsItem, NewsRegion } from './realtimeWorldCore';
 export {
     fetchOwmWeather,
     fetchOpenMeteoWeather,
@@ -57,8 +62,11 @@ export interface RealtimeConfig {
 
     // 新闻配置
     newsEnabled: boolean;
-    newsApiKey?: string;    // 可选，Brave Search 回落源用
+    newsApiKey?: string;    // 英国/全球主源，中国模式的回落源
     newsPlatforms?: string[]; // hot_news 热榜平台 key（默认主源，免鉴权），留空用内置默认
+    newsRegion?: NewsRegion;
+    newsLanguage?: string;
+    newsTimezone?: string;
 
     // Notion 配置
     notionEnabled: boolean;
@@ -98,6 +106,9 @@ export const defaultRealtimeConfig: RealtimeConfig = {
     newsEnabled: false,
     newsApiKey: '',
     newsPlatforms: ['weibo', 'zhihu', 'baidu', 'bilibili', 'douyin'],
+    newsRegion: 'CN',
+    newsLanguage: 'zh',
+    newsTimezone: 'Asia/Shanghai',
     notionEnabled: false,
     notionApiKey: '',
     notionDatabaseId: '',
@@ -117,7 +128,7 @@ export const defaultRealtimeConfig: RealtimeConfig = {
 
 // 缓存
 let weatherCache: { data: WeatherData | null; timestamp: number } = { data: null, timestamp: 0 };
-let newsCache: { data: NewsItem[]; timestamp: number } = { data: [], timestamp: 0 };
+let newsCache: { key: string; data: NewsItem[]; timestamp: number } = { key: '', data: [], timestamp: 0 };
 
 
 export const RealtimeContextManager = {
@@ -178,113 +189,122 @@ export const RealtimeContextManager = {
         return final;
     },
 
-    // 一天分 6 段（每 4 小时）：0-4 凌晨 / 4-8 清晨 / 8-12 上午 / 12-16 午后 / 16-20 傍晚 / 20-24 夜间。
+    // 旧入口保留给调试/测试；区域新闻用 getNewsSlot，它会按新闻所属地的时区计算。
     getHotNewsSlot: (d: Date = new Date()) => getHotNewsSlotCore({ now: d }),
 
-    // 同一时段并发只真正发一次请求（群聊 / 多角色同时回复时复用同一 Promise）
+    getNewsRegion: (config: Pick<RealtimeConfig, 'newsRegion'>): NewsRegion =>
+        normalizeNewsRegion(config.newsRegion),
+
+    getNewsRegionMeta: (config: Pick<RealtimeConfig, 'newsRegion' | 'newsTimezone' | 'newsLanguage'>) => {
+        const region = normalizeNewsRegion(config.newsRegion);
+        const defaults = NEWS_REGION_META[region];
+        return {
+            region,
+            label: defaults.label,
+            timezone: config.newsTimezone?.trim() || defaults.timezone,
+            language: config.newsLanguage?.trim() || defaults.language,
+        };
+    },
+
+    getNewsSlot: (config: Pick<RealtimeConfig, 'newsRegion' | 'newsTimezone'>, d: Date = new Date()) => {
+        const meta = RealtimeContextManager.getNewsRegionMeta(config);
+        const base = getHotNewsSlotCore({ tz: meta.timezone, now: d });
+        return { ...base, id: meta.region === 'CN' ? base.id : `${base.id}#${meta.region}` };
+    },
+
+    getNewsPlatforms: (config: Pick<RealtimeConfig, 'newsRegion' | 'newsPlatforms'>): string[] =>
+        getNewsScopePlatforms(normalizeNewsRegion(config.newsRegion), config.newsPlatforms),
+
+    fetchBraveNews: async (apiKey: string, region: NewsRegion = 'CN', language?: string, count = 20): Promise<NewsItem[]> =>
+        fetchBraveRegionalNews({ proxyWorkerUrl: getProxyWorkerUrl(), apiKey, region, language, count }),
+
+    /** 中国走免 key 的 hot_news，英国/全球走 Brave News。 */
+    fetchConfiguredNews: async (config: RealtimeConfig, total = 240): Promise<NewsItem[]> => {
+        const meta = RealtimeContextManager.getNewsRegionMeta(config);
+        if (meta.region === 'CN') {
+            return RealtimeContextManager.fetchHotNews(config.newsPlatforms, 12, total);
+        }
+        return RealtimeContextManager.fetchBraveNews(config.newsApiKey || '', meta.region, meta.language, Math.min(total, 50));
+    },
+
+    // 同一地区、同一时段并发只真正发一次请求。
     _hotNewsInFlight: new Map<string, Promise<NewsItem[]>>(),
 
-    /**
-     * 分时段热点：每天每时段最多拉一次，持久化在 IndexedDB，全角色共享。
-     * - 本时段已有快照且平台集一致 → 直接复用，不发请求
-     * - 否则拉一次并存快照；拉失败则退回最近一次快照（且不写本时段，下次会重试）
-     */
-    getSlottedHotNews: async (config: RealtimeConfig): Promise<NewsItem[]> => {
-        const { id, date, slot, label } = RealtimeContextManager.getHotNewsSlot();
-        const platforms = resolveHotNewsPlatforms(config.newsPlatforms);
+    /** 取当前区域的分时段快照；force=true 时强制重拉。 */
+    getSlottedNewsSnapshot: async (config: RealtimeConfig, force = false) => {
+        const { id, date, slot, label } = RealtimeContextManager.getNewsSlot(config);
+        const platforms = RealtimeContextManager.getNewsPlatforms(config);
 
-        // 1. 命中本时段快照（平台一致）→ 复用
-        try {
-            const snap = await DB.getHotNewsSnapshot(id);
-            if (snap && snap.items?.length > 0 && sameHotNewsPlatforms(snap.platforms, platforms)) {
-                const mins = Math.round((Date.now() - snap.fetchedAt) / 60000);
-                console.log(`%c[hot_news] 命中今日${label}快照（${snap.items.length} 条，${mins} 分钟前拉的）`, 'color:#16a34a');
-                return snap.items;
-            }
-        } catch { /* 读快照失败就当没有，继续去拉 */ }
+        if (!force) {
+            try {
+                const snap = await DB.getHotNewsSnapshot(id);
+                if (snap && snap.items?.length > 0 && sameHotNewsPlatforms(snap.platforms, platforms)) {
+                    const mins = Math.round((Date.now() - snap.fetchedAt) / 60000);
+                    console.log(`%c[news] 命中今日${label}快照（${snap.items.length} 条，${mins} 分钟前拉的）`, 'color:#16a34a');
+                    return snap;
+                }
+            } catch { /* 读快照失败就继续拉 */ }
+        }
 
-        // 2. in-flight 锁：本时段已有在飞请求就复用
-        const inflight = RealtimeContextManager._hotNewsInFlight.get(id);
-        if (inflight) return inflight;
+        const scopeKey = platforms.slice().sort().join(',');
+        const inflightKey = `${id}#${scopeKey}${force ? '#force' : ''}`;
+        const inflight = RealtimeContextManager._hotNewsInFlight.get(inflightKey);
+        if (inflight) {
+            await inflight;
+            return DB.getHotNewsSnapshot(id).catch(() => null);
+        }
 
         const job = (async (): Promise<NewsItem[]> => {
-            console.log(`%c[hot_news] 触发今日${label}拉取…`, 'color:#2563eb;font-weight:bold');
-            const items = await RealtimeContextManager.fetchHotNews(platforms);
+            const items = await RealtimeContextManager.fetchConfiguredNews(config);
             if (items.length > 0) {
                 try {
                     await DB.saveHotNewsSnapshot({ id, date, slot, slotLabel: label, items, platforms, fetchedAt: Date.now() });
-                    DB.pruneHotNewsSnapshots(12).catch(() => {});
+                    DB.pruneHotNewsSnapshots(18).catch(() => {});
                 } catch { /* 存快照失败不影响返回 */ }
-                return items;
             }
-            // 拉取失败 → 退回最近一次快照（不写本时段，下条消息会再试）
-            try {
-                const latest = await DB.getLatestHotNewsSnapshot();
-                if (latest && latest.items?.length > 0) {
-                    console.warn(`[hot_news] ${label}拉取失败，复用最近快照（${latest.date} ${latest.slotLabel}，${latest.items.length} 条）`);
-                    return latest.items;
-                }
-            } catch { /* ignore */ }
-            return [];
+            return items;
         })();
 
-        RealtimeContextManager._hotNewsInFlight.set(id, job);
+        RealtimeContextManager._hotNewsInFlight.set(inflightKey, job);
         try {
-            return await job;
-        } finally {
-            RealtimeContextManager._hotNewsInFlight.delete(id);
-        }
-    },
-
-    /**
-     * 使用 Brave Search API 获取新闻（通过自建 Cloudflare Worker 代理）
-     */
-    fetchBraveNews: async (apiKey: string): Promise<NewsItem[]> => {
-        try {
-            // 使用自建的 Cloudflare Worker 代理
-            const workerUrl = `${getProxyWorkerUrl()}/news?q=热点新闻&count=5&country=cn`;
-
-            const response = await fetch(workerUrl, {
-                headers: {
-                    'Accept': 'application/json',
-                    'X-Brave-API-Key': apiKey  // Worker 需要这个 header
+            const items = await job;
+            const saved = await DB.getHotNewsSnapshot(id).catch(() => null);
+            if (saved?.items?.length && sameHotNewsPlatforms(saved.platforms, platforms)) return saved;
+            if (items.length > 0) {
+                return { id, date, slot, slotLabel: label, items, platforms, fetchedAt: Date.now() };
+            }
+            if (items.length === 0) {
+                const latest = await DB.getLatestHotNewsSnapshot(platforms).catch(() => null);
+                if (latest?.items?.length && Date.now() - latest.fetchedAt <= 24 * 60 * 60 * 1000) {
+                    console.warn(`[news] ${label}拉取失败，复用同地区最近快照（${latest.date} ${latest.slotLabel}）`);
+                    return latest;
                 }
-            });
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                console.error('Brave API error:', response.status, errorText);
-                return [];
+                return null;
             }
-
-            const data = await safeResponseJson(response);
-
-            // Brave News API 返回结构
-            if (data.results && data.results.length > 0) {
-                return data.results.slice(0, 5).map((item: any) => ({
-                    title: item.title,
-                    source: item.meta_url?.netloc || item.source || 'Brave新闻',
-                    url: item.url
-                }));
-            }
-            return [];
-        } catch (e) {
-            console.error('Brave Search failed:', e);
-            return [];
+            return null;
+        } finally {
+            RealtimeContextManager._hotNewsInFlight.delete(inflightKey);
         }
     },
+
+    getSlottedNews: async (config: RealtimeConfig, force = false): Promise<NewsItem[]> =>
+        (await RealtimeContextManager.getSlottedNewsSnapshot(config, force))?.items || [],
+
+    /** @deprecated 保留旧调用名。 */
+    getSlottedHotNews: async (config: RealtimeConfig): Promise<NewsItem[]> =>
+        RealtimeContextManager.getSlottedNews(config),
 
     /**
      * 获取热点新闻
-     * 优先级: hot_news 分时段快照（默认主源，每天每时段最多拉一次）> Brave Search API > Hacker News
+     * 主源: 中国 hot_news；英国/全球 Brave News。主源失败后才用同区快照/Hacker News 兜底。
      */
     fetchNews: async (config: RealtimeConfig): Promise<NewsItem[]> => {
         if (!config.newsEnabled) {
             return [];
         }
 
-        // 1. 默认主源：hot_news 分时段持久化快照（全角色共享，自带 IndexedDB 缓存与 in-flight 锁）
-        const slotted = await RealtimeContextManager.getSlottedHotNews(config);
+        // 1. 区域主源：中国 hot_news，英国/全球 Brave News。
+        const slotted = await RealtimeContextManager.getSlottedNews(config);
         if (slotted.length > 0) {
             return slotted;
         }
@@ -292,18 +312,19 @@ export const RealtimeContextManager = {
         // ── 回落源用内存缓存兜一下，避免降级态下每条消息都打 Brave/HN ──
         const now = Date.now();
         const cacheMs = config.cacheMinutes * 60 * 1000;
-        if (newsCache.data.length > 0 && (now - newsCache.timestamp) < cacheMs) {
+        const cacheKey = RealtimeContextManager.getNewsPlatforms(config).slice().sort().join(',');
+        if (newsCache.key === cacheKey && newsCache.data.length > 0 && (now - newsCache.timestamp) < cacheMs) {
             return newsCache.data;
         }
 
         let news: NewsItem[] = [];
 
         // 2. 回落：Brave Search API（需 key，走 Worker 代理）
-        if (config.newsApiKey) {
-            news = await RealtimeContextManager.fetchBraveNews(config.newsApiKey);
+        if (RealtimeContextManager.getNewsRegion(config) === 'CN' && config.newsApiKey) {
+            news = await RealtimeContextManager.fetchBraveNews(config.newsApiKey, 'CN', config.newsLanguage || 'zh', 20);
             if (news.length > 0) {
                 console.log(`%c[hot_news] 本次新闻源 = Brave 回落（${news.length} 条）`, 'color:#d97706;font-weight:bold');
-                newsCache = { data: news, timestamp: now };
+                newsCache = { key: cacheKey, data: news, timestamp: now };
                 return news;
             }
         }
@@ -312,7 +333,7 @@ export const RealtimeContextManager = {
         news = await RealtimeContextManager.fetchBackupNews();
         if (news.length > 0) {
             console.log(`%c[hot_news] 本次新闻源 = Hacker News 兜底（${news.length} 条，英文）`, 'color:#dc2626;font-weight:bold');
-            newsCache = { data: news, timestamp: now };
+            newsCache = { key: cacheKey, data: news, timestamp: now };
         }
         return news;
     },
@@ -456,7 +477,7 @@ export const RealtimeContextManager = {
      */
     clearCache: () => {
         weatherCache = { data: null, timestamp: 0 };
-        newsCache = { data: [], timestamp: 0 };
+        newsCache = { key: '', data: [], timestamp: 0 };
         clearGeocodeCache();
     },
 

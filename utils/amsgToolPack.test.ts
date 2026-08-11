@@ -84,6 +84,9 @@ describe('buildToolConfig / parseToolConfig', () => {
       weatherEnabled: true,
       weatherCity: '上海',
       newsPlatforms: ['weibo', 'zhihu'],
+      newsRegion: 'GB',
+      newsLanguage: 'en',
+      newsTimezone: 'Europe/London',
     } as unknown as RealtimeConfig;
 
     const config = buildToolConfig(rc);
@@ -98,6 +101,9 @@ describe('buildToolConfig / parseToolConfig', () => {
     expect(parsed?.weatherEnabled).toBe(true);
     expect(parsed?.weatherCity).toBe('上海');
     expect(parsed?.newsPlatforms).toEqual(['weibo', 'zhihu']);
+    expect(parsed?.newsRegion).toBe('GB');
+    expect(parsed?.newsLanguage).toBe('en');
+    expect(parsed?.newsTimezone).toBe('Europe/London');
     // 未配置的可选键不写（省 payload，也避免 undefined 序列化怪态）
     expect('feishuAppId' in config).toBe(false);
   });
