@@ -68,6 +68,9 @@ export interface XhsConfig {
 export interface AgenticToolRealtimeConfig {
     newsEnabled: boolean;
     newsApiKey?: string;
+    newsRegion?: 'CN' | 'GB' | 'ALL';
+    newsLanguage?: string;
+    newsTimezone?: string;
     notionEnabled: boolean;
     notionApiKey?: string;
     notionDatabaseId?: string;

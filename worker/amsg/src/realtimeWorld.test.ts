@@ -199,6 +199,35 @@ describe('热榜快照', () => {
         expect(writeState.mock.calls[0][1][0].key).toBe(AMSG_HOTNEWS_SNAPSHOT_KEY);
     });
 
+    it('英国模式到点直接拉 Brave News，不拉中文热榜', async () => {
+        fetchMock.mockResolvedValue(new Response(JSON.stringify({
+            results: [{ title: 'UK breaking news', description: 'Summary', url: 'https://example.co.uk/news' }],
+        }), { status: 200 }));
+        const writeState = vi.fn().mockResolvedValue({});
+
+        const out = await run({
+            toolConfig: cfg({
+                newsEnabled: true,
+                newsRegion: 'GB',
+                newsLanguage: 'en',
+                newsTimezone: 'Europe/London',
+                newsApiKey: 'brave-key',
+            }),
+            writeState,
+        });
+
+        expect(out).toContain('UK breaking news');
+        const [rawUrl, init] = fetchMock.mock.calls[0];
+        const url = new URL(rawUrl as string);
+        expect(url.pathname).toBe('/news');
+        expect(url.searchParams.get('country')).toBe('GB');
+        expect(url.searchParams.get('freshness')).toBe('pd');
+        expect((init?.headers as Record<string, string>)['X-Brave-API-Key']).toBe('brave-key');
+        const saved = JSON.parse(writeState.mock.calls[0][1][0].value);
+        expect(saved.id).toBe('2026-12-25#1#GB');
+        expect(saved.platforms).toEqual(['brave:GB']);
+    });
+
     it('拉不到 → 退回上个时段的，不留空段', async () => {
         const out = await run({
             toolConfig: cfg({ newsEnabled: true, newsPlatforms: ['weibo'] }),

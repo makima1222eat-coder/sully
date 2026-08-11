@@ -31,6 +31,21 @@ export interface NewsItem {
     desc?: string;
 }
 
+export type NewsRegion = 'CN' | 'GB' | 'ALL';
+
+export const NEWS_REGION_META: Record<NewsRegion, { label: string; timezone: string; language: string }> = {
+    CN: { label: '中国', timezone: 'Asia/Shanghai', language: 'zh' },
+    GB: { label: '英国', timezone: 'Europe/London', language: 'en' },
+    ALL: { label: '全球', timezone: 'UTC', language: 'en' },
+};
+
+export const normalizeNewsRegion = (region?: string): NewsRegion =>
+    region === 'GB' || region === 'ALL' ? region : 'CN';
+
+/** 快照中用伪平台标识 Brave 地区，避免切换国家后复用错的旧闻。 */
+export const getNewsScopePlatforms = (region: NewsRegion, platforms?: string[]): string[] =>
+    region === 'CN' ? resolveHotNewsPlatforms(platforms) : [`brave:${region}`];
+
 /**
  * 叶子里不用 safeApi 的 safeResponseJson——那份挂着开发面板的接口日志，是浏览器侧的东西。
  * 这里只要「响应不是 JSON 就抛出带原文片段的错」，让调用方能在日志里看出拉到了什么。
@@ -379,6 +394,71 @@ export const fetchHotNews = async (platforms?: string[], perPlatform = 12, total
         }
     }
     return merged.slice(0, total);
+};
+
+export interface BraveRegionalNewsOptions {
+    proxyWorkerUrl: string;
+    apiKey: string;
+    region: NewsRegion;
+    language?: string;
+    count?: number;
+}
+
+/**
+ * 通过项目自带的 Worker 调 Brave News Search。GB 是英国结果，ALL 是全球结果；
+ * freshness=pd 限制在最近 24 小时，比不带时效筛选更符合「当日新闻」。
+ */
+export const fetchBraveRegionalNews = async (opts: BraveRegionalNewsOptions): Promise<NewsItem[]> => {
+    const apiKey = opts.apiKey.trim();
+    const proxyWorkerUrl = opts.proxyWorkerUrl.trim().replace(/\/+$/, '');
+    if (!apiKey || !proxyWorkerUrl) return [];
+
+    const language = (opts.language || NEWS_REGION_META[opts.region].language).trim() || 'en';
+    const count = Math.max(1, Math.min(50, opts.count ?? 20));
+    const params = new URLSearchParams({
+        q: opts.region === 'CN' ? 'China top news' : opts.region === 'GB' ? 'UK top news' : 'world top news',
+        count: String(count),
+        country: opts.region,
+        search_lang: language,
+        ui_lang: opts.region === 'CN' ? 'zh-CN' : opts.region === 'GB' ? 'en-GB' : 'en-US',
+        freshness: 'pd',
+        safesearch: 'moderate',
+    });
+
+    try {
+        const response = await fetch(`${proxyWorkerUrl}/news?${params.toString()}`, {
+            headers: {
+                Accept: 'application/json',
+                'X-Brave-API-Key': apiKey,
+            },
+        });
+        if (!response.ok) {
+            console.warn(`[Brave News] ${opts.region} HTTP ${response.status}`);
+            return [];
+        }
+
+        const data = await readJson(response);
+        const results: any[] = Array.isArray(data?.results) ? data.results : [];
+        return results
+            .filter((item) => item && item.title)
+            .slice(0, count)
+            .map((item) => {
+                const rawDesc = typeof item.description === 'string'
+                    ? item.description
+                    : typeof item.snippet === 'string' ? item.snippet : '';
+                const desc = rawDesc.replace(/\s+/g, ' ').trim();
+                const title = String(item.title).trim();
+                return {
+                    title,
+                    source: item.meta_url?.netloc || item.source || 'Brave News',
+                    url: item.url,
+                    desc: desc && desc !== title ? desc : undefined,
+                } satisfies NewsItem;
+            });
+    } catch (e: any) {
+        console.warn(`[Brave News] ${opts.region} 拉取失败:`, e?.message || e);
+        return [];
+    }
 };
 
 /**

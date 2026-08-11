@@ -50,3 +50,42 @@ describe('RealtimeContextManager.fetchHotNews', () => {
         await expect(RealtimeContextManager.fetchHotNews(['weibo'])).resolves.toEqual([]);
     });
 });
+
+describe('RealtimeContextManager 区域新闻', () => {
+    it('英国模式向 Brave 传 GB + 最近 24 小时，并保留摘要', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+            results: [{
+                title: 'UK headline',
+                description: '  A useful summary.  ',
+                url: 'https://www.bbc.co.uk/news/example',
+                meta_url: { netloc: 'bbc.co.uk' },
+            }],
+        })));
+
+        const items = await RealtimeContextManager.fetchBraveNews('brave-key', 'GB', 'en', 20);
+
+        const [rawUrl, init] = vi.mocked(fetch).mock.calls[0];
+        const url = new URL(rawUrl as string);
+        expect(url.pathname).toBe('/news');
+        expect(url.searchParams.get('q')).toBe('UK top news');
+        expect(url.searchParams.get('country')).toBe('GB');
+        expect(url.searchParams.get('freshness')).toBe('pd');
+        expect(url.searchParams.get('search_lang')).toBe('en');
+        expect((init?.headers as Record<string, string>)['X-Brave-API-Key']).toBe('brave-key');
+        expect(items).toEqual([{
+            title: 'UK headline', source: 'bbc.co.uk', url: 'https://www.bbc.co.uk/news/example', desc: 'A useful summary.',
+        }]);
+    });
+
+    it('按新闻地区时区分段，并用地区后缀隔离快照', () => {
+        const at = new Date('2026-08-11T23:30:00Z');
+        expect(RealtimeContextManager.getNewsSlot({ newsRegion: 'GB' }, at)).toMatchObject({
+            id: '2026-08-12#0#GB', date: '2026-08-12', slot: 0,
+        });
+        expect(RealtimeContextManager.getNewsSlot({ newsRegion: 'ALL' }, at)).toMatchObject({
+            id: '2026-08-11#5#ALL', date: '2026-08-11', slot: 5,
+        });
+        expect(RealtimeContextManager.getNewsPlatforms({ newsRegion: 'GB' })).toEqual(['brave:GB']);
+        expect(RealtimeContextManager.getNewsPlatforms({ newsRegion: 'ALL' })).toEqual(['brave:ALL']);
+    });
+});
