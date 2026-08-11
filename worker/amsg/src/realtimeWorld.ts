@@ -13,12 +13,15 @@
 
 import {
   checkSpecialDates,
+  fetchBraveRegionalNews,
   fetchHotNews,
   fetchWeatherWithFallback,
   getHotNewsSlot,
+  getNewsScopePlatforms,
+  NEWS_REGION_META,
+  normalizeNewsRegion,
   pickRandomNews,
   renderRealtimeWorldBlock,
-  resolveHotNewsPlatforms,
   sameHotNewsPlatforms,
   REALTIME_NEWS_PICK_COUNT,
   type NewsItem,
@@ -42,12 +45,6 @@ const WEATHER_TTL_MS = 30 * 60 * 1000;
  */
 const WEATHER_FALLBACK_MAX_AGE_MS = 3 * 60 * 60 * 1000;
 const HOTNEWS_FALLBACK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-
-/**
- * 热榜按「国内现在几点」分时段。worker 跑在 UTC 上，不指定时区的话「今日上午」
- * 会跟榜单自己的作息差好几个时段。
- */
-const HOTNEWS_SLOT_TZ = 'Asia/Shanghai';
 
 /** 存进快照的热榜条数。每次触发只随机抽几条注入，留这些够换着说很多轮了。 */
 const HOTNEWS_KEEP = 60;
@@ -154,8 +151,11 @@ const loadHotNews = async (
   globalRows: StateRow[],
   pendingWrites: Array<{ key: string; value: string }>,
 ): Promise<NewsItem[]> => {
-  const platforms = resolveHotNewsPlatforms(cfg.newsPlatforms);
-  const slot = getHotNewsSlot({ tz: HOTNEWS_SLOT_TZ, now: new Date(nowMs) });
+  const region = normalizeNewsRegion(cfg.newsRegion);
+  const platforms = getNewsScopePlatforms(region, cfg.newsPlatforms);
+  const timezone = cfg.newsTimezone?.trim() || NEWS_REGION_META[region].timezone;
+  const slotBase = getHotNewsSlot({ tz: timezone, now: new Date(nowMs) });
+  const slot = { ...slotBase, id: region === 'CN' ? slotBase.id : `${slotBase.id}#${region}` };
 
   const snap = parseSnapshot<HotNewsSnapshot>(globalRows, AMSG_HOTNEWS_SNAPSHOT_KEY,
     (v) => v && typeof v.id === 'string' && Array.isArray(v.items) && Array.isArray(v.platforms)
@@ -165,7 +165,15 @@ const loadHotNews = async (
     return snap.items;
   }
 
-  const fresh = await fetchHotNews(platforms, 12, HOTNEWS_KEEP);
+  const fresh = region === 'CN'
+    ? await fetchHotNews(cfg.newsPlatforms, 12, HOTNEWS_KEEP)
+    : await fetchBraveRegionalNews({
+        proxyWorkerUrl: cfg.proxyWorkerUrl,
+        apiKey: cfg.newsApiKey || '',
+        region,
+        language: cfg.newsLanguage || NEWS_REGION_META[region].language,
+        count: Math.min(HOTNEWS_KEEP, 50),
+      });
   if (fresh.length > 0) {
     pendingWrites.push({
       key: AMSG_HOTNEWS_SNAPSHOT_KEY,
@@ -175,7 +183,8 @@ const loadHotNews = async (
   }
   // 一条都没拉到：用上个时段的顶一下，且不写快照，下次触发重试。
   // 隔天的旧闻不顶——那时候「最近发生的事」已经不是最近了。
-  if (snap && snap.items.length > 0 && nowMs - snap.fetchedAt <= HOTNEWS_FALLBACK_MAX_AGE_MS) {
+  if (snap && snap.items.length > 0 && sameHotNewsPlatforms(snap.platforms, platforms)
+      && nowMs - snap.fetchedAt <= HOTNEWS_FALLBACK_MAX_AGE_MS) {
     console.warn('[amsg:world] 热榜拉取失败，先用上个时段的', { was: snap.id, want: slot.id });
     return snap.items;
   }

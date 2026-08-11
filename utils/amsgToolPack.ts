@@ -56,7 +56,7 @@ export interface AmsgToolConfig extends AgenticToolRealtimeConfig {
   weatherEnabled: boolean;
   weatherCity?: string;
   weatherApiKey?: string;
-  /** 热榜要拉哪几个平台（继承来的 newsEnabled 管开关）。留空 worker 用内置默认。 */
+  /** 中国热榜要拉哪几个平台（英国/全球模式改用 Brave News）。 */
   newsPlatforms?: string[];
   /** 上云这份比工具侧多一个 cookie（lite 模式的登录态），并且两个开关字段是必填。 */
   xhsMcpConfig?: {
@@ -137,6 +137,9 @@ export const buildToolConfig = (
     newsEnabled: !!rc?.newsEnabled,
     ...(rc?.newsApiKey ? { newsApiKey: rc.newsApiKey } : {}),
     ...(rc?.newsPlatforms?.length ? { newsPlatforms: rc.newsPlatforms } : {}),
+    ...(rc?.newsRegion ? { newsRegion: rc.newsRegion } : {}),
+    ...(rc?.newsLanguage ? { newsLanguage: rc.newsLanguage } : {}),
+    ...(rc?.newsTimezone ? { newsTimezone: rc.newsTimezone } : {}),
     notionEnabled: !!rc?.notionEnabled,
     ...(rc?.notionApiKey ? { notionApiKey: rc.notionApiKey } : {}),
     ...(rc?.notionDatabaseId ? { notionDatabaseId: rc.notionDatabaseId } : {}),

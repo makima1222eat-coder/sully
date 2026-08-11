@@ -3985,7 +3985,7 @@ export default {
 
     const braveUrl = new URL(`${BRAVE_ENDPOINT}/${r.kind}/search`);
     braveUrl.searchParams.set("q", q);
-    for (const k of ["count", "offset", "country", "safesearch", "spellcheck"]) {
+    for (const k of ["count", "offset", "country", "safesearch", "spellcheck", "freshness", "search_lang", "ui_lang"]) {
       const v = url.searchParams.get(k);
       if (v) braveUrl.searchParams.set(k, v);
     }

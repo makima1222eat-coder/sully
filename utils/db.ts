@@ -1644,15 +1644,20 @@ export const DB = {
       transaction.objectStore(STORE_HOTNEWS).put(snapshot);
   },
 
-  // 拿最近一次快照（按 fetchedAt 倒序），失败兜底与 App 展示用
-  getLatestHotNewsSnapshot: async (): Promise<HotNewsSnapshot | null> => {
+  // 拿最近一次快照（按 fetchedAt 倒序）。传 platforms 时只在同一地区/数据源内回落。
+  getLatestHotNewsSnapshot: async (platforms?: string[]): Promise<HotNewsSnapshot | null> => {
       const db = await openDB();
       return new Promise((resolve, reject) => {
           if (!db.objectStoreNames.contains(STORE_HOTNEWS)) { resolve(null); return; }
           const transaction = db.transaction(STORE_HOTNEWS, 'readonly');
           const req = transaction.objectStore(STORE_HOTNEWS).getAll();
           req.onsuccess = () => {
-              const all = (req.result || []) as HotNewsSnapshot[];
+              const all = ((req.result || []) as HotNewsSnapshot[]).filter((snapshot) => {
+                  if (!platforms) return true;
+                  const a = [...(snapshot.platforms || [])].sort();
+                  const b = [...platforms].sort();
+                  return a.length === b.length && a.every((value, index) => value === b[index]);
+              });
               if (all.length === 0) { resolve(null); return; }
               all.sort((a, b) => b.fetchedAt - a.fetchedAt);
               resolve(all[0]);

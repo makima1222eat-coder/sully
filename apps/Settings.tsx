@@ -8,7 +8,7 @@ import { extractContent, safeResponseJson } from '../utils/safeApi';
 import { extractModelIds, normalizeModelIds } from '../utils/modelList';
 import { EXPORT_CHUNK_SIZE, sliceRanges } from '../utils/backupExport';
 import Modal from '../components/os/Modal';
-import { NotionManager, FeishuManager, RealtimeContextManager, fetchOwmWeather, fetchOpenMeteoWeather } from '../utils/realtimeContext';
+import { NotionManager, FeishuManager, RealtimeContextManager, fetchOwmWeather, fetchOpenMeteoWeather, type NewsRegion } from '../utils/realtimeContext';
 import { XhsMcpClient } from '../utils/xhsMcpClient';
 import { getMcdToken, setMcdToken as saveMcdToken, isMcdEnabled, setMcdEnabled as saveMcdEnabled, testMcdConnection, resetMcdSession } from '../utils/mcdMcpClient';
 import { getLuckinToken, setLuckinToken as saveLuckinToken, isLuckinEnabled, setLuckinEnabled as saveLuckinEnabled, testLuckinConnection, resetLuckinSession } from '../utils/luckinMcpClient';
@@ -496,6 +496,9 @@ const Settings: React.FC = () => {
   const [rtNewsEnabled, setRtNewsEnabled] = useState(realtimeConfig.newsEnabled);
   const [rtNewsApiKey, setRtNewsApiKey] = useState(realtimeConfig.newsApiKey || '');
   const [rtNewsPlatforms, setRtNewsPlatforms] = useState<string[]>(realtimeConfig.newsPlatforms || ['weibo', 'zhihu', 'baidu', 'bilibili', 'douyin']);
+  const [rtNewsRegion, setRtNewsRegion] = useState<NewsRegion>(
+      realtimeConfig.newsRegion === 'GB' || realtimeConfig.newsRegion === 'ALL' ? realtimeConfig.newsRegion : 'CN'
+  );
   const [rtNotionEnabled, setRtNotionEnabled] = useState(realtimeConfig.notionEnabled);
   const [rtNotionKey, setRtNotionKey] = useState(realtimeConfig.notionApiKey);
   const [rtNotionDbId, setRtNotionDbId] = useState(realtimeConfig.notionDatabaseId);
@@ -1306,6 +1309,9 @@ const Settings: React.FC = () => {
           newsEnabled: rtNewsEnabled,
           newsApiKey: rtNewsApiKey,
           newsPlatforms: rtNewsPlatforms,
+          newsRegion: rtNewsRegion,
+          newsLanguage: rtNewsRegion === 'CN' ? 'zh' : 'en',
+          newsTimezone: rtNewsRegion === 'CN' ? 'Asia/Shanghai' : rtNewsRegion === 'GB' ? 'Europe/London' : 'UTC',
           notionEnabled: rtNotionEnabled,
           notionApiKey: rtNotionKey,
           notionDatabaseId: rtNotionDbId,
@@ -3172,40 +3178,61 @@ const Settings: React.FC = () => {
                       </label>
                   </div>
                   {rtNewsEnabled && (
-                      <div className="space-y-2">
-                          <p className="text-xs text-blue-600/70">默认主源：中文多平台热榜（免鉴权，聊天时角色会自动捕捉热点）。选择要关注的平台：</p>
-                          <div className="flex flex-wrap gap-1.5">
-                              {HOTNEWS_PLATFORM_OPTIONS.map(p => {
-                                  const active = rtNewsPlatforms.includes(p.key);
-                                  return (
+                      <div className="space-y-3">
+                          <div>
+                              <p className="text-[10px] font-bold text-slate-400 uppercase mb-1.5">新闻范围</p>
+                              <div className="grid grid-cols-3 gap-1.5">
+                                  {([
+                                      { key: 'CN', label: '中国' },
+                                      { key: 'GB', label: '英国' },
+                                      { key: 'ALL', label: '全球' },
+                                  ] as { key: NewsRegion; label: string }[]).map(option => (
                                       <button
-                                          key={p.key}
+                                          key={option.key}
                                           type="button"
-                                          onClick={() => setRtNewsPlatforms(prev => prev.includes(p.key) ? prev.filter(k => k !== p.key) : [...prev, p.key])}
-                                          className={`text-[11px] px-2.5 py-1 rounded-full font-bold transition-colors active:scale-95 ${active ? 'bg-blue-500 text-white shadow-sm' : 'bg-white/80 text-slate-500 border border-blue-200'}`}
+                                          onClick={() => setRtNewsRegion(option.key)}
+                                          className={`py-2 rounded-xl text-xs font-bold transition-colors active:scale-95 ${rtNewsRegion === option.key ? 'bg-blue-500 text-white shadow-sm' : 'bg-white/80 text-slate-500 border border-blue-200'}`}
                                       >
-                                          {p.label}
+                                          {option.label}
                                       </button>
-                                  );
-                              })}
-                          </div>
-                          {rtNewsPlatforms.length === 0 && (
-                              <p className="text-[10px] text-rose-500/80">未选任何平台时会回落到 Brave / Hacker News。</p>
-                          )}
-                          <details className="border-t border-blue-200/50 pt-2 mt-1 group">
-                              <summary className="text-[10px] font-bold text-slate-400 uppercase cursor-pointer select-none list-none flex items-center gap-1.5">
-                                  <span className="transition-transform group-open:rotate-90">›</span>
-                                  Brave Search（回落源 · <span className="text-rose-400">不建议配置</span>）
-                              </summary>
-                              <div className="mt-2 space-y-1.5">
-                                  <p className="text-[10px] text-slate-400/90 leading-relaxed">
-                                      上面的中文热榜在国内场景比 Brave 好用一万倍，<b className="text-slate-500">基本不需要配这个</b>。
-                                      它只是热榜彻底拉不到时的英文回落，配了反而可能盖掉中文热点。除非你清楚自己在做什么，否则留空即可。
-                                  </p>
-                                  <input type="password" value={rtNewsApiKey} onChange={e => setRtNewsApiKey(e.target.value)} className="w-full bg-white/60 border border-slate-200 rounded-xl px-3 py-2 text-sm font-mono text-slate-500" placeholder="（不建议）brave.com/search/api" />
-                                  <p className="text-[10px] text-slate-400/70">仅当中文热榜拉取失败时才启用；都不可用时再兜底 Hacker News（英文）。</p>
+                                  ))}
                               </div>
-                          </details>
+                          </div>
+
+                          {rtNewsRegion === 'CN' ? (
+                              <>
+                                  <p className="text-xs text-blue-600/70">中文多平台热榜（免鉴权）。选择要关注的平台：</p>
+                                  <div className="flex flex-wrap gap-1.5">
+                                      {HOTNEWS_PLATFORM_OPTIONS.map(p => {
+                                          const active = rtNewsPlatforms.includes(p.key);
+                                          return (
+                                              <button
+                                                  key={p.key}
+                                                  type="button"
+                                                  onClick={() => setRtNewsPlatforms(prev => prev.includes(p.key) ? prev.filter(k => k !== p.key) : [...prev, p.key])}
+                                                  className={`text-[11px] px-2.5 py-1 rounded-full font-bold transition-colors active:scale-95 ${active ? 'bg-blue-500 text-white shadow-sm' : 'bg-white/80 text-slate-500 border border-blue-200'}`}
+                                              >
+                                                  {p.label}
+                                              </button>
+                                          );
+                                      })}
+                                  </div>
+                                  <details className="border-t border-blue-200/50 pt-2 group">
+                                      <summary className="text-[10px] font-bold text-slate-400 cursor-pointer select-none list-none">
+                                          › Brave Search（中国热榜失败时的可选回落）
+                                      </summary>
+                                      <input type="password" value={rtNewsApiKey} onChange={e => setRtNewsApiKey(e.target.value)} className="mt-2 w-full bg-white/60 border border-slate-200 rounded-xl px-3 py-2 text-sm font-mono text-slate-500" placeholder="Brave Search API Key（可选）" />
+                                  </details>
+                              </>
+                          ) : (
+                              <div className="space-y-2">
+                                  <p className="text-xs text-blue-600/70 leading-relaxed">
+                                      {rtNewsRegion === 'GB' ? '英国当日新闻（Europe/London）' : '全球当日新闻（UTC）'}，使用 Brave News 最近 24 小时结果。
+                                  </p>
+                                  <input type="password" value={rtNewsApiKey} onChange={e => setRtNewsApiKey(e.target.value)} className="w-full bg-white/80 border border-blue-200 rounded-xl px-3 py-2 text-sm font-mono" placeholder="Brave Search API Key（必填）" />
+                                  {!rtNewsApiKey.trim() && <p className="text-[10px] text-rose-500/80">英国/全球新闻需要 Brave Search API Key。</p>}
+                              </div>
+                          )}
                       </div>
                   )}
               </div>
