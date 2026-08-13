@@ -41,37 +41,38 @@ function clampVA(x: number): number {
 
 function buildGroupRulesBlock(groupName: string, memberNames: string[], userLabel: string): string {
     const memberList = memberNames.join('、');
-    return `## 规则
+    return `## Rules
 
-1. **第三人称叙事**：你是【${groupName}】的群聊观察者，记录"群里发生了什么"。
-   - 用户称呼为"${userLabel}"，群成员名字直接用：${memberList}
-   - **绝对不要用"我"** —— 这条记忆会平等地发给群里每个成员，所以不能站在某一个人的视角
-   - 内容前缀统一为："在【${groupName}】里，..."
-   例：
-   - "在【${groupName}】里，${memberNames[0] || 'A'} 提起了最近在追的剧，${memberNames[1] || 'B'} 跟着安利，${userLabel} 表示已经被种草了。"
-   - "在【${groupName}】里，${memberNames[0] || 'A'} 抱怨了周末加班的事，大家分别支了一招，${memberNames[1] || 'B'} 让 ta 直接拒绝，${memberNames[2] || 'C'} 让 ta 先观望。"
+1. **Third-person narration**: You observe the 【${groupName}】 group chat and record what happened in the group.
+   - Refer to the user as "${userLabel}" and use group members' names directly: ${memberList}.
+   - Never use "I". The memory will be distributed equally to every member and must not adopt any one member's viewpoint.
+   - Begin every memory with: "In 【${groupName}】, ..."
+   - Write every generated memory and tag in English, even when the source conversation is in another language.
+   Examples:
+   - "In 【${groupName}】, ${memberNames[0] || 'A'} mentioned a show they had been watching, ${memberNames[1] || 'B'} recommended it too, and ${userLabel} said they were convinced to try it."
+   - "In 【${groupName}】, ${memberNames[0] || 'A'} complained about weekend overtime. Everyone offered advice: ${memberNames[1] || 'B'} suggested refusing directly, while ${memberNames[2] || 'C'} suggested waiting to see what happened."
 
-2. **重要性分级控制文字长度**：
-   - 重要性 1–5：20–60字，事实为主
-   - 重要性 6–7：60–140字，包含群里的氛围描写
-   - 重要性 8–10：120–220字，完整叙事（起因→经过→群里的反应）
+2. **Use importance to control length**:
+   - Importance 1-5: 20-60 English words, primarily factual.
+   - Importance 6-7: 60-140 English words, including the group's atmosphere.
+   - Importance 8-10: 120-220 English words, with a complete narrative (cause → development → group reaction).
 
-3. **房间分配**（注意视角是群整体）：
-   - living_room：群里的日常闲聊、玩梗、复读、无关紧要的活跃气氛
-   - bedroom：群里的暖心瞬间、深度互动、彼此关心或起哄逗 ${userLabel} 的时刻
-   - study：群里讨论工作 / 学习 / 兴趣 / 技能 / 新闻话题
-   - user_room：群里发生的、关于 ${userLabel} 的事——${userLabel} 在群里的状态、情绪、提到的家人朋友、被起哄等
-   - self_room：群成员之间的关系演变、群整体氛围的变化、谁和谁关系变好/变差
-   - attic：群里没解决的矛盾、尴尬冷场、被搁置的话题、暗流涌动的修罗场
-   - windowsill：群里立下的约定、共同期盼、群体目标（线下聚会、集体计划等）
+3. **Room assignment** (from the group's collective viewpoint):
+   - living_room: Everyday group chatter, running jokes, repetition, and inconsequential lively atmosphere.
+   - bedroom: Warm moments, deep interactions, mutual care, or playful teasing of ${userLabel}.
+   - study: Group discussion of work, study, interests, skills, or news.
+   - user_room: Things in the group concerning ${userLabel}: their state, emotions, family or friends they mention, teasing directed at them, and similar matters.
+   - self_room: Changes in relationships among group members or in the group's overall atmosphere.
+   - attic: Unresolved conflict, awkward silence, abandoned topics, or simmering interpersonal tension.
+   - windowsill: Group promises, shared hopes, and collective goals such as meeting offline or making plans together.
 
-4. **情绪标签**（mood）：happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral
-5. **情感坐标**（valence, arousal）：
-   - valence：-1（极痛苦）→ +1（极愉悦）
-   - arousal：-1（极平静）→ +1（极激烈）
-6. **标签**（tags）：提取 2-5 个关键词标签，最好包含涉及的角色名
-7. **不要遗漏值得记的事，但也不要把每句话都变成记忆**。一段群聊通常提取 1–5 条记忆。
-8. **不需要 pinDays / relatedTo / sameAs / eventName / eventTags** —— 群记忆 v1 不参与便利贴和事件盒系统。`;
+4. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
+5. **Emotion coordinates** (valence, arousal):
+   - valence: -1 (extreme pain) → +1 (extreme pleasure).
+   - arousal: -1 (extreme calm) → +1 (extreme intensity).
+6. **Tags**: Extract 2-5 English keyword tags, preferably including the names of the people involved.
+7. **Do not miss worthwhile events, but do not turn every sentence into a memory**. A group-chat segment normally yields 1-5 memories.
+8. **Do not output pinDays / relatedTo / sameAs / eventName / eventTags**. Group Memory v1 does not participate in pinned notes or event boxes.`;
 }
 
 function buildGroupConversationText(messages: Message[], speakerNameOf: (m: Message) => string): string {
@@ -109,28 +110,28 @@ export async function extractGroupMemoriesFromBuffer(
     const conversationText = buildGroupConversationText(messages, speakerNameOf);
     const memberList = memberNames.join('、');
 
-    const systemPrompt = `你是【${groupName}】的群聊观察者，请从以下群聊记录中提取值得记住的群聊记忆。
-群成员：${memberList}
-用户：${userLabel}
+    const systemPrompt = `You are an observer of the 【${groupName}】 group chat. Extract group memories worth retaining from the chat log below. Write all generated natural-language output in English.
+Group members: ${memberList}
+User: ${userLabel}
 
 ${buildGroupRulesBlock(groupName, memberNames, userLabel)}
 
-## 输出格式
+## Output Format
 
-严格 JSON 数组，不要 markdown 包裹：
+Return a strict JSON array with no Markdown wrapper:
 [
   {
-    "content": "在【${groupName}】里，...",
+    "content": "In 【${groupName}】, ...",
     "room": "living_room",
     "importance": 5,
     "mood": "neutral",
     "valence": 0,
     "arousal": 0,
-    "tags": ["标签1", "标签2"]
+    "tags": ["tag 1", "tag 2"]
   }
 ]
 
-如果群聊过于琐碎无值得记忆的内容，返回空数组 []。`;
+If the group chat is too trivial to contain a worthwhile memory, return an empty array [].`;
 
     try {
         const data = await safeFetchJson(
@@ -145,7 +146,7 @@ ${buildGroupRulesBlock(groupName, memberNames, userLabel)}
                     model: llmConfig.model,
                     messages: [
                         { role: 'system', content: systemPrompt },
-                        { role: 'user', content: `群聊记录：\n${conversationText}` },
+                        { role: 'user', content: `Group chat log:\n${conversationText}` },
                     ],
                     temperature: 0.4,
                     max_tokens: 12000,

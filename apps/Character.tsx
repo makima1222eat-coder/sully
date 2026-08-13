@@ -11,7 +11,7 @@ import { Share } from '@capacitor/share';
 import { DB } from '../utils/db';
 import { ContextBuilder } from '../utils/context';
 import { formatMessageWithTime, formatMessageForPrompt } from '../utils/messageFormat';
-import { DEFAULT_ARCHIVE_PROMPTS } from '../components/chat/ChatConstants';
+import { DEFAULT_ARCHIVE_PROMPTS, MEMORY_SUMMARY_ENGLISH_INSTRUCTION } from '../components/chat/ChatConstants';
 import ImpressionPanel from '../components/character/ImpressionPanel';
 import RoomPlatePanel from '../components/character/RoomPlatePanel';
 import MemoryArchivist from '../components/character/MemoryArchivist';
@@ -448,10 +448,10 @@ const Character: React.FC = () => {
       trackEvent('提炼当月核心记忆');
 
       // Build lightweight character identity context (no memories - we're generating those)
-      let identityContext = `[角色身份]\n名字: ${formData.name}\n`;
-      if (formData.systemPrompt) identityContext += `核心性格/指令:\n${formData.systemPrompt}\n`;
-      if (formData.worldview?.trim()) identityContext += `世界观设定: ${formData.worldview}\n`;
-      identityContext += `互动对象: ${userProfile.name}`;
+      let identityContext = `[Character Identity]\nName: ${formData.name}\n`;
+      if (formData.systemPrompt) identityContext += `Core personality/instructions:\n${formData.systemPrompt}\n`;
+      if (formData.worldview?.trim()) identityContext += `World setting: ${formData.worldview}\n`;
+      identityContext += `Conversation partner: ${userProfile.name}`;
       if (userProfile.bio) identityContext += ` (${userProfile.bio})`;
       identityContext += '\n\n';
 
@@ -461,13 +461,13 @@ const Character: React.FC = () => {
       //   (A) 任务声明放最前，明确这是总结不是角色扮演
       //   (B) 拆 system+user：规则/身份/任务走 system，原始日记走 user，
       //       让模型看清哪段是指令、哪段是数据
-      const taskPreamble = `### 任务（最优先，请先读此段再读后文）
-你正在执行"月度记忆精炼"：把 user 消息里提供的【${year}-${month} 每日记忆碎片】压缩成一份简洁的月度核心记忆。
-这是**总结写作任务**，不是角色扮演对话——不要进入聊天模式、不要等待对方发言、不要只输出空白或沉默，直接输出总结正文。`;
+      const taskPreamble = `### Highest-priority task (read this before anything below)
+You are performing monthly memory refinement: compress the ${year}-${month} daily memory fragments in the user message into one concise monthly core memory.
+This is a summarization task, not a role-play conversation. Do not enter chat mode, wait for another message, or return silence. Output the summary itself directly and write it entirely in English.`;
 
       const systemContent = formattedPrompt
-          ? `${taskPreamble}\n\n### 角色视角（仅供写作口吻参考）\n${identityContext}### 详细规则与输出格式\n${formattedPrompt}`
-          : `${taskPreamble}\n\n### 角色视角（仅供写作口吻参考）\n${identityContext}### 详细规则\n以该角色的第一人称写作，使用与日记相同的语言（中文），输出一段精简的月度核心记忆。`;
+          ? `${taskPreamble}\n\n### Character perspective (for writing voice only)\n${identityContext}### Detailed rules and output format\n${formattedPrompt}`
+          : `${taskPreamble}\n\n### Character perspective (for writing voice only)\n${identityContext}### Detailed rules\nWrite in the character's first-person voice and output one concise monthly core memory entirely in English.`;
       const userContent = rawText;
 
       const refineUrl = `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`;
@@ -549,7 +549,7 @@ const Character: React.FC = () => {
           const effectivePromptId = overridePromptId || selectedPromptId;
           const templateObj = archivePrompts.find(p => p.id === effectivePromptId) || DEFAULT_ARCHIVE_PROMPTS[0];
           const baseContext = ContextBuilder.buildCoreContext(formData, userProfile);
-          let prompt = baseContext + '\n\n' + templateObj.content;
+          let prompt = baseContext + '\n\n' + MEMORY_SUMMARY_ENGLISH_INSTRUCTION + '\n\n' + templateObj.content;
           prompt = prompt.replace(/\$\{dateStr\}/g, dateStr);
           prompt = prompt.replace(/\$\{char\.name\}/g, formData.name);
           prompt = prompt.replace(/\$\{userProfile\.name\}/g, userProfile.name);
@@ -716,7 +716,7 @@ const Character: React.FC = () => {
 
                 // Use selected template (same as ChatApp) with variable substitution
                 const templateObj = archivePrompts.find(p => p.id === selectedPromptId) || DEFAULT_ARCHIVE_PROMPTS[0];
-                let prompt = baseContext + '\n\n' + templateObj.content;
+                let prompt = baseContext + '\n\n' + MEMORY_SUMMARY_ENGLISH_INSTRUCTION + '\n\n' + templateObj.content;
                 prompt = prompt.replace(/\$\{dateStr\}/g, date);
                 prompt = prompt.replace(/\$\{char\.name\}/g, formData.name);
                 prompt = prompt.replace(/\$\{userProfile\.name\}/g, userProfile.name);

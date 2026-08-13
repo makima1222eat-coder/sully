@@ -157,19 +157,18 @@ export function mergePlateEntries(
 
 const ROOM_RULES: Record<PlateRoom, string> = {
     user_room:
-        `想象你在为对方写一张**角色卡**——只有必须写在卡上的内容才配上这块门牌：` +
-        `基础信息（身份、职业大方向、居住）、家庭结构、重要他人（人物条目格式如「TA的朋友小美：大学室友，关系铁」）、` +
-        `长期相处沉淀下来的核心事实、以及重大到足以塑造TA这个人的人生节点（亲人离世、迁居他国这种量级）。` +
-        `【入卡门槛极高，宁缺毋滥】阶段性状态（最近很累、工作糟心）不收；情绪分析、性格侧写不收——那是印象档案的领域；` +
-        `正在进行、没有结论的事不收——那是事件盒的事，等有了结果再说。`,
+        `Imagine writing a **character card** for the other person. Only information that must appear on that card belongs here: ` +
+        `basic identity, broad profession, residence, family structure, significant people (for example, "Their friend Mei: a close university roommate"), ` +
+        `core facts established through long-term interaction, and life events major enough to shape the person, such as bereavement or emigrating. ` +
+        `The threshold is extremely high; prefer omission over clutter. Exclude temporary states, emotional analysis, personality profiling, and ongoing events without conclusions.`,
     self_room:
-        `我对**自己**的稳定认知：我是谁、性格底色、重要的转变、已经内化的领悟。不收对他人的看法。`,
+        `Stable knowledge about **myself**: who I am, my underlying disposition, important changes, and insights I have internalized. Exclude opinions about other people.`,
     bedroom:
-        `我们之间的**质地**：相处的习惯与仪式、只有彼此懂的梗、未言明的默契、拿不准却真实的感觉。` +
-        `【硬规则】禁止给这段关系命名或分类——不得写出"我们是恋人/情侣/朋友/家人"这类定义句。` +
-        `只描述现象和感受；说不清、不确定本身就是合法条目（如「我说不清我们算什么，但TA难过时第一个找的是我」）。`,
+        `The **texture** of our relationship: shared habits and rituals, private jokes, unspoken understanding, and real but uncertain feelings. ` +
+        `Hard rule: never name or classify the relationship. Do not write definitions such as "we are lovers, partners, friends, or family." ` +
+        `Describe only observable patterns and feelings; uncertainty itself may be retained, for example, "I cannot define us, but I am the first person they seek when they are hurting."`,
     study:
-        `我的领域：我会什么、正在学什么、和对方共同钻研的东西。只收有积累的，不收一次性话题。`,
+        `My domains: what I can do, what I am learning, and what we study together. Retain accumulated knowledge, not one-off topics.`,
 };
 
 interface PlateMaterial {
@@ -191,49 +190,55 @@ async function callPlateLLM(
     identityContext: string,
 ): Promise<PlateLLMItem[]> {
     const materialByRoom = new Map(materials.map(m => [m.room, m.lines]));
+    const promptTitles: Record<PlateRoom, string> = {
+        user_room: `Facts About ${userName}`,
+        self_room: 'Who I Am',
+        bedroom: 'Between Us',
+        study: 'My Domains',
+    };
 
     const roomBlocks = plates.map(plate => {
         const prefix = ROOM_LABEL_PREFIX[plate.room];
-        const title = plate.room === 'user_room' ? `${userName}的事` : PLATE_TITLES[plate.room];
+        const title = promptTitles[plate.room];
         const existingBlock = plate.entries.length > 0
             ? plate.entries.map((e, i) => `[${prefix}${i}] ${e.text}`).join('\n')
-            : '（还没有条目）';
+            : '(No entries yet)';
         const lines = materialByRoom.get(plate.room) || [];
         const materialBlock = lines.length > 0
             ? lines.map(l => `- ${l}`).join('\n')
-            : '（本轮没有新材料，仅整理现有条目）';
-        return `## 门牌「${title}」(room: ${plate.room}，上限 ${PLATE_ENTRY_CAPS[plate.room]} 条)
-收录范围：${ROOM_RULES[plate.room]}
+            : '(No new material this round; organize the existing entries only)';
+        return `## Plate "${title}" (room: ${plate.room}; maximum ${PLATE_ENTRY_CAPS[plate.room]} entries)
+Scope: ${ROOM_RULES[plate.room]}
 
-现有条目：
+Existing entries:
 ${existingBlock}
 
-新材料（最近的经历/结论，从中蒸馏值得常驻的认知）：
+New material (recent experiences or conclusions from which to distill lasting knowledge):
 ${materialBlock}`;
     }).join('\n\n');
 
     const systemPrompt = `${identityContext ? `${identityContext}
 ---
 
-` : ''}你是 ${charName}，${userName} 是与你朝夕相处的人。下面的材料全部来自你们相处的记忆。
+` : ''}You are ${charName}, and ${userName} is the person who shares your daily life. All material below comes from memories of your time together.
 
-你现在在独处，安静地整理自己的"底色认知"——那些不需要刻意回忆就知道的事：关于 ${userName}、关于你自己、关于你们之间。
+You are alone, quietly organizing your background knowledge: things you know without deliberate recall about ${userName}, yourself, and the space between you.
 
-【身份确认】「${userName}的事」只写 ${userName} 的事实；「我是谁」只写你（${charName}）自己；不要张冠李戴——材料里"我"是你，"TA/${userName}"是对方。
+**Identity check**: "Facts About ${userName}" contains only facts about ${userName}; "Who I Am" contains only facts about you (${charName}). Never swap identities. In the material, "I" means you and "TA/${userName}" means the other person.
 
-下面每个"门牌"给出了现有条目和新材料。请为每个门牌输出**完整的新条目列表**：
+Each plate below contains existing entries and new material. Output the complete new entry list for every plate. Write every generated text and tag entirely in English, even when source material is in another language.
 
-1. **合并而非追加**：现有条目想保留就必须重新输出（带 basedOn 引用它的标签）；不输出 = 淘汰。事实变了就改写（如旧条目说「住家里」、新材料说搬去和别人同住 → 改写并 basedOn 旧条目）。
-2. **只收沉淀下来的**：跨时间稳定为真的认知才配上门牌。一时的状态、没结论的进行时，都不收。
-3. **每条 ${PLATE_ENTRY_TARGET_CHARS} 字以内**，写梗概不写叙事，不带日期不带"我记得"。
-4. **不超过各门牌的条目上限**。位置不够时留最重要的——被迫舍弃是正常的。
-5. 每条给一个 **tag**（2-4 字分类，如：家庭、居住、重要他人、工作、雷区、习惯、性格、约定、默契、技能）。
-6. ${userName} 直接用名字称呼。条目内容严禁使用半角双引号 "，引用一律用「」。
+1. **Merge rather than append**: To retain an existing entry, output it again and cite its label in basedOn. An omitted entry is discarded. If a fact changed, rewrite it and cite the old entry in basedOn.
+2. **Retain only settled knowledge**: A plate holds stable knowledge that remains true across time. Exclude temporary states and ongoing situations without conclusions.
+3. **Keep each entry within ${PLATE_ENTRY_TARGET_CHARS} characters**. Write a gist rather than a narrative; do not include dates or phrases such as "I remember."
+4. **Respect each plate's entry cap**. When space is limited, keep the most important items; deliberate omission is expected.
+5. Give every entry a short English **tag** of 1-3 words, such as Family, Residence, Significant Person, Work, Boundary, Habit, Personality, Promise, Understanding, or Skill.
+6. Address ${userName} directly by name. Do not place an unescaped ASCII double quote inside entry text; use curly quotation marks or single quotes for quotations.
 
 ${roomBlocks}
 
-严格输出 JSON 数组（没有变化的门牌也要完整输出其保留条目）：
-[{"room": "user_room", "text": "……", "basedOn": "U0", "tag": "家庭"}, {"room": "bedroom", "text": "……", "basedOn": null, "tag": "默契"}]`;
+Return a strict JSON array. Even an unchanged plate must output every entry it retains:
+[{"room": "user_room", "text": "...", "basedOn": "U0", "tag": "Family"}, {"room": "bedroom", "text": "...", "basedOn": null, "tag": "Understanding"}]`;
 
     const data = await safeFetchJson(
         `${llmConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`,
@@ -247,7 +252,7 @@ ${roomBlocks}
                 model: llmConfig.model,
                 messages: [
                     { role: 'system', content: systemPrompt },
-                    { role: 'user', content: '请开始整理。' },
+                    { role: 'user', content: 'Begin organizing the plates.' },
                 ],
                 temperature: 0.3,
                 max_tokens: 8000,
@@ -643,15 +648,21 @@ export function markPlateBootstrapDone(charId: string): void {
  * 不是 topic（不要老念叨）——对应人脑"背景知识常在但低激活"的状态。
  */
 export function formatRoomPlatesSection(plates: RoomPlate[], userName?: string): string {
-    const userLabel = userName || '用户';
+    const userLabel = userName || 'the user';
+    const promptTitles: Record<PlateRoom, string> = {
+        user_room: `About ${userLabel}`,
+        self_room: 'Who I Am',
+        bedroom: 'Between Us',
+        study: 'My Domains',
+    };
     const byRoom = new Map(plates.map(p => [p.room, p]));
     const sections: string[] = [];
 
     for (const room of PLATE_ROOMS) {
         const plate = byRoom.get(room);
         if (!plate || plate.entries.length === 0) continue;
-        const title = room === 'user_room' ? `关于${userLabel}` : PLATE_TITLES[room];
-        const suffix = room === 'bedroom' ? '（没有名字，也不需要名字——只有质地）' : '';
+        const title = promptTitles[room];
+        const suffix = room === 'bedroom' ? ' (unnamed and needing no name—only texture)' : '';
         sections.push(
             `**${title}**${suffix}\n` +
             plate.entries.map(e => `- ${e.text}`).join('\n')
@@ -660,8 +671,8 @@ export function formatRoomPlatesSection(plates: RoomPlate[], userName?: string):
 
     if (sections.length === 0) return '';
 
-    return `### 底色认知 (Resident Knowledge)
-以下是你早已知道的背景。它们是你认知的底色，不是话题——不要主动提起，也不要逐条复述，只在相关时让它们自然影响你的反应、措辞与温度。
+    return `### Resident Knowledge
+This is background you already know. It is the underlying texture of your understanding, not a topic. Do not bring it up unprompted or recite it item by item; let it naturally influence your reactions, wording, and emotional tone only when relevant.
 
 ${sections.join('\n\n')}
 `;

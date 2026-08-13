@@ -91,49 +91,49 @@ async function extractMonthMemories(
         .join('\n\n');
 
     const contextBlock = charContext
-        ? `\n## 你的人设\n${charContext}\n`
+        ? `\n## Your Character Profile\n${charContext}\n`
         : '';
 
-    const userLabel = userName || 'TA';
+    const userLabel = userName || 'the user';
 
     const hasRelated = relatedMemories.length > 0;
     const relatedBlock = hasRelated ? buildRelatedMemoriesBlock(relatedMemories) : '';
     const relatedToRule = hasRelated ? buildRelatedToRule() : '';
     const relatedToFormat = hasRelated ? buildRelatedToFormatHint() : '';
 
-    const systemPrompt = `你是 ${charName}。以下是你 ${monthKey} 这个月的日常记录。请以你的第一人称视角（"我"），从中提取值得长期记住的记忆。${contextBlock}${relatedBlock}
+    const systemPrompt = `You are ${charName}. The following are your daily records from ${monthKey}. Extract memories worth retaining long-term from your first-person ("I") perspective. Write every generated natural-language value—content, tags, event names, and correction notes—entirely in English.${contextBlock}${relatedBlock}
 
-## 规则
+## Rules
 
-1. **第一人称叙事**：用"我"的视角记录，用户用"${userLabel}"指代。保持完整事件脉络，不要掐头去尾。
-2. **重要性分级**：
-   - 1–5：日常琐事（15–50字）
-   - 6–7：有情感价值的事件（60–120字），包含我的感受
-   - 8–10：重大事件（100–200字），完整因果+我的反应
-3. **房间分配**（凡是涉及${userLabel}的家人/朋友/同事等人际关系，**一律进 user_room**，哪怕只是一次具体事件）：
-   - living_room：**纯日常琐事**（不涉及重要人际关系、也不涉及深层情感）
-   - bedroom：${userLabel}和我之间的亲密情感、深层羁绊、感动时刻
-   - study：工作、学习、技能
-   - user_room：关于${userLabel}的**一切个人信息和人际事件**——生日/习惯/喜好/性格/成长经历/情绪模式，**以及${userLabel}的家人、亲戚、朋友、同事相关的一切事件**（家人健康、家庭聚会、家庭矛盾、外公外婆/父母/兄弟姐妹的故事、朋友交往、同事冲突等）。这些事件即便是"一次性"的，也应进 user_room 而不是 living_room。
-   - self_room：我自身的成长、认同变化
-   - attic：未解决的矛盾、困惑、伤害
-   - windowsill：期盼、目标、憧憬
-4. **情绪标签**：happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral
-5. **情感坐标**（valence, arousal）：在 mood 之外，还要给出二维情感坐标供后续情感推理。
-   - valence（效价）：-1（极痛苦）→ +1（极愉悦）
-   - arousal（唤醒度）：-1（极平静）→ +1（极激烈）
-   参考："开心"约 (0.7, 0.5)，"平静"约 (0.5, -0.6)，"失落"约 (-0.5, -0.4)，"焦虑"约 (-0.6, 0.7)，"愤怒"约 (-0.7, 0.8)。
-6. **不要遗漏任何事件**。这些日度总结本身已经是精华，每一件事都值得保留为独立记忆。一条日度总结里如果有3件事，就提取3条记忆。宁可多提取，不要压缩遗漏。
-7. **必须保留精确日期**：date 字段填该事件发生的具体日期（从日志的日期标签读取）。内容中也自然提及时间。${relatedToRule}
+1. **First-person narration**: Record each memory using "I" and address the user as "${userLabel}". Preserve the complete course of each event rather than dropping its beginning or ending.
+2. **Importance levels**:
+   - 1-5: Everyday details, 15-50 English words.
+   - 6-7: Emotionally meaningful events, 60-120 English words, including my feelings.
+   - 8-10: Major events, 100-200 English words, including complete causality and my reaction.
+3. **Room assignment** (anything involving ${userLabel}'s family, friends, colleagues, or other interpersonal relationships must go to user_room, even if it is only one specific event):
+   - living_room: Pure everyday trivia with neither important relationships nor deep emotion.
+   - bedroom: Intimacy, deep bonds, and moving moments between ${userLabel} and me.
+   - study: Work, learning, and skills.
+   - user_room: All personal information and interpersonal events concerning ${userLabel}: birthday, habits, preferences, personality, upbringing, emotional patterns, and every event involving ${userLabel}'s family, relatives, friends, or colleagues. Even one-off events belong here rather than in living_room.
+   - self_room: My own growth and changes in identity.
+   - attic: Unresolved conflict, confusion, or harm.
+   - windowsill: Hopes, goals, and aspirations.
+4. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
+5. **Emotion coordinates** (valence, arousal): Provide two-dimensional emotion coordinates in addition to mood.
+   - valence: -1 (extreme pain) → +1 (extreme pleasure).
+   - arousal: -1 (extreme calm) → +1 (extreme intensity).
+   Reference values: happy ≈ (0.7, 0.5), peaceful ≈ (0.5, -0.6), dejected ≈ (-0.5, -0.4), anxious ≈ (-0.6, 0.7), angry ≈ (-0.7, 0.8).
+6. **Do not omit any event**. These daily summaries are already distilled; each event deserves its own memory. If a daily summary contains three events, extract three memories. Prefer extracting more over compressing away details.
+7. **Preserve exact dates**: Set date to the event's specific date from the log label and mention the timing naturally in the content.${relatedToRule}
 
-## 输出
+## Output
 
-严格 JSON 数组，不要用 markdown 包裹，直接输出 JSON：
+Return only a strict JSON array with no Markdown wrapper:
 [{"content": "...", "room": "...", "importance": 5, "mood": "...", "valence": 0, "arousal": 0, "tags": ["..."], "date": "YYYY-MM-DD"${relatedToFormat}}]
 
-注意：content 中的引号必须用中文引号（""）而不是英文引号，避免 JSON 解析出错。
+Inside content, use curly quotation marks, corner brackets, or single quotes for quoted speech. Never place an unescaped ASCII double quote inside a JSON string.
 
-date 字段填记忆对应的大概日期。`;
+Set date to the date corresponding to the memory.`;
 
     try {
         const data = await safeFetchJson(

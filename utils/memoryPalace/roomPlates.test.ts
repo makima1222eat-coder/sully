@@ -240,21 +240,21 @@ describe('formatRoomPlatesSection — 注入格式', () => {
         expect(formatRoomPlatesSection([plate('user_room', [])], '小明')).toBe('');
     });
 
-    it('包含注入框架：底色而非话题', () => {
+    it('包含英文注入框架：底色而非话题', () => {
         const out = formatRoomPlatesSection([plate('user_room', ['父母离异'])], '小明');
-        expect(out).toContain('底色认知');
-        expect(out).toContain('不要主动提起');
-        expect(out).toContain('关于小明');
+        expect(out).toContain('Resident Knowledge');
+        expect(out).toContain('Do not bring it up unprompted');
+        expect(out).toContain('About 小明');
         expect(out).toContain('- 父母离异');
     });
 
-    it('卧室段标注"没有名字也不需要名字"，空门牌跳过', () => {
+    it('卧室段用英文标注"没有名字也不需要名字"，空门牌跳过', () => {
         const out = formatRoomPlatesSection([
             plate('bedroom', ['TA会在深夜来找我说话']),
             plate('study', []),
         ], '小明');
-        expect(out).toContain('我们之间');
-        expect(out).toContain('只有质地');
-        expect(out).not.toContain('我的领域');
+        expect(out).toContain('Between Us');
+        expect(out).toContain('only texture');
+        expect(out).not.toContain('My Domains');
     });
 });

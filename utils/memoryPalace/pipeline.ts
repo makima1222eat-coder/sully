@@ -1085,9 +1085,9 @@ export async function ingestDiaryToPalace(
     if (fakeMessages.length === 0) return { status: 'empty_input' };
 
     // 角色 / 用户档案给 LLM 当上下文
-    let charContext = `[角色档案]\n名字: ${char.name}\n核心设定:\n${char.systemPrompt || '无'}\n`;
-    if (char.worldview?.trim()) charContext += `世界观: ${char.worldview}\n`;
-    charContext += `\n[用户档案]\n名字: ${userName || '用户'}\n\n[来源说明]\n这是来自【交换日记】app 的一次归档，不是普通聊天，是一篇双方各写一页的正式日记。\n`;
+    let charContext = `[Character Profile]\nName: ${char.name}\nCore definition:\n${char.systemPrompt || 'None'}\n`;
+    if (char.worldview?.trim()) charContext += `World setting: ${char.worldview}\n`;
+    charContext += `\n[User Profile]\nName: ${userName || 'the user'}\n\n[Source Note]\nThis archive comes from the Exchange Diary app. It is not an ordinary chat; it is a formal diary in which both people wrote one page.\n`;
 
     const extracted = await extractMemoriesFromBuffer(
         fakeMessages,
@@ -1294,20 +1294,20 @@ async function extractAndStoreMemories(
 
             // 5a. 精简角色档案（姓名、设定、世界观）
             if (charProfile) {
-                charContext += `[角色档案]\n`;
-                charContext += `名字: ${charProfile.name}\n`;
-                charContext += `核心设定:\n${charProfile.systemPrompt || '无'}\n`;
+                charContext += `[Character Profile]\n`;
+                charContext += `Name: ${charProfile.name}\n`;
+                charContext += `Core definition:\n${charProfile.systemPrompt || 'None'}\n`;
                 if (charProfile.worldview?.trim()) {
-                    charContext += `世界观: ${charProfile.worldview}\n`;
+                    charContext += `World setting: ${charProfile.worldview}\n`;
                 }
                 charContext += `\n`;
             }
 
             // 5b. 精简用户档案（姓名、设定）
             if (userProfile) {
-                charContext += `[用户档案]\n`;
-                charContext += `名字: ${userProfile.name}\n`;
-                charContext += `设定: ${userProfile.bio || '无'}\n\n`;
+                charContext += `[User Profile]\n`;
+                charContext += `Name: ${userProfile.name}\n`;
+                charContext += `Profile: ${userProfile.bio || 'None'}\n\n`;
             }
 
             // 5c. 向量检索相关已有记忆，用于两个目的：

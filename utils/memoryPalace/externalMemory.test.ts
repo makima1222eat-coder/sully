@@ -50,21 +50,22 @@ describe('外部记忆搬家', () => {
     it('提示词钉死只整理时间、不压缩内容的搬家原则', () => {
         const prompt = buildExternalMemoryPrompt('小满', '阿宁');
 
-        expect(prompt).toContain('只整理时间和结构，不压缩内容');
-        expect(prompt).toContain('输出能被程序直接解析');
-        expect(prompt).toContain('不删除、不更改、不压缩内容');
-        expect(prompt).toContain('不得总结、概括、润色、改写、合并同类项或去重');
-        expect(prompt).toContain('每个具体事实');
-        expect(prompt).toContain('不能省略');
-        expect(prompt).toContain('严禁猜日期');
+        expect(prompt).toContain('organize only time and structure without compressing content');
+        expect(prompt).toContain('program can parse directly');
+        expect(prompt).toContain('Translate all natural-language output faithfully into English');
+        expect(prompt).toContain('Do not summarize, generalize, polish, paraphrase, merge similar items, or deduplicate');
+        expect(prompt).toContain('every concrete fact');
+        expect(prompt).toContain('omit nothing');
+        expect(prompt).toContain('Never guess a date');
         expect(prompt).toContain('阿宁');
-        expect(prompt).toContain('姓名或角色标签 > 说话人标签与上下文 > 代词');
-        expect(prompt).toContain('引号内的第一人称属于原说话人');
-        expect(prompt).toContain('代词指向无法可靠判断');
-        expect(prompt).toContain('阿宁带了娃娃出门');
-        expect(prompt).toContain('不要看到负面内容就塞进阁楼');
-        expect(prompt).toContain('低 valence 本身都不等于阁楼');
-        expect(prompt).toContain('当前仍明确未解决');
+        expect(prompt).toContain('explicit name or role label in the source > speaker label and context > pronoun');
+        expect(prompt).toContain('First-person language inside quoted dialogue belongs to the original speaker');
+        expect(prompt).toContain('a pronoun cannot be resolved reliably');
+        expect(prompt).toContain('阿宁 took the doll outside');
+        expect(prompt).toContain('do not put something in attic merely because it is negative');
+        expect(prompt).toContain('low valence alone do not imply attic');
+        expect(prompt).toContain('explicitly still unresolved');
+        expect(prompt).toContain('Every natural-language value in the output must be English');
     });
 
     it('搬家只接受完整 JSON，不把截断对象抢救成半份成功', () => {

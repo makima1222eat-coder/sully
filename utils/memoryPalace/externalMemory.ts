@@ -98,58 +98,59 @@ export function splitExternalMemoryText(
 }
 
 export function buildExternalMemoryPrompt(charName: string, userName: string): string {
-    const userLabel = userName || '用户';
-    return `你是“外部记忆搬家整理器”。这些文字来自别的应用、设备或记忆系统，要迁入 ${charName} 的记忆。
+    const userLabel = userName || 'the user';
+    return `You are an External Memory Migration Organizer. This text comes from another app, device, or memory system and must be migrated into ${charName}'s memories.
 
-你必须同时完成两个硬目标，缺一不可：
-A. 输出能被程序直接解析、字段符合下方定义的完整 JSON 数组。
-B. 对原文做无损搬运：只整理时间和结构，不压缩内容；不删除、不更改、不压缩内容。
+You must satisfy both non-negotiable goals:
+A. Return one complete JSON array that the program can parse directly and whose fields follow the schema below.
+B. Migrate the source losslessly: organize only time and structure without compressing content. Translate all natural-language output faithfully into English while preserving every fact and nuance.
 
-1. 不得总结、概括、润色、改写、合并同类项或去重；不得用一句结论代替一段经历，也不得输出“略”“其余同上”等省略表达。
-2. 原文里的每个具体事实、人物、称呼、地点、数字、对话、动作、因果、先后顺序、情绪和细微反应都必须保留。宁可多拆几条，也不能省略。
-3. 先锁定人物身份，再做必要的视角转换；严禁把所有“我/你/他/她”机械归给同一个人。
-   - 目标记忆主人固定是“${charName}”；与其对话和相处的用户固定是“${userLabel}”。
-   - 身份判断优先级：原文明示的姓名或角色标签 > 说话人标签与上下文 > 代词。明确证据优先，不能反过来靠猜测覆盖姓名。
-   - 原文标明由 ${charName} 叙述时，叙述中的“我”可转成记忆第一人称“我”；原文标明由 ${userLabel}/用户叙述时，“我”必须写成“${userLabel}”，绝不能写成 ${charName} 的“我”。
-   - 第三方保持原姓名或原称呼，不得擅自改成 ${charName} 或 ${userLabel}。
-   - 引号内的第一人称属于原说话人，对话必须原样保留，不能把引号里的“我”替换成记忆主人。
-   - 如果片段缺少说话人、代词指向无法可靠判断，保留原称呼/代词并忠实搬运，不猜、不补人物关系。
-   例：来源标注“${userLabel}：我带了娃娃出门”时，应写“${userLabel}带了娃娃出门”，不能写“我带了娃娃出门”；来源标注“${charName}：我没敢问”时，才可写“我没敢问”。
-4. 1500 字只是单条 content 的拆分提示，不是压缩目标。原事件太长时，按自然段连续拆成多条并完整承接；禁止为了满足字数而删改、缩写或截断。
-5. date 填事件实际日期，格式 YYYY-MM-DD。原文只有月份可填 YYYY-MM；只有年份可填 YYYY；完全不确定填 null。严禁猜日期。
-6. room 先按记忆主体与用途分类，不要看到负面内容就塞进阁楼：
-   - living_room：纯日常琐事
-   - bedroom：${userLabel}和我的共同经历、亲密情感与深层羁绊（即使其中有难过或争执）
-   - study：工作、学习、技能、职业
-   - user_room：${userLabel}的个人信息、经历、家人、朋友、同事与人际事件（即使事件是负面的）
-   - self_room：我自身的成长、认同变化与个人经历
-   - attic：仅限“当前仍明确未解决，而且核心就是矛盾、持续困惑或尚在影响的伤害/创伤”的记忆
-   - windowsill：期盼、目标、未来愿望
-   房间判定以事件主体为先；悲伤、愤怒、争吵、受伤或低 valence 本身都不等于阁楼。若原文没有明确写出“仍未解决/持续困扰”，优先放入对应的 bedroom、user_room、self_room、study 或 living_room。
-7. importance 为 1-10；mood 从 happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral 中选；tags 保留具体人物/地点/事件关键词。
-8. 这一批可能是整份材料的中间片段。只处理本批实际出现的内容，不补写上下文，不写“后续未知”等占位话。
+1. Do not summarize, generalize, polish, paraphrase, merge similar items, or deduplicate. Never replace an experience with a one-sentence conclusion or use omissions such as "etc." or "same as above."
+2. Preserve every concrete fact, person, form of address, place, number, line of dialogue, action, causal link, sequence, emotion, and subtle reaction. Split into more entries if necessary; omit nothing. Translate non-English narration and dialogue faithfully into English without shortening or changing their meaning.
+3. Establish each person's identity before making any necessary perspective conversion. Never mechanically assign every "I/you/he/she/they" to the same person.
+   - The memory owner is always "${charName}"; the user who talks and spends time with them is always "${userLabel}".
+   - Identity evidence priority: explicit name or role label in the source > speaker label and context > pronoun. Explicit evidence wins; guesses must never override a name.
+   - When the source explicitly identifies ${charName} as the narrator, the narrator's "I" may become the memory's first-person "I." When ${userLabel}/the user is the narrator, "I" must become "${userLabel}" and must never become ${charName}'s "I."
+   - Keep third parties under their original names or forms of address; never silently turn them into ${charName} or ${userLabel}.
+   - First-person language inside quoted dialogue belongs to the original speaker. Translate the dialogue faithfully but never replace its "I" with the memory owner.
+   - If a fragment has no speaker label and a pronoun cannot be resolved reliably, retain the original form of address or pronoun in faithful English and do not invent a relationship.
+   Example: if the source is labeled "${userLabel}: I took the doll outside," write "${userLabel} took the doll outside," not "I took the doll outside." Only a source labeled "${charName}: I did not dare ask" may become "I did not dare ask."
+4. The 1,500-character guidance is only a splitting cue for one content value, not a compression target. If an event is too long, split it continuously at natural paragraph boundaries and carry every detail forward. Never delete, abbreviate, or truncate to meet a length target.
+5. Set date to the event's actual date in YYYY-MM-DD format. If the source gives only a month, use YYYY-MM; if only a year, use YYYY; if completely uncertain, use null. Never guess a date.
+6. Assign room by the memory's subject and purpose; do not put something in attic merely because it is negative:
+   - living_room: Pure everyday trivia.
+   - bedroom: Shared experiences, intimacy, and deep bonds between ${userLabel} and me, even when sadness or conflict is involved.
+   - study: Work, learning, skills, and career.
+   - user_room: ${userLabel}'s personal information, experiences, family, friends, colleagues, and interpersonal events, even when negative.
+   - self_room: My own growth, changes in identity, and personal experiences.
+   - attic: Only memories that are explicitly still unresolved and fundamentally concern conflict, ongoing confusion, or harm/trauma that continues to have an effect.
+   - windowsill: Hopes, goals, and future wishes.
+   Classify by the event's subject first. Sadness, anger, arguments, injury, or low valence alone do not imply attic. If the source does not explicitly say something remains unresolved or troubling, prefer the appropriate bedroom, user_room, self_room, study, or living_room.
+7. importance is 1-10. mood must be one of happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral. tags must be English and preserve concrete people, places, and event keywords.
+8. This batch may be a middle segment of a larger source. Process only content that actually appears in this batch. Do not invent context or add placeholders such as "what happened next is unknown."
 
-输出格式同样是硬要求：
-- 只输出一个完整 JSON 数组；数组前后不得有解释、标题、markdown 代码围栏或其它字符。
-- 必须使用双引号；字符串里的双引号、反斜杠和换行必须按 JSON 规则转义。
-- 不得有注释、尾随逗号或未闭合对象；不得只返回前半批内容。
-- 每个记忆对象都必须含 date、content、room、importance、mood、valence、arousal、tags。
+The output format is equally strict:
+- Output exactly one complete JSON array, with no explanation, title, Markdown fence, or other characters before or after it.
+- Use double quotes as required by JSON. Escape double quotes, backslashes, and newlines inside strings according to JSON rules.
+- Do not include comments, trailing commas, or unclosed objects, and do not return only the first part of the batch.
+- Every memory object must contain date, content, room, importance, mood, valence, arousal, and tags.
+- Every natural-language value in the output must be English.
 
-格式：
+Format:
 [
   {
     "date": "YYYY-MM-DD",
-    "content": "完整保留细节的第一人称记忆",
+    "content": "A first-person English memory preserving every detail",
     "room": "user_room",
     "importance": 7,
     "mood": "nostalgic",
     "valence": 0.2,
     "arousal": -0.1,
-    "tags": ["具体人物", "具体事件"]
+    "tags": ["specific person", "specific event"]
   }
 ]
 
-若原文没有任何有效内容，返回 []。`;
+If the source contains no valid content, return [].`;
 }
 
 /** 搬家不能使用通用 JSON 的“截断抢救”：只接受完整、独立、可解析的 JSON 数组。 */
@@ -332,8 +333,8 @@ export async function extractExternalMemoryText(
                                 {
                                     role: 'user',
                                     content: `${attempt > 0
-                                        ? '上一次输出未通过完整性校验。请重新处理整批：必须输出完整 JSON，且原文内容不得删减、改写或压缩。\n\n'
-                                        : ''}这是第 ${index + 1}/${chunks.length} 批外部记忆原文：\n\n${chunks[index]}`,
+                                        ? 'The previous output failed the completeness check. Reprocess the entire batch: return complete JSON, translate all natural-language values into English, and do not omit, paraphrase, or compress any source content.\n\n'
+                                        : ''}This is external-memory source batch ${index + 1}/${chunks.length}:\n\n${chunks[index]}`,
                                 },
                             ],
                             temperature: 0.05,
