@@ -1381,6 +1381,10 @@ interface MessageItemProps {
     charAvatar: string;
     charName: string;
     userAvatar: string;
+    /** 当前窗口里的最后一条消息；最新图片需要立即解码，避免移动端懒加载卡在滚动容器底部。 */
+    isLatestMessage?: boolean;
+    /** 图片完成解码并确定高度后，通知聊天列表重新校准贴底位置。 */
+    onMediaLoad?: (messageId: number) => void;
     onLongPress: (m: Message) => void;
     onReply: (m: Message) => void;
     selectionMode: boolean;
@@ -1439,6 +1443,8 @@ const MessageItem = React.memo(({
     charAvatar,
     charName,
     userAvatar,
+    isLatestMessage = false,
+    onMediaLoad,
     onLongPress,
     onReply,
     selectionMode,
@@ -1928,7 +1934,9 @@ const MessageItem = React.memo(({
             )}
             <div className={[
                 'sully-chat-message',
-                isUser ? 'sully-chat-message-user justify-end' : 'sully-chat-message-ai justify-start',
+                isUser
+                    ? 'sully-chat-message-user justify-end'
+                    : `sully-chat-message-ai ${isModuleCard && centerModules ? 'justify-center' : 'justify-start'}`,
                 isFirstInGroup ? 'sully-chat-message-group-first' : '',
                 isLastInGroup ? 'sully-chat-message-group-last' : '',
                 isModuleCard ? 'sully-chat-message-module' : '',
@@ -1978,7 +1986,7 @@ const MessageItem = React.memo(({
                     Added min-w-0 to prevent flexbox overflow issues.
                     Added explicit margins to clear absolute avatars.
                 */}
-                <div className={`sully-chat-message-content relative max-w-[72%] min-w-0 ${isModuleCard && centerModules ? 'mx-auto' : (!isUser ? 'ml-12' : 'mr-12')} ${isModuleCard ? 'sully-html-wrap' : ''}`}>
+                <div className={`sully-chat-message-content relative min-w-0 ${isModuleCard && centerModules ? 'w-fit max-w-full mx-auto' : `max-w-[72%] ${!isUser ? 'ml-12' : 'mr-12'}`} ${isModuleCard ? 'sully-html-wrap' : ''}`}>
                     <div
                         aria-hidden="true"
                         className={`absolute -right-10 top-1/2 -translate-y-1/2 w-8 h-8 rounded-full flex items-center justify-center pointer-events-none transition-all duration-150 ${isReplyReady ? 'bg-indigo-500 text-white shadow-md shadow-indigo-200' : 'bg-white/90 text-slate-400 shadow-sm'}`}
@@ -1993,7 +2001,7 @@ const MessageItem = React.memo(({
                         </svg>
                     </div>
                     <div
-                        className={`relative flex flex-col ${isUser ? 'items-end' : 'items-start'} min-w-0`}
+                        className={`relative flex flex-col ${isModuleCard && centerModules ? 'items-center' : (isUser ? 'items-end' : 'items-start')} min-w-0`}
                         style={{
                             transform: `translateX(${replyOffset}px)`,
                             transition: isReplyGestureActive ? 'none' : 'transform 220ms cubic-bezier(0.22, 1, 0.36, 1)',
@@ -3284,7 +3292,14 @@ const MessageItem = React.memo(({
         return commonLayout(
             <div className="relative group">
                 {m.content ? (
-                    <img src={m.content} className="max-w-[200px] max-h-[300px] rounded-2xl" alt="Uploaded" loading="lazy" decoding="async" />
+                    <img
+                        src={m.content}
+                        className="max-w-[200px] max-h-[300px] rounded-2xl"
+                        alt="Uploaded"
+                        loading={isLatestMessage ? 'eager' : 'lazy'}
+                        decoding="async"
+                        onLoad={() => onMediaLoad?.(m.id)}
+                    />
                 ) : (
                     <div className="px-4 py-6 rounded-2xl bg-slate-100 text-slate-400 text-xs italic text-center min-w-[120px]">[图片已丢失]</div>
                 )}
@@ -3746,6 +3761,8 @@ const MessageItem = React.memo(({
            prev.charAvatar === next.charAvatar &&
            prev.charName === next.charName &&
            prev.userAvatar === next.userAvatar &&
+           prev.isLatestMessage === next.isLatestMessage &&
+           prev.onMediaLoad === next.onMediaLoad &&
            prev.selectionMode === next.selectionMode &&
            prev.isSelected === next.isSelected &&
            prev.translationEnabled === next.translationEnabled &&

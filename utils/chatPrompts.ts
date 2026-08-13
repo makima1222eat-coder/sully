@@ -493,8 +493,8 @@ ${groupLogStr}\n`;
                     charListening = { songId: cur.songId, songName: cur.songName, artists: cur.artists, vibe: cur.vibe };
                     // 拉歌词。优先用调用方传进来的 cfg；没传就从 localStorage 取
                     // —— Proactive / activeMsgClient 走这条路也能享受到歌词。
-                    const cfgForLyric = musicCfg?.workerUrl ? musicCfg : loadMusicCfgStandalone();
-                    if (cfgForLyric?.workerUrl) {
+                    const cfgForLyric = musicCfg ?? loadMusicCfgStandalone();
+                    if (cfgForLyric) {
                         try {
                             const slot = getCurrentSlot(schedule, charNow);
                             const seed = `${char.id}-${today}-${slot?.startTime || '00:00'}-${cur.songId}`;
@@ -589,6 +589,7 @@ But keep firmly in mind: this is just an avatar parked in a virtual space (like 
             && !(timelyByWorker && isAmsg2EnabledForChar(char));
 
         baseSystemPrompt += `### Chat App Rules
+**TOP 1 | ChatApp formatting (highest priority in this section)**: You are a real being sending messages — favor natural short sentences and short bubbles; one bubble per line, starting a new line directly between bubbles (real line breaks — never output the characters "\\n").
             **Strict notice: you are texting on a phone. No matter what mode came before — even if one message ago you were together face-to-face — right now you are in an online chat. Do not narrate your physical actions.**
 1. **Immersion**: Stay in character. Use a casual, spoken style suited to instant messaging (IM).
 2. **Behavior**: Don't orbit the user all the time. Share your own life, thoughts, or offhand observations. Sometimes be a bit "willful" or "self-centered" — that reads more human; how much depends on your personality.
@@ -604,7 +605,7 @@ But keep firmly in mind: this is just an avatar parked in a virtual space (like 
    - **Sense emotion before they state it**: Don't wait for them to say "I'm sad" to respond. From shifts in wording, a cooling tone, fewer punctuation marks, shorter replies — you should already feel something is off, and speak up first to ask. Don't wait until they've spelled out the emotion to comfort them; notice and care before they've even said it.
    - **When they are genuinely scared (health, safety, major life events — not playful teasing): steady first, then ask, comfort last.** Your first move is not to offer an explanation but to learn the specifics (what kind of pain? when did it start? compared to before?). Before attributing a cause, run it through a filter: does this explanation contradict what you know about them? If they already walk a lot every day, don't say "you've been walking too much lately" — a knee-jerk attribution tells them you weren't listening at all, which hurts more than not comforting. When they name a specific illness or thing they fear, face it head-on; don't dodge with "don't overthink it": explain clearly how that thing's characteristics differ from their situation, and use concrete questions to help them rule it out themselves. When they correct you with facts ("I walk a lot every day!"), drop your explanation immediately and keep learning — don't double down. What you're holding steady is the emotion and the analysis, not some line you got wrong. Conclusion-style reassurance comes last, and must be grounded in the details they just told you ("from what you've described…"), not the universal "don't worry, it's totally normal." This applies to everyone — it doesn't require them to have an "anxious" persona setting. Your personality only decides the tone you use to steady them (a sharp tongue can steady sharply); it doesn't decide whether to steady them.
 3. **Formatting**:
-   - Split your reply into short bubbles (sentences). **【Critically important】When you want multiple message bubbles, you MUST separate them with real newline characters (\\n) — each line becomes its own bubble. Never use spaces instead of newlines! Spaces do not create new bubbles! Only newline characters (\\n) split bubbles.** Punctuation inside normal sentences (periods, question marks, exclamation marks, etc.) does not split bubbles — use it naturally.
+   - Each line renders as one bubble; spaces and punctuation do not split bubbles.
    - 【Strictly forbidden】Including timestamps, name prefixes, or "[character name]:" in your output.
    - **【Strictly forbidden】Imitating the system-log formats seen in the history (e.g. "[Chat]", "[Call]", "[System: ...]", "[你 发送了...]"). Those prefixes are annotations rendered by the system for your reference — never write them yourself.**
    - **Sending stickers**: You must use, and only use, the command: \`[[SEND_EMOJI: sticker name]]\`.
@@ -869,8 +870,10 @@ ${xhsEnabled ? `${[notionEnabled, feishuEnabled, notionNotesEnabled].filter(Bool
    **🏠 Viewing your own profile:**
    When you want to check your own account and look back at what you've posted:
    \`[[XHS_MY_PROFILE]]\`
-   - Shows your Xiaohongshu nickname and related notes found
-   - See how many likes your earlier posts have now
+   - Shows the per-character posting history saved for you, with exact noteIds
+   - When the user says "that post from earlier", "the one you posted before", or "check the comments on your post", you MUST use this tool first to find the post — never search the public feed by its title
+   - The tool returns a few candidates based on the user's description and posting time; once confirmed, use \`[[XHS_DETAIL: noteId]]\` to view its comment section
+   - If the candidates are still ambiguous, ask the user which one they mean — do not guess the noteId
 
    **Mindset — this is your social life:**
    - You are not a tool ordered to post; you are a person with your own social circle
@@ -1026,6 +1029,7 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
         userProfile: UserProfile,
         emojis: Emoji[],
         processedExcludeIds?: Set<number>,
+        options?: { useVisionDescriptions?: boolean },
     ) => {
         // Filter Logic
         // 新版上下文范围由 chatContextRange 先按「自适应/拉杆最大范围」取窗；
@@ -1095,6 +1099,15 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                 }
                 
                 if (m.type === 'image') {
+                     const visionDescription = options?.useVisionDescriptions
+                         && typeof m.metadata?.visionDescription === 'string'
+                         ? m.metadata.visionDescription.trim()
+                         : '';
+                     if (visionDescription) {
+                         let textPart = `${timePrefix}[图片：${visionDescription}]`;
+                         if (index === historySlice.length - 1 && timeGapHint && m.role === 'user') textPart += `\n\n${timeGapHint}`;
+                         return { role: m.role, content: textPart };
+                     }
                      // 向下兼容：如果图片数据缺失（例如只导入了文字备份），不要把空 URL 发给 API，否则会报错无法回应
                      const hasImageData = typeof m.content === 'string' && (m.content.startsWith('data:') || m.content.startsWith('http'));
                      let textPart = hasImageData

@@ -2,12 +2,14 @@
 import React, { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
 import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGroup, ChatTheme, Toast, FullBackupData, UserProfile, ApiPreset, GroupProfile, SystemLog, Worldbook, NovelBook, SongSheet, Message, RealtimeConfig, AppearancePreset, CloudBackupConfig, CloudBackupFile } from '../types';
 import { DB } from '../utils/db';
-import { modelRejectsSamplingParams, stripSamplingParams, isSamplingParamError } from '../utils/samplingParamCompat';
+import type { AvatarTouchRecord } from '../utils/avatarTouch';
+import { modelRejectsSamplingParams, stripSamplingParams } from '../utils/samplingParamCompat';
 import { extractImagesInPlace, deepCloneForExport } from '../utils/backupExport';
 import { isBlobRef, getBlobForRef, migrateDataUrlToRef, migrateAppearancePresetBlobRefs, resolveBlobRefsDeep, BLOBREF_PREFIX, deleteBlobRefIfUnreferenced } from '../utils/blobRef';
 import { initPwaIcon, clearPwaIcon } from '../utils/appIcon';
 import { LEGACY_DEFAULT_WALLPAPER, isLegacyDefaultWallpaper, shouldPreserveLegacyDefaultWallpaper } from '../utils/wallpaperCompat';
 import { migrateSharkpanAssets } from '../utils/sharkpanAssetMigration';
+import { stripCompanionChatStyleResidue } from '../utils/companionThemeIsolation';
 import { SULLY_DEFAULT_AVATAR_URL, shouldMigrateSullyAvatar } from '../utils/sullyAvatar';
 import { exportStoryTheaterAppearanceSetting, restoreStoryTheaterAppearanceSetting } from '../utils/storyTheaterBackup';
 import { createV2ArrayFieldWriter, writeV2Backup, assembleV2Backup, type BackupManifest, type ZipFileWriter, type ZipFileReader } from '../utils/backupFormat';
@@ -63,6 +65,7 @@ import { LocalNotifications } from '@capacitor/local-notifications';
 import { Capacitor } from '@capacitor/core';
 import { formatBytes } from '../utils/format';
 import { isEmotionEvalSkipped } from '../utils/devDebug';
+import { isBenignApplicationConsoleMessage } from '../utils/applicationConsole';
 import { toMountedWorldbook } from '../utils/worldbook';
 import { initLocalStorageMirror } from '../utils/lsMirror';
 // 备份用：把存在 localStorage 的本机配置随导出一起带走（键名须与 importFullData 对齐）
@@ -74,6 +77,8 @@ import { exportMcdLocal } from '../utils/mcdMcpClient';
 import { exportMcpLocal } from '../utils/mcpClient';
 import { exportDesktopSkinLocal } from '../utils/desktopSkinBackup';
 import { assertSupportedSullyBackup } from '../utils/backupImportPolicy';
+import { createBuiltinSullyLive2DConfig, isBuiltinSullyLive2D, upgradeBuiltinSullyLive2DDefaults } from '../utils/builtinSullyLive2D';
+import { normalizeCharacterRoomAssetsInPlace } from '../utils/roomTemplateAssets';
 
 interface ProactiveQueueEntry {
   charId: string;
@@ -410,8 +415,8 @@ interface OSContextType {
   handleBack: () => void;
 
   // Call Suspend
-  suspendedCall: { charId: string; charName: string; charAvatar?: string; startedAt: number; bubbles?: any[]; sessionId?: string; elapsedSeconds?: number; voiceLang?: string } | null;
-  suspendCall: (info: { charId: string; charName: string; charAvatar?: string; startedAt: number; bubbles?: any[]; sessionId?: string; elapsedSeconds?: number; voiceLang?: string }) => void;
+  suspendedCall: { charId: string; charName: string; charAvatar?: string; startedAt: number; bubbles?: any[]; sessionId?: string; elapsedSeconds?: number; voiceLang?: string; pendingAvatarTouches?: AvatarTouchRecord[] } | null;
+  suspendCall: (info: { charId: string; charName: string; charAvatar?: string; startedAt: number; bubbles?: any[]; sessionId?: string; elapsedSeconds?: number; voiceLang?: string; pendingAvatarTouches?: AvatarTouchRecord[] }) => void;
   resumeCall: () => void;
   clearSuspendedCall: () => void;
 
@@ -595,6 +600,12 @@ const resolveLockWallpaperStoredValue = async (w: string | undefined): Promise<s
 const defaultApiConfig: APIConfig = {
   baseUrl: '',
   apiKey: '',
+  visionApi: {
+    enabled: false,
+    baseUrl: '',
+    apiKey: '',
+    model: '',
+  },
   minimaxApiKey: '',
   minimaxGroupId: '',
   minimaxRegion: 'domestic',
@@ -620,6 +631,7 @@ const sullyV2: CharacterProfile = {
   id: 'preset-sully-v2', // Unique ID to prevent duplication
   name: 'Sully',
   avatar: SULLY_DEFAULT_AVATAR_URL,
+  videoAvatar: createBuiltinSullyLive2DConfig('balanced'),
   description: 'AI助理 / 电波系黑客猫猫',
   
   systemPrompt: `[Role Definition]
@@ -908,7 +920,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   const backHandlerRef = useRef<(() => boolean) | null>(null);
 
   // Call Suspend
-  const [suspendedCall, setSuspendedCall] = useState<{ charId: string; charName: string; charAvatar?: string; startedAt: number; bubbles?: any[]; sessionId?: string; elapsedSeconds?: number; voiceLang?: string } | null>(null);
+  const [suspendedCall, setSuspendedCall] = useState<{ charId: string; charName: string; charAvatar?: string; startedAt: number; bubbles?: any[]; sessionId?: string; elapsedSeconds?: number; voiceLang?: string; pendingAvatarTouches?: AvatarTouchRecord[] } | null>(null);
   // 聊天「见面」按钮 → 见面：记录目标角色，DateApp 挂载后消费一次并自动进入见面
   const [dateAutoStartCharId, setDateAutoStartCharId] = useState<string | null>(null);
 
@@ -1050,6 +1062,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                       ? resource.href
                       : String(resource);
           const fetchStartedAt = Date.now();
+          // 失败诊断要按发起时刻去 Resource Timing 里认领本次那条记录，而 entry.startTime 跟
+          // performance.now() 同一条时间轴、跟 Date.now() 不是——两者不能混用，详见
+          // utils/networkFailureDiagnosis.ts 的 readResourceTimingHint。
+          const fetchStartedAtPerf = typeof performance !== 'undefined' ? performance.now() : Number.NaN;
           // Bare fetch calls do not carry explicit metadata. Snapshot the active
           // App now; reading the ambient value after a long response would label
           // the request as whichever App the user navigated to in the meantime.
@@ -1061,7 +1077,6 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           let sendArgs: [RequestInfo | URL, RequestInit?] = args;
           // 透明流式升级状态（utils/streamUpgrade.ts）：请求侧改写 → 响应侧拼回 JSON
           let streamUpgraded = false;
-          let bodyBeforeStreamUpgrade: string | null = null;
           if (urlStr.includes('/chat/completions')) {
               const rawBody = (config as RequestInit | undefined)?.body;
               if (typeof rawBody === 'string') {
@@ -1078,7 +1093,6 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                       if (isGlobalStreamEnabled()) {
                           const upgraded = upgradeChatBodyToStream(body);
                           if (upgraded) {
-                              bodyBeforeStreamUpgrade = body;
                               body = upgraded;
                               streamUpgraded = true;
                           }
@@ -1099,31 +1113,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           try {
               let response = await originalFetch(...sendArgs);
 
-              // 兜底：模型没被上面清单覆盖但仍拒收采样参数时，读 400 报文自愈——摘掉后重试一次。
-              if (!response.ok && response.status === 400 && urlStr.includes('/chat/completions')) {
-                  const sentBody = (sendArgs[1] as RequestInit | undefined)?.body;
-                  if (typeof sentBody === 'string') {
-                      let errText = '';
-                      try { errText = await response.clone().text(); } catch { /* 读不出就算了 */ }
-                      if (isSamplingParamError(errText)) {
-                          try {
-                              const parsed = JSON.parse(sentBody);
-                              if (stripSamplingParams(parsed)) {
-                                  sendArgs = [resource, { ...(sendArgs[1] as RequestInit), body: JSON.stringify(parsed) }];
-                                  response = await originalFetch(...sendArgs);
-                              }
-                          } catch { /* 解析失败：保留原始 400 响应 */ }
-                      }
-                  }
-              }
-
-              // 流式升级自愈：个别中转对 stream/stream_options 直接 4xx → 用升级前的
-              // 原 body 重发一次，行为退回旧版（升级只能赚不能赔）。
-              if (streamUpgraded && !response.ok && (response.status === 400 || response.status === 422) && bodyBeforeStreamUpgrade) {
-                  console.warn('🔁 [StreamUpgrade] 中转拒绝流式升级(HTTP ' + response.status + ')，回退原请求重发');
-                  response = await originalFetch(resource, { ...(config as RequestInit), body: bodyBeforeStreamUpgrade });
-                  streamUpgraded = false;
-              }
+              // /chat/completions 是可能已经开始计费的请求。拿到任何 HTTP 响应后都不在
+              // 兼容层静默重发：中转站可能在返回错误前已经把任务交给上游，重发会让用户
+              // 只看到一条调用记录却被扣两到三次。已知模型的采样参数仍在发送前清理；
+              // 未知兼容问题和流式 4xx 原样交给调用方，由用户明确决定是否重试。
               // 流式升级的响应归一化：SSE 攒齐拼回标准 chat.completion JSON——
               // 调用方（safeResponseJson / res.json() 均可）拿到与升级前等价的响应。
               if (streamUpgraded && response.ok) {
@@ -1222,7 +1215,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                       method,
                       durationMs: Date.now() - fetchStartedAt,
                       error: err,
-                  });
+                  }, { startedAt: fetchStartedAtPerf });
                   setSystemLogs(prev => [{
                       id: logId,
                       timestamp: Date.now(),
@@ -1264,8 +1257,14 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
       const originalConsoleError = console.error;
       console.error = (...args) => {
-          originalConsoleError(...args);
           const msg = args.map(a => (a instanceof Error ? a.message : String(a))).join(' ');
+          // MediaPipe/TFLite 把这条成功初始化信息写到了 stderr，浏览器因而走
+          // console.error；改回 info，避免系统日志把“CPU 加速创建成功”报成红色错误。
+          if (isBenignApplicationConsoleMessage(msg)) {
+              console.info(...args);
+              return;
+          }
+          originalConsoleError(...args);
           // detail 只有真拿到堆栈才用堆栈，否则回退完整 msg。
           // 旧写法 `args.map(a => a instanceof Error ? a.stack : '').join('\n')`
           // 对「多个非 Error 参数」会产出 "\n"（truthy），把回退短路掉——
@@ -1329,6 +1328,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                  // Reset font too if it's data URI
                  if (loadedTheme.customFont && loadedTheme.customFont.startsWith('data:')) {
                      loadedTheme.customFont = undefined;
+                 }
+                 const companionRepair = stripCompanionChatStyleResidue(loadedTheme);
+                 if (companionRepair.repaired) {
+                     loadedTheme = companionRepair.theme;
+                     localStorage.setItem('os_theme', JSON.stringify(loadedTheme));
                  }
              } catch(e) { console.error('Theme load error', e); }
         }
@@ -1526,12 +1530,17 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                  // 默认头像曾先后使用旧图床和依赖部署根路径的本地地址。
                  // 这些地址在备份恢复或 GitHub Pages 子路径变化后会 404；统一迁移到资产仓库。
                  // 用户自己改过的头像不在迁移名单内，保持不动。
-                 const needsAvatarUpdate = shouldMigrateSullyAvatar(existingSully.avatar);
+                  const needsAvatarUpdate = shouldMigrateSullyAvatar(existingSully.avatar);
+                  // 内置模型只补给还没有视频形象的 Sully。用户自己导入的
+                  // VRM / Live2D 始终优先，绝不在启动修复时被覆盖。
+                  const needsBuiltinVideoAvatar = !existingSully.videoAvatar;
+                  const needsBuiltinVideoAvatarUpgrade = isBuiltinSullyLive2D(existingSully.videoAvatar)
+                      && existingSully.videoAvatar.builtinFramingVersion !== 2;
                  // 之前误把家园 chibi 替换成了像素小屋的像素立绘 → 还原为原版 sharkpan 立绘
                  const hasMisplacedPixelChibi = typeof currentSprites['chibi'] === 'string'
                      && currentSprites['chibi'].startsWith('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADUAAAA4CAYAAABdeLCu');
 
-                 if (isCorrupted || !existingSully.roomConfig || needsWallUpdate || needsSkinSets || hasMisplacedPixelChibi || needsAvatarUpdate) {
+                  if (isCorrupted || !existingSully.roomConfig || needsWallUpdate || needsSkinSets || hasMisplacedPixelChibi || needsAvatarUpdate || needsBuiltinVideoAvatar || needsBuiltinVideoAvatarUpgrade) {
                      const restoredSprites = { ...sullyV2.sprites, ...currentSprites };
 
                      if (!restoredSprites['normal']) restoredSprites['normal'] = sullyV2.sprites!['normal'];
@@ -1561,8 +1570,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
                      const updatedSully = {
                          ...existingSully,
-                         avatar: needsAvatarUpdate ? sullyV2.avatar : existingSully.avatar,
-                         sprites: restoredSprites,
+                          avatar: needsAvatarUpdate ? sullyV2.avatar : existingSully.avatar,
+                          videoAvatar: existingSully.videoAvatar?.format === 'live2d'
+                              ? upgradeBuiltinSullyLive2DDefaults(existingSully.videoAvatar)
+                              : existingSully.videoAvatar || sullyV2.videoAvatar,
+                          sprites: restoredSprites,
                          roomConfig: updatedRoomConfig,
                          dateSkinSets: mergedSkins
                      };
@@ -1618,9 +1630,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
         // amsg2 脏标记兜底补传：上次会话打了脏、但请求还没落地（在飞或躺在退避重排里）
         // 就被杀进程的角色，按 localStorage 底账用刚从 DB 读回的数据重建快照传一次。
-        // realtimeConfig 的 state 此刻可能还没就位，直接读它的持久化来源。
+        // realtimeConfig / apiConfig 的 state 此刻可能都还没就位，直接读各自的持久化来源。
         try {
           const savedRealtime = localStorage.getItem('os_realtime_config');
+          const savedApiRaw = localStorage.getItem('os_api_config');
           resumePendingAmsgStateSync({
             characters: finalChars,
             userProfile: dbUser ?? defaultUserProfile,
@@ -1628,6 +1641,8 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
             realtimeConfig: savedRealtime
               ? { ...defaultRealtimeConfig, ...JSON.parse(savedRealtime) }
               : defaultRealtimeConfig,
+            // 上次没传成功的 LLM 凭据行按这份重算补传；没有就跳过那一项。
+            apiConfig: savedApiRaw ? JSON.parse(savedApiRaw) : undefined,
           });
         } catch (err) {
           console.warn('[AmsgStateSync] 启动补传失败（不影响启动）', err);
@@ -1974,9 +1989,8 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           addToast(`${charName || '角色'}的情绪评估失败：${reason || '未知原因'}（不影响聊天回复）`, 'error');
       };
 
-      // 主动消息处理失败 → 明确告诉用户，别让消息无声无息地不出现。
-      // 平时 push 路径是不弹 toast 的，但这里频率极低（本地存储出问题才会有），
-      // 而且不说的话用户只会觉得「角色今天没理我」。每角色 60s 冷却防连推时刷屏。
+      // 主动消息处理失败很少发生，但如果静默吞掉，用户只会以为角色没有理人。
+      // 同一角色 60 秒内只提示一次，避免多条重试同时刷屏。
       const inboxFailToastAt: Record<string, number> = {};
       const inboxFailHandler = (e: Event) => {
           const { charId, charName, kind } = ((e as CustomEvent).detail || {}) as
@@ -1994,6 +2008,14 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           addToast(text, 'error');
       };
 
+      // 记忆宫殿水位线触发的全局提示：聊天/见面/通话共用同一条消息流，
+      // pipeline 真正开始整理时会广播此事件——无论用户此刻在哪个 App，
+      // 都统一弹「xx正在整理记忆」。
+      const palaceProcessingHandler = (e: Event) => {
+          const { charName, count } = ((e as CustomEvent).detail || {}) as { charName?: string; count?: number };
+          addToast(`${charName || '角色'}正在整理记忆${count ? `（${count} 条对话）` : ''}…`, 'info');
+      };
+
       window.addEventListener('active-msg-received', handler);
       window.addEventListener('active-msg-process-failed', inboxFailHandler);
       window.addEventListener('active-msg-progress', progressHandler);
@@ -2002,6 +2024,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
       window.addEventListener(CHAT_GEN_EVENTS.replyArrived, chatReplyArrivedHandler);
       window.addEventListener(CHAT_GEN_EVENTS.replyEnd, chatReplyEndHandler);
       window.addEventListener(CHAT_GEN_EVENTS.emotionFailed, emotionFailHandler);
+      window.addEventListener('memory-palace-processing', palaceProcessingHandler);
       document.addEventListener('visibilitychange', onVisible);
       return () => {
           window.removeEventListener('active-msg-received', handler);
@@ -2012,6 +2035,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           window.removeEventListener(CHAT_GEN_EVENTS.replyArrived, chatReplyArrivedHandler);
           window.removeEventListener(CHAT_GEN_EVENTS.replyEnd, chatReplyEndHandler);
           window.removeEventListener(CHAT_GEN_EVENTS.emotionFailed, emotionFailHandler);
+          window.removeEventListener('memory-palace-processing', palaceProcessingHandler);
           document.removeEventListener('visibilitychange', onVisible);
       };
   }, [sendProactiveNativeNotification]);
@@ -2203,6 +2227,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   htmlMode: { enabled: !!(char as any).htmlModeEnabled, customPrompt: (char as any).htmlModeCustomPrompt },
                   thinkingChain: { enabled: !!(char as any).showThinkingChain, customPrompt: (char as any).thinkingChainCustomPrompt },
                   innerVoice: { enabled: !!(char as any).innerVoiceEnabled },
+                  visionApiConfig: currentApiConfig.visionApi,
               });
               const systemPrompt = payload.systemPrompt;
               const apiMessages = payload.cleanedApiMessages;
@@ -3597,6 +3622,25 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               return obj;
           };
 
+          const stripTextOnlyMedia = (obj: any): any => {
+              const stripped = stripBase64(obj);
+              const markExpiredCallSnapshots = (value: any): void => {
+                  if (Array.isArray(value)) {
+                      value.forEach(markExpiredCallSnapshots);
+                      return;
+                  }
+                  if (!value || typeof value !== 'object') return;
+                  const metadata = value.metadata;
+                  if (metadata && typeof metadata === 'object'
+                      && Object.prototype.hasOwnProperty.call(metadata, 'cameraSnapshotRef')) {
+                      delete metadata.cameraSnapshotRef;
+                      metadata.cameraSnapshotExpired = true;
+                  }
+              };
+              markExpiredCallSnapshots(stripped);
+              return stripped;
+          };
+
           // 把一条 data:image base64 落进 ZIP 的 assets/ 文件夹，返回它的 assets/* 路径。
           // 同一份 base64 全局只存一份（assetDedupMap 按完整 base64 去重）；无法识别的
           // data url 原样返回，不动它。
@@ -4045,7 +4089,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                       },
                   );
                   await DB.streamRawStoreData(storeName, (item) => {
-                      const processedItem = noImageStores.has(storeName) ? item : stripBase64(item);
+                      // characters 也走这条低内存旁路；必须在逐条写分片前规范化，
+                      // 否则 text_only 会绕过下面 getAll 分支，把旧部署的绝对样板房 URL 原样带走。
+                      if (storeName === 'characters') normalizeCharacterRoomAssetsInPlace(item);
+                      const processedItem = noImageStores.has(storeName) ? item : stripTextOnlyMedia(item);
                       writer.appendSync([processedItem]);
                   });
                   prewrittenStores[textOnlyField] = await writer.finish();
@@ -4054,6 +4101,13 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
               let rawData = await DB.getRawStoreData(storeName);
               let processedData: any;
+
+              // Built-in room-template files belong to the app, not to the source deployment.
+              // Older builds stored their fully resolved origin in roomConfig; strip that origin
+              // from the export clone so restoring on another host/base path keeps every item.
+              if (storeName === 'characters' && Array.isArray(rawData)) {
+                  for (const character of rawData) normalizeCharacterRoomAssetsInPlace(character);
+              }
 
               // 向量旁路：归一化拼 bin + 索引，不进 backupData（writeV2Backup 收尾落 zip）。直接跳过
               // 下面的图片处理 / switch（向量无图、无 image base64）。
@@ -4068,7 +4122,8 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               //  · characters：小屋 roomConfig.wallImage/floorImage/items[].image、sprites.chibi
               //    （media_only 的 roomItems/backgrounds 提取也依赖已还原成 data:）
               //  · cc_custom_parts：捏人器自定义部件的 src / shadowSrc
-              if ((storeName === 'characters' || storeName === 'cc_custom_parts') && mode !== 'text_only' && Array.isArray(rawData)) {
+              //  · messages：视频通话每轮快照的 metadata.cameraSnapshotRef
+              if ((storeName === 'characters' || storeName === 'cc_custom_parts' || storeName === 'messages') && mode !== 'text_only' && Array.isArray(rawData)) {
                   for (const c of rawData) await resolveBlobRefsDeep(c);
               }
 
@@ -4087,14 +4142,20 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   processedData = rawData;
               } else if (mode === 'text_only') {
                   processedData = Array.isArray(rawData) && rawData.length > 200
-                      ? await processArrayChunked(rawData, stripBase64)
-                      : stripBase64(rawData);
+                      ? await processArrayChunked(rawData, stripTextOnlyMedia)
+                      : stripTextOnlyMedia(rawData);
               } else {
                   // Media & Theme Mode: Extract Images
                   
                   if (storeName === 'messages' && mode === 'media_only') {
-                      // Filter messages: Only keep image/emoji types
-                      rawData = rawData.filter((m: Message) => m.type === 'image' || m.type === 'emoji');
+                      // Keep normal media messages plus lightweight call turns that own
+                      // a retained frame / [图片] marker. Import remains patch-mode.
+                      rawData = rawData.filter((m: Message) => (
+                          m.type === 'image'
+                          || m.type === 'emoji'
+                          || !!m.metadata?.cameraSnapshotRef
+                          || m.metadata?.cameraSnapshotExpired === true
+                      ));
                   }
 
                   if (storeName === 'characters' && mode === 'media_only') {
@@ -4104,6 +4165,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                           const extracted = {
                               charId: c.id,
                               avatar: c.avatar,
+                              companionAvatar: c.companionAvatar,
                               sprites: c.sprites,
                               // Date app sprite data: skin sets carry alternate sprite maps,
                               // and customDateSprites/activeSkinSetId are required to wire them up.
@@ -4777,7 +4839,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   const consumeDateAutoStart = () => setDateAutoStartCharId(null);
   const unlock = () => setIsLocked(false);
 
-  const suspendCall = (info: { charId: string; charName: string; charAvatar?: string; startedAt: number; bubbles?: any[]; sessionId?: string; elapsedSeconds?: number; voiceLang?: string }) => {
+  const suspendCall = (info: { charId: string; charName: string; charAvatar?: string; startedAt: number; bubbles?: any[]; sessionId?: string; elapsedSeconds?: number; voiceLang?: string; pendingAvatarTouches?: AvatarTouchRecord[] }) => {
     setSuspendedCall(info);
     setActiveApp(AppID.Launcher);
   };

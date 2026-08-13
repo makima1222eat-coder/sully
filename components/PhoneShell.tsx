@@ -5,6 +5,8 @@ import React, { useState, useEffect, useMemo, useRef, lazy, Suspense } from 'rea
 import { IMPORT_IN_PROGRESS_KEY, useOS } from '../context/OSContext';
 import StatusBar from './os/StatusBar';
 import Launcher from '../apps/Launcher';
+import CompanionLockChrome from './os/CompanionLockChrome';
+import { loadCompanionFrameStyle } from './os/companionFrameStyles';
 
 // 按需懒加载各 App —— 切到对应 App 时才下载/解析其代码块，首屏只加载 Launcher 与外壳，
 // 大体积 App（MemoryPalace / VRWorld / Songwriting 等）不再压在主包里。
@@ -130,6 +132,7 @@ setAppPayloadWarmer((id: AppID) => { const c = APP_BY_ID[id]; if (c) warmLazy(c)
 import { Like520Controller, shouldShowLike520Popup } from './Like520Event';
 import { UpdateNotificationController, shouldShowUpdateNotification } from './UpdateNotificationEvent';
 import { WorkerUpdateReminderController, shouldShowWorkerUpdateReminder, rearmWorkerUpdateReminder } from './WorkerUpdateReminderEvent';
+import { InstantPushSunsetController, shouldShowInstantPushSunsetNotice } from './InstantPushSunsetEvent';
 import { loadInstantConfig, probeInstantWorkerVersion } from '../utils/instantPushClient';
 import { BackupReminderController } from './BackupReminderEvent';
 import { shouldShowBackupReminder, markBackupReminderShown, daysSinceLastBackup } from '../utils/backupReminder';
@@ -610,13 +613,23 @@ const PhoneShell: React.FC = () => {
     if (shouldShowLike520Popup()) setShowLike520Popup(true);
   }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, isDataLoaded]);
 
-  // Worker 后端更新提醒 — 只对启用了 Instant Push 的用户弹，且当前 worker 版本未确认过
-  const [showWorkerUpdateReminder, setShowWorkerUpdateReminder] = useState(false);
+  // Instant Push 下线通知 — 只对现在开着它的人弹，每天最多一次。
+  // 排在 Worker 更新提醒前面：这两条都只找同一批人，而「这功能要没了」比
+  // 「去把它更新到最新版」重要，同一天里先说前者。
+  const [showInstantPushSunset, setShowInstantPushSunset] = useState(false);
   useEffect(() => {
     if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showLike520Popup) return;
     if (!isDataLoaded) return;
-    if (shouldShowWorkerUpdateReminder()) setShowWorkerUpdateReminder(true);
+    if (shouldShowInstantPushSunsetNotice()) setShowInstantPushSunset(true);
   }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showLike520Popup, isDataLoaded]);
+
+  // Worker 后端更新提醒 — 只对启用了 Instant Push 的用户弹，且当前 worker 版本未确认过
+  const [showWorkerUpdateReminder, setShowWorkerUpdateReminder] = useState(false);
+  useEffect(() => {
+    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showLike520Popup || showInstantPushSunset) return;
+    if (!isDataLoaded) return;
+    if (shouldShowWorkerUpdateReminder()) setShowWorkerUpdateReminder(true);
+  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showLike520Popup, showInstantPushSunset, isDataLoaded]);
 
   // 部署漂移自检：启动后异步 GET {workerUrl}/version（每 24h 最多一次）。
   // 常量比对只能发现「前端更新了」，发现不了「用户 seen 过但实际没部署 / 部署的是更老的包」——
@@ -644,14 +657,14 @@ const PhoneShell: React.FC = () => {
   // 「该备份啦」提醒 — local-first 数据只在本机，隔 N 天（默认 7，可在设置里改）没导出就弹一次
   const [showBackupReminder, setShowBackupReminder] = useState(false);
   useEffect(() => {
-    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showLike520Popup || showWorkerUpdateReminder) return;
+    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showLike520Popup || showInstantPushSunset || showWorkerUpdateReminder) return;
     if (!isDataLoaded || isLocked) return;
     if (shouldShowBackupReminder()) {
       setShowBackupReminder(true);
       // 只报「从未备份 / 已过期」这一个二选一，不报具体天数、也不报用户设的提醒间隔。
       trackEvent('弹出该备份啦提醒', { state: daysSinceLastBackup() == null ? '从未备份' : '已过期' });
     }
-  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showLike520Popup, showWorkerUpdateReminder, isDataLoaded, isLocked]);
+  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showLike520Popup, showInstantPushSunset, showWorkerUpdateReminder, isDataLoaded, isLocked]);
 
   const dismissBackupReminder = () => {
     markBackupReminderShown();
@@ -753,11 +766,14 @@ const PhoneShell: React.FC = () => {
   const lockBgImageValue = getBgStyle(theme.lockWallpaper || theme.wallpaper);
   const contentColor = theme.contentColor || '#ffffff';
   const acnhSkin = theme.skin === 'animalcrossing'; // 动森彩蛋：锁屏换暖色草地点缀
+  const storedCompanionFrame = theme.skin === 'companion' ? loadCompanionFrameStyle() : null;
+  const companionLockFrame = storedCompanionFrame;
 
   if (isLocked) {
     const unreadCount = Object.values(unreadMessages).reduce((a,b) => a+b, 0);
     const unreadCharId = Object.keys(unreadMessages)[0];
     const unreadChar = unreadCharId ? characters.find(c => c.id === unreadCharId) : null;
+    const lockCharacter = characters.find(c => c.id === activeCharacterId) || characters[0] || null;
 
         return (
       <div 
@@ -789,7 +805,19 @@ const PhoneShell: React.FC = () => {
             </div>
         )}
 
-        <div className="absolute top-24 w-full text-center drop-shadow-[0_2px_4px_rgba(0,0,0,0.3)]">
+        {companionLockFrame && (
+          <CompanionLockChrome
+            variant={companionLockFrame}
+            hours={virtualTime.hours}
+            minutes={virtualTime.minutes}
+            activeCharacter={lockCharacter}
+            unreadCharacter={unreadChar}
+            unreadCount={unreadCount}
+            preserveWallpaper={Boolean(theme.lockWallpaper)}
+          />
+        )}
+
+        {!companionLockFrame && <div className="absolute top-24 w-full text-center drop-shadow-[0_2px_4px_rgba(0,0,0,0.3)]">
            <div className="text-8xl tracking-tighter opacity-95 font-bold">
              {virtualTime.hours.toString().padStart(2,'0')}<span className="animate-pulse">:</span>{virtualTime.minutes.toString().padStart(2,'0')}
            </div>
@@ -800,9 +828,9 @@ const PhoneShell: React.FC = () => {
            ) : (
                <div className="text-lg tracking-widest opacity-90 mt-2 uppercase text-xs font-bold">SullyOS Simulation</div>
            )}
-        </div>
+        </div>}
 
-        {unreadCount > 0 && (
+        {!companionLockFrame && unreadCount > 0 && (
             <div className="absolute top-[40%] left-4 right-4 animate-slide-up">
                 <div className="bg-white/20 backdrop-blur-md rounded-2xl p-4 shadow-lg border border-white/10 flex items-center gap-4">
                     <div className="w-10 h-10 rounded-xl bg-green-500 flex items-center justify-center text-white shrink-0 shadow-sm">
@@ -821,10 +849,10 @@ const PhoneShell: React.FC = () => {
             </div>
         )}
 
-        <div className="absolute bottom-12 w-full flex flex-col items-center gap-3 animate-pulse opacity-80 drop-shadow-md">
+        {!companionLockFrame && <div className="absolute bottom-12 w-full flex flex-col items-center gap-3 animate-pulse opacity-80 drop-shadow-md">
           <div className="w-1 h-8 rounded-full bg-gradient-to-b from-transparent to-current"></div>
           <span className="text-[10px] tracking-widest uppercase font-semibold">Tap to Unlock</span>
-        </div>
+        </div>}
       </div>
     );
   }
@@ -1002,15 +1030,22 @@ const PhoneShell: React.FC = () => {
          />
        )}
 
+       {/* Instant Push 下线通知（仅现在开着它的用户，每天最多一次） */}
+       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showLike520Popup && showInstantPushSunset && (
+         <InstantPushSunsetController
+           onClose={() => setShowInstantPushSunset(false)}
+         />
+       )}
+
        {/* Worker 后端更新提醒（仅启用 Instant Push 的用户，每个 worker 版本一次） */}
-       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showLike520Popup && showWorkerUpdateReminder && (
+       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showLike520Popup && !showInstantPushSunset && showWorkerUpdateReminder && (
          <WorkerUpdateReminderController
            onClose={() => setShowWorkerUpdateReminder(false)}
          />
        )}
 
        {/* 「该备份啦」提醒（local-first 数据只在本机，隔 N 天没导出弹一次） */}
-       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showLike520Popup && !showWorkerUpdateReminder && showBackupReminder && (
+       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showLike520Popup && !showInstantPushSunset && !showWorkerUpdateReminder && showBackupReminder && (
          <BackupReminderController
            onDismiss={dismissBackupReminder}
            onGoBackup={goBackupFromReminder}

@@ -15,7 +15,10 @@ import {
     buildStoryIdentityGuard,
     buildStoryPrefillInstruction,
     buildStoryMultiAffinityGuide,
+    buildStoryWorldbookScanMessages,
+    buildTheaterWorldbookSlots,
     compileStoryPreset,
+    createBlankStoryPreset,
     createStoryTheaterDraft,
     dedupeTheaterWorldbooks,
     getStoryPresetPromptGroups,
@@ -34,7 +37,29 @@ import {
     selectStoryArchiveBatch,
     storyTheaterMemoryRecipientIds,
     formatActorRecentMessages,
+    formatStoryTheaterExport,
+    makeStoryTheaterFileName,
 } from './storyTheater';
+
+describe('剧情原文导出', () => {
+    it('按原始楼层顺序导出真实陪伴的完整推进与正文', () => {
+        const output = formatStoryTheaterExport(
+            { title: '雨夜', premise: '从车站开始', writesToCharacterMemory: true },
+            '条条',
+            ['林星', 'Noir'],
+            [
+                { id: 2, charId: 'story', role: 'assistant', type: 'text', content: '<story_text>他撑开伞。</story_text>', timestamp: 2 },
+                { id: 1, charId: 'story', role: 'user', type: 'text', content: '走出车站。', timestamp: 1 },
+            ] as Message[],
+            new Date(2026, 7, 13, 20, 0, 0).getTime(),
+        );
+
+        expect(output).toContain('模式：真实时间陪伴');
+        expect(output).toContain('角色：林星、Noir');
+        expect(output.indexOf('走出车站。')).toBeLessThan(output.indexOf('<story_text>他撑开伞。</story_text>'));
+        expect(makeStoryTheaterFileName('雨/夜', new Date(2026, 7, 13).getTime())).toBe('雨_夜_剧情记录_2026-08-13.txt');
+    });
+});
 
 describe('多人剧情记忆的人称与归属', () => {
     it('把每位角色的召回包进具名专属信封，并阻止把“你”重绑定到面具', () => {
@@ -202,6 +227,57 @@ describe('剧情预设发送器', () => {
         expect(result.settings).toMatchObject({ temperature: 0.7, top_p: 0.8, max_tokens: 2048 });
     });
 
+    it('把角色设定前世界书放在角色资料前，并兼容缺少槽位的旧预设', () => {
+        const result = compileStoryPreset({
+            preset,
+            userName: '条条',
+            characterNames: ['苏利'],
+            slots: {
+                actors: 'ACTOR_BLOCK',
+                persona: '',
+                scenario: '',
+                worldBefore: 'WORLD_BEFORE_BLOCK',
+                worldAfter: '',
+                history: '',
+            },
+        });
+        const contents = result.messages.map(message => message.content);
+        expect(contents.indexOf('WORLD_BEFORE_BLOCK')).toBeGreaterThanOrEqual(0);
+        expect(contents.indexOf('WORLD_BEFORE_BLOCK')).toBeLessThan(contents.indexOf('ACTOR_BLOCK'));
+
+        const blank = createBlankStoryPreset('空白', 1);
+        const beforeIndex = blank.document.prompts.findIndex(prompt => prompt.marker === 'world_before');
+        const characterIndex = blank.document.prompts.findIndex(prompt => prompt.marker === 'characters');
+        expect(beforeIndex).toBeGreaterThanOrEqual(0);
+        expect(beforeIndex).toBeLessThan(characterIndex);
+
+        const builtInBeforeIndex = BUILTIN_NIGHT_SCREENING_PRESET.document.prompts.findIndex(prompt => prompt.marker === 'world_before');
+        const builtInCharacterIndex = BUILTIN_NIGHT_SCREENING_PRESET.document.prompts.findIndex(prompt => prompt.marker === 'characters');
+        expect(builtInBeforeIndex).toBeLessThan(builtInCharacterIndex);
+    });
+
+    it('会把旧预设中放错位置的角色设定前槽位纠正到角色资料之前', () => {
+        const misplacedPreset: StoryTheaterPreset = {
+            ...preset,
+            document: {
+                ...preset.document,
+                prompts: [
+                    { id: 'actor', name: '演员', enabled: true, role: 'user', content: '', marker: 'characters' },
+                    { id: 'before', name: '设定前', enabled: true, role: 'user', content: '', marker: 'world_before' },
+                ],
+            },
+        };
+        const result = compileStoryPreset({
+            preset: misplacedPreset,
+            userName: '条条',
+            characterNames: ['Noir'],
+            slots: { actors: 'ACTOR_BLOCK', persona: '', scenario: '', worldBefore: 'WORLD_BEFORE_BLOCK', worldAfter: '', history: '' },
+        });
+        const contents = result.messages.map(message => message.content);
+        expect(contents.indexOf('WORLD_BEFORE_BLOCK')).toBeLessThan(contents.indexOf('ACTOR_BLOCK'));
+        expect(contents.filter(content => content === 'WORLD_BEFORE_BLOCK')).toHaveLength(1);
+    });
+
     it('默认保留原生 assistant prefill，只有显式兼容时才由 user 收尾', () => {
         const prefill = { role: 'assistant' as const, content: '<scene_header>\n' };
         const nativePayload = appendStoryUserTurn([{ role: 'system', content: '规则' }], '继续', prefill);
@@ -271,6 +347,33 @@ describe('剧情沙盒辅助逻辑', () => {
         const result = dedupeTheaterWorldbooks(chars);
         expect(result.map(book => book.id)).toEqual(['a', 'b']);
         expect(chars[1].mountedWorldbooks).toHaveLength(2);
+    });
+
+    it('不会把不同世界书文件里 sourceUid 相同的条目误判成同一本', () => {
+        const chars = [
+            { id: 'c1', name: '一', mountedWorldbooks: [{ id: 'a', title: 'A', content: '一', category: '甲', sourceUid: 0 }] },
+            { id: 'c2', name: '二', mountedWorldbooks: [{ id: 'b', title: 'B', content: '二', category: '乙', sourceUid: 0 }] },
+        ] as CharacterProfile[];
+
+        expect(dedupeTheaterWorldbooks(chars).map(book => book.id).sort()).toEqual(['a', 'b']);
+    });
+
+    it('用当前轮输入立即触发关键词世界书，并保持最多二十条扫描窗口', () => {
+        const history = Array.from({ length: 25 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `旧消息 ${index}` }));
+        const scanMessages = buildStoryWorldbookScanMessages(history, '我现在肘击他');
+        const slots = buildTheaterWorldbookSlots([{
+            id: 'elbow',
+            title: '肘击规则',
+            content: '触发成功',
+            category: '测试',
+            key: ['肘击'],
+            constant: false,
+            position: 1,
+        }], scanMessages, '条条', ['苏利']);
+
+        expect(scanMessages).toHaveLength(20);
+        expect(scanMessages.at(-1)).toEqual({ role: 'user', content: '我现在肘击他' });
+        expect(slots.worldAfter).toContain('触发成功');
     });
 
     it('把同一正文映射到每位角色自己的时间锚点', () => {

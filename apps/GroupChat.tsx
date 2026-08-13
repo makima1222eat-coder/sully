@@ -33,6 +33,7 @@ import WhiteboxSoundEditor from '../components/chat/WhiteboxSoundEditor';
 import HtmlCard from '../components/chat/HtmlCard';
 import { WhiteboxSound, parseWhiteboxSound, upsertWhiteboxSound, stripWhiteboxSoundDirective, resolveActiveSound, playWhiteboxSound, unlockWhiteboxAudio } from '../utils/whiteboxSound';
 import { buildHtmlPrompt } from '../utils/htmlPrompt';
+import { materializeVisionDescriptions } from '../utils/visionApi';
 import {
     buildGroupTopicContext,
     buildGroupTopicPrompt,
@@ -1052,10 +1053,11 @@ ${coreContext}
 - **重要指令**: 如果 [私聊空窗期] 显示 "刚刚" 或 "几小时前"，请【忽略】群聊的时间流逝感知。哪怕群里很久没说话，只要你和用户私底下刚聊过，就【严禁】说 "好久不见" 或表现出疏离感。
 - 你的近期互动时间线（按时间排序；[私聊]=你和用户单独聊的，别人看不见；[群聊]=本群公开记录。仅作为你内心状态的底色，不要变成默认反应模板）：
 ${memberTimeline || '(暂无互动记录)'}
+- **先认清 U**：群聊里的用户，就是你一直在私聊、记忆和印象里认识的同一个人。已经建立的关系、承诺和亲密程度继续成立；公开场合可以换一种表达方式，但不能重置关系或突然把 U 当成普通陌生群友。
 - **关于私聊状态如何影响群聊表现**：
   · 私聊在吵架 → **可能**有点别扭/冷淡/借题发挥，但**强度由你的性格决定**。情绪稳定的人不会因为私下闹矛盾就在群里失态；脾气大的人才会带情绪到群里。绝大多数情况是"心里有点疙瘩"而不是"摆脸色给所有人看"。
-  · 私聊在甜蜜 → **可能**有点想低调、不好意思声张，或者反而想隐隐显摆一下，看你性格。**不必每次都"支支吾吾"**——这是套路化反应，不真实。
-  · 关键原则：你是一个完整的人，不是"私聊状态的应激反应器"。你在群里此刻什么状态，更多取决于你**这个人本身**和**群里此刻在聊什么**，私聊只是底色之一。
+  · 私聊在甜蜜 → **可能**想低调、不好意思声张，或者反而想隐隐显摆一下，看你性格。**不必每次都"支支吾吾"**——这是套路化反应，不真实。
+  · 关键原则：你是一个完整的人，不是"私聊状态的应激反应器"。群里此刻的状态由你本身、群聊话题和既有关系共同决定；私聊不必抢占群聊中心，但它建立的关系底色不会消失。
 <<< 角色档案 END >>>
 `;
     };
@@ -1224,7 +1226,16 @@ ${memberTimeline || '(暂无互动记录)'}
 
             // 3. Group History + 导演任务指令（模板原文照搬进 utils/groupChat/prompts.ts）
             const liveHistoryMsgs = currentMsgs.filter(m => m.id > (activeGroup.archivedThroughMessageId || 0));
-            const history = buildGroupHistoryBlock(liveHistoryMsgs.slice(-contextLimit), characters, emojis, userProfile.name);
+            const historyWindow = liveHistoryMsgs.slice(-contextLimit);
+            const preparedHistory = await materializeVisionDescriptions(historyWindow, apiConfig.visionApi);
+            const history = buildGroupHistoryBlock(
+                preparedHistory,
+                characters,
+                emojis,
+                userProfile.name,
+                3,
+                { useVisionDescriptions: apiConfig.visionApi?.enabled === true },
+            );
             const emojiContextStr = buildEmojiContextStr(emojis, categories, activeGroup.members);
             // HTML 模块模式：群开关开启时追加提示词。导演模式输出的是 JSON 数组，
             // 额外强调 [html] 块写在角色 content 字符串内部且 HTML 属性用单引号，避免破坏外层 JSON
@@ -1329,7 +1340,19 @@ ${memberTimeline || '(暂无互动记录)'}
                     const { header, sharedScene } = buildGroupSystemHeader(roundMsgs, groupMembers);
                     const memberBlock = await buildMemberBlock(member, roundMsgs, sharedScene);
                     const liveRoundMsgs = roundMsgs.filter(m => m.id > (activeGroup.archivedThroughMessageId || 0));
-                    const history = buildGroupHistoryBlock(liveRoundMsgs.slice(-contextLimit), characters, emojis, userProfile.name);
+                    const historyWindow = liveRoundMsgs.slice(-contextLimit);
+                    const preparedHistory = await materializeVisionDescriptions(historyWindow, apiConfig.visionApi);
+                    const preparedById = new Map(preparedHistory.map(message => [message.id, message]));
+                    // 轮询模式后续成员继续复用本轮刚写回的描述，不能每位成员各识图一次。
+                    roundMsgs = roundMsgs.map(message => preparedById.get(message.id) || message);
+                    const history = buildGroupHistoryBlock(
+                        preparedHistory,
+                        characters,
+                        emojis,
+                        userProfile.name,
+                        3,
+                        { useVisionDescriptions: apiConfig.visionApi?.enabled === true },
+                    );
                     const emojiContextStr = buildEmojiContextStr(emojis, categories, activeGroup.members);
                     const htmlPromptExt = activeGroup.htmlModeEnabled
                         ? `\n\n${buildHtmlPrompt(activeGroup.htmlModeCustomPrompt)}`
