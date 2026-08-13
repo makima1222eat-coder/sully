@@ -13,13 +13,32 @@
  */
 
 import type { Anticipation, EventBox, MemoryNode, ScoredMemory } from './types';
-import { ROOM_CONFIGS, getRoomLabel } from './types';
 import { MemoryNodeDB, EventBoxDB } from './db';
 import { recordRecallReceipt } from './recallReceipts';
-import { formatMemoryDateWithDistance } from './memoryDate';
 
 const DEFAULT_MAX_OUTPUT_ITEMS = 15;
 const MAX_LIVE_NODES_PER_BOX = 8; // 单盒最多展开多少条活节点（防止超大盒污染）
+const PROMPT_ROOM_META: Record<string, { label: string; description: string }> = {
+    living_room: { label: 'Living Room', description: 'everyday conversation and recent interactions' },
+    bedroom: { label: 'Bedroom', description: 'intimacy and deep bonds' },
+    study: { label: 'Study', description: 'work, learning, and skill development' },
+    user_room: { label: 'User Room', description: 'personal information and habits' },
+    self_room: { label: 'Self Room', description: 'identity and personal evolution' },
+    attic: { label: 'Attic', description: 'unprocessed conflicts and the subconscious' },
+    windowsill: { label: 'Windowsill', description: 'hopes, goals, and aspirations' },
+};
+
+function formatPromptMemoryDate(createdAt: number, now: number): string {
+    const date = new Date(createdAt);
+    const today = new Date(now);
+    if (Number.isNaN(date.getTime()) || Number.isNaN(today.getTime())) return 'unknown date';
+    const calendarDate = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    const dayMs = 24 * 60 * 60 * 1000;
+    const dayNumber = (d: Date) => Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / dayMs);
+    const distance = dayNumber(today) - dayNumber(date);
+    const relative = distance === 0 ? 'today' : distance > 0 ? `about ${distance} days ago` : `about ${Math.abs(distance)} days from now`;
+    return `${calendarDate} (${relative})`;
+}
 
 interface RenderItem {
     /** 用于排序：取该 item 内最高的 finalScore */
@@ -190,15 +209,15 @@ export async function expandAndFormat(
     console.groupEnd();
 
     // 4. 按房间分组渲染
-    let output = `### 记忆宫殿 (Memory Palace)\n`;
-    output += `以下是你脑海中浮现的相关记忆片段，它们可能影响你此刻的感受和反应：\n\n`;
+    let output = `### Memory Palace\n`;
+    output += `These relevant memories have surfaced in your mind and may influence your present feelings and reactions:\n\n`;
 
     // 4a. 便利贴置顶记忆
     if (pinnedNodes.length > 0) {
-        output += `📌 **便利贴（近期重要事项）**\n`;
+        output += `📌 **Pinned Notes (important near-term matters)**\n`;
         for (const node of pinnedNodes) {
             const daysLeft = Math.ceil((node.pinnedUntil! - now) / (24 * 60 * 60 * 1000));
-            output += `- [${formatMemoryDateWithDistance(node.createdAt, now)}] ${node.content}（剩余 ${daysLeft} 天）\n`;
+            output += `- [${formatPromptMemoryDate(node.createdAt, now)}] ${node.content} (${daysLeft} days remaining)\n`;
         }
         output += `\n`;
         console.log(`📌 [MemoryPalace] 便利贴置顶 ${pinnedNodes.length} 条`);
@@ -215,8 +234,9 @@ export async function expandAndFormat(
     for (const room of roomOrder) {
         const items = byRoom.get(room);
         if (!items || items.length === 0) continue;
-        const roomLabel = getRoomLabel(room as any, userName);
-        const roomDesc = ROOM_CONFIGS[room as keyof typeof ROOM_CONFIGS]?.description || '';
+        const baseMeta = PROMPT_ROOM_META[room] || { label: room, description: '' };
+        const roomLabel = room === 'user_room' && userName ? `${userName}'s Room` : baseMeta.label;
+        const roomDesc = baseMeta.description;
         for (const it of items) {
             output += `**[${roomLabel} · ${roomDesc}]** ${it.body}\n\n`;
         }
@@ -225,9 +245,9 @@ export async function expandAndFormat(
     // 5. 窗台期盼
     const activeAnticipations = anticipations.filter(a => a.status === 'active' || a.status === 'anchor');
     if (activeAnticipations.length > 0) {
-        output += `> **窗台期盼**:\n`;
+        output += `> **Windowsill Hopes**:\n`;
         for (const ant of activeAnticipations) {
-            const label = ant.status === 'anchor' ? '🔒 锚点' : '✨ 期盼';
+            const label = ant.status === 'anchor' ? '🔒 Anchor' : '✨ Hope';
             output += `> - ${label}: ${ant.content}\n`;
         }
         output += `\n`;
@@ -242,8 +262,8 @@ export async function expandAndFormat(
 
 function buildStandaloneItem(r: ScoredMemory, now: number): RenderItem {
     const node = r.node;
-    const date = formatMemoryDateWithDistance(node.createdAt, now);
-    const body = `(${date}, 重要性: ${node.importance})\n${node.content}`;
+    const date = formatPromptMemoryDate(node.createdAt, now);
+    const body = `(${date}, importance: ${node.importance})\n${node.content}`;
     return {
         score: r.finalScore,
         room: node.room,
@@ -289,23 +309,23 @@ async function buildBoxItem(
     const liveToShow = liveNodes.slice(0, MAX_LIVE_NODES_PER_BOX);
     const omitted = liveNodes.length - liveToShow.length;
 
-    let body = `📦 **事件盒：${box.name}**`;
+    let body = `📦 **Event Box: ${box.name}**`;
     if (box.tags.length > 0) body += `  〈${box.tags.slice(0, 6).join(' · ')}〉`;
     body += '\n';
 
     if (summary) {
-        const sDate = formatMemoryDateWithDistance(summary.createdAt, now);
-        body += `_整合回忆_ (${sDate}, 重要性 ${summary.importance}, 已压缩 ${box.compressionCount} 次)\n`;
+        const sDate = formatPromptMemoryDate(summary.createdAt, now);
+        body += `_Integrated memory_ (${sDate}, importance ${summary.importance}, compressed ${box.compressionCount} times)\n`;
         body += `${summary.content}\n`;
     }
 
     if (liveToShow.length > 0) {
-        body += summary ? `_新增片段_：\n` : '';
+        body += summary ? `_New fragments_:\n` : '';
         for (const n of liveToShow) {
-            const d = formatMemoryDateWithDistance(n.createdAt, now);
+            const d = formatPromptMemoryDate(n.createdAt, now);
             body += `- [${d}] ${n.content}\n`;
         }
-        if (omitted > 0) body += `（另有 ${omitted} 条同盒活节点未展示）\n`;
+        if (omitted > 0) body += `(${omitted} additional live nodes from this box are not shown)\n`;
     }
 
     const sourceIds: string[] = [];

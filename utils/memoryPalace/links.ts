@@ -60,19 +60,19 @@ async function batchClassifyDeepLinks(
         .map((c, i) => `[O${i}] (${c.room}, ${c.mood}): ${c.content.slice(0, 80)}`)
         .join('\n');
 
-    const prompt = `你是一个记忆关联分析器。给你一组新记忆 [N*] 和一组旧记忆 [O*]，找出它们之间的深层关联。
+    const prompt = `You are a memory-link analyzer. Given new memories [N*] and old memories [O*], identify deep connections between them.
 
-三种关联类型：
-- causal: 因果关系（一件事导致了另一件事）
-- person: 提到了同一个人
-- metaphor: 隐喻/类比（不同事件但有相似的情感模式）
+Three link types are allowed:
+- causal: one event caused another.
+- person: both memories mention the same person.
+- metaphor: different events share a similar emotional pattern or analogy.
 
-只输出存在关联的配对。严格 JSON 数组格式：
+Return only pairs that are genuinely linked. Use a strict JSON array:
 [{"from": "N0", "to": "O2", "type": "person", "strength": 0.6}]
 
-strength 范围 0.3-0.8。没有关联返回 []。只输出 JSON。`;
+strength must be between 0.3 and 0.8. If there are no links, return []. Output JSON only.`;
 
-    const userMsg = `新记忆：\n${newList}\n\n旧记忆：\n${oldList}`;
+    const userMsg = `New memories:\n${newList}\n\nOld memories:\n${oldList}`;
 
     try {
         const data = await safeFetchJson(

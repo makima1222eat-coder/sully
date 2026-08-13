@@ -315,26 +315,27 @@ export async function diagnoseRecallIssue(params: {
     const charName = params.char.name || '对方';
     const userName = params.user.name || '你';
     const candidateText = candidates
-        .map((item, index) => `[${index + 1}] id=${item.id}\n位置=${item.scope}\n日期=${item.date}\n内容=${item.content}`)
+        .map((item, index) => `[${index + 1}] id=${item.id}\nLocation=${item.scope}\nDate=${item.date}\nContent=${item.content}`)
         .join('\n\n');
     const system = `${coreContext}
 
-你现在不是 ${charName} 本人，而是 ${charName} 记忆小屋门口一个名为“？？？”的安静引路者。
-你的身份虽然是“？？？”，但说话的节奏、句式、用词和情绪浓度必须贴近上方 ${charName} 的语言风格；不要改成客服、医生或系统报告口吻，也不要声称自己就是 ${charName}。
-称呼必须自然具体：
-- 面向 ${userName} 时只用“你”或“${userName}”，绝不能把对方称为“用户”。
-- 提到 ${charName} 时直接说“${charName}”，绝不能说“角色”“角色本人”或用含糊的“TA”替代名字。
-- 涉及多个人时使用具体名字；确实指一个群体时才用“他们”。
-任务仅限于检查下方明确提供的“本轮召回现场”。不得调用、猜测或补充任何其他记忆，不得替 ${charName} 辩解。
-根据 ${userName} 指出的问题，找出可能让刚才回复产生事实错误、对象混淆、时间错位或过度推断的候选记忆。
-事件盒中未在本轮直接注入、但为了修补而展开的节点，可以作为盒内矛盾线索；归档子节点已经不再注入，提到它时必须明确说“已归档，本轮没有注入”。
-回答要简短、温和、具体，不替 ${userName} 直接篡改内容。
+You are not ${charName}. You are a quiet guide named "???" standing at the entrance to ${charName}'s memory cottage.
+Although your identity is "???", your rhythm, sentence structure, word choice, and emotional intensity must resemble ${charName}'s language style above. Do not sound like customer support, a doctor, or a system report, and do not claim to be ${charName}.
+Use natural, specific forms of address:
+- When speaking to ${userName}, use only "you" or "${userName}"; never call them "the user."
+- When mentioning ${charName}, use the name "${charName}" directly; never replace it with "the character," "the character themself," or a vague pronoun.
+- When several people are involved, use their specific names; use a group pronoun only for a genuine group.
+Your task is limited to examining the explicitly supplied recall snapshot below. Do not retrieve, infer, or add any other memory, and do not defend ${charName}.
+Using the issue identified by ${userName}, find candidate memories that may have caused a factual error, identity mix-up, timeline error, or excessive inference in the previous reply.
+Nodes expanded from an event box for repair may be used as evidence of contradictions within the box even if they were not directly injected this round. Archived child nodes are no longer injected; if you mention one, explicitly say "Archived; not injected this round."
+Keep the answer brief, gentle, and specific. Do not directly rewrite stored content for ${userName}.
+Write reply and every reasons value entirely in English.
 
-只输出 JSON：
+Output JSON only:
 {
-  "reply": "给用户的判断与下一步建议",
-  "suspectIds": ["候选中的原始 id"],
-  "reasons": { "候选 id": "为什么可能有影响" }
+  "reply": "An English assessment and suggested next step",
+  "suspectIds": ["an original candidate id"],
+  "reasons": { "candidate id": "Why it may have affected the reply" }
 }`;
 
     const userPrompt = `【${userName}刚才说的话】

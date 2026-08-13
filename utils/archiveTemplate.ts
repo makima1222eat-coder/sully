@@ -11,7 +11,7 @@
  * 共用。
  */
 
-import { DEFAULT_ARCHIVE_PROMPTS } from '../components/chat/ChatConstants';
+import { DEFAULT_ARCHIVE_PROMPTS, MEMORY_SUMMARY_ENGLISH_INSTRUCTION } from '../components/chat/ChatConstants';
 
 const LS_KEY_CUSTOM_PROMPTS = 'chat_archive_prompts';
 const LS_KEY_SELECTED_ID = 'chat_active_archive_prompt_id';
@@ -48,11 +48,12 @@ export function getActiveArchiveTemplate(opts: {
         if (!found) return null;
 
         // 字段替换
-        return found.content
+        const formatted = found.content
             .replace(/\$\{dateStr\}/g, opts.dateStr)
             .replace(/\$\{char\.name\}/g, opts.charName)
             .replace(/\$\{userProfile\.name\}/g, opts.userName)
             .replace(/\$\{rawLog.*?\}/g, opts.rawLog);
+        return `${MEMORY_SUMMARY_ENGLISH_INSTRUCTION}\n\n${formatted}`;
     } catch {
         return null;
     }

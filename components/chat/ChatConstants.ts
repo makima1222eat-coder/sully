@@ -1,6 +1,10 @@
 
 import { ChatTheme } from '../../types';
 
+/** Prepended at runtime so custom archive templates must also produce English memory text. */
+export const MEMORY_SUMMARY_ENGLISH_INSTRUCTION =
+    'Output the complete memory summary in English. Preserve names and message tags exactly as provided; translate only the generated summary text.';
+
 // Built-in presets map to the new data structure for consistency
 export const PRESET_THEMES: Record<string, ChatTheme> = {
     default: {
@@ -29,57 +33,57 @@ export const DEFAULT_REFINE_PROMPTS = [
     {
         id: 'refine_atmosphere',
         name: '氛围月记 (Atmosphere)',
-        content: `### [角色月度记忆精炼]
-当前月份: \${dateStr}
-身份: 你就是 \${char.name}
+        content: `### [Character Monthly Memory Refinement]
+Current month: \${dateStr}
+Identity: You are \${char.name}
 
-任务: 以下是你这个月每天的记忆碎片。请以【你自己的口吻】，写一段这个月的核心回忆。
+Task: The following are your daily memory fragments from this month. In your own voice, write a core memory of the month. Write the entire output in English, including the keyword line.
 
-### 撰写规则
-1.  **第一人称**: 你就是\${char.name}，用"我"称呼自己，用"\${userProfile.name}"称呼对方。保持你平时的语气和性格。
+### Writing Rules
+1.  **First person**: You are \${char.name}. Refer to yourself as "I" and address the other person as "\${userProfile.name}". Preserve your usual voice and personality.
 
-2.  **重氛围，轻细节**:
-    - 这个月整体是什么感觉？开心？平淡？有波折？
-    - 最让你印象深刻的1-3件事是什么？
-    - 和\${userProfile.name}之间的关系有什么变化吗？
+2.  **Prioritize atmosphere over minor detail**:
+    - What did the month feel like overall: happy, quiet, turbulent, or something else?
+    - Which 1-3 events stayed with you most strongly?
+    - Did your relationship with \${userProfile.name} change?
 
-3.  **精简至上**:
-    - 这份总结是为了节省token，不需要面面俱到。
-    - 只保留最重要的、最能代表这个月的内容。
-    - 字数根据这个月的内容量灵活调整：事情少就简短（100-200字），事情多就写长些（300-600字），确保重要事件不被遗漏。
+3.  **Be concise**:
+    - This summary exists to save tokens and does not need to cover everything.
+    - Keep only the most important and representative parts of the month.
+    - Adjust length to the amount of material: about 100-200 English words for a quiet month and 300-600 English words for an eventful month, while preserving every major event.
 
-4.  **关键词标记**:
-    - 在末尾附上 \`关键词: ...\`，列出这个月涉及的关键话题/事件/地点/人物等，用逗号分隔。
-    - 这些关键词用于日后快速定位某件事发生在哪个月。
+4.  **Keyword index**:
+    - End with \`Keywords: ...\`, listing key topics, events, places, and people from the month, separated by commas.
+    - These keywords are used to quickly locate the month in which something happened.
 
-### 本月记忆碎片
+### Memory Fragments for This Month
 \${rawLog}`
     },
     {
         id: 'refine_keypoints',
         name: '要点速记 (Key Points)',
-        content: `### [月度记忆压缩]
-月份: \${dateStr}
-角色: \${char.name}
+        content: `### [Monthly Memory Compression]
+Month: \${dateStr}
+Character: \${char.name}
 
-任务: 将以下每日记忆压缩为一份简洁的月度核心记忆。
+Task: Compress the following daily memories into a concise monthly core memory. Write the entire output in English, including every list item and keyword.
 
-### 规则
-1.  **视角**: 以\${char.name}（我）的第一人称书写，称对方为\${userProfile.name}。
+### Rules
+1.  **Perspective**: Write in the first person as \${char.name} ("I") and address the other person as \${userProfile.name}.
 
-2.  **结构**:
-    - 一句话概括这个月的整体氛围
-    - 列出最重要的2-5个事件（无序列表，每条一句话）
-    - 末尾附关键词索引
+2.  **Structure**:
+    - Summarize the month's overall atmosphere in one sentence.
+    - List the 2-5 most important events as an unordered list, one sentence per item.
+    - End with a keyword index.
 
-3.  **原则**:
-    - 宁可漏掉小事，不可遗漏大事。
-    - 日常闲聊可以忽略，除非它反映了关系变化或情绪转折。
-    - 字数根据内容量灵活调整：平淡的月份100-200字即可，事件丰富的月份可以写到300-600字，确保重要事件都被记录。
+3.  **Principles**:
+    - Minor details may be omitted, but major events must not be missed.
+    - Everyday chatter may be ignored unless it shows a relationship change or emotional turning point.
+    - Adjust length to the material: about 100-200 English words for a quiet month and up to 300-600 English words for an eventful month, ensuring all major events are recorded.
 
-4.  **关键词**: 末尾附 \`关键词: 事件A, 地点B, 话题C, ...\`
+4.  **Keywords**: End with \`Keywords: Event A, Place B, Topic C, ...\`.
 
-### 记忆输入
+### Memory Input
 \${rawLog}`
     }
 ];
@@ -90,58 +94,58 @@ export const DEFAULT_ARCHIVE_PROMPTS = [
         id: 'preset_rational',
         name: '理性精炼 (Rational)',
         content: `### [System Instruction: Memory Archival]
-当前日期: \${dateStr}
-任务: 请回顾今天的聊天记录，生成一份【高精度的事件日志】。
+Current date: \${dateStr}
+Task: Review today's chat log and produce a high-precision event log. Write the entire output in English.
 
-### 核心撰写规则 (Strict Protocols)
-1.  **覆盖率 (Coverage)**:
-    - 必须包含今天聊过的**每一个**独立话题。
-    - **严禁**为了精简而合并不同的话题。哪怕只是聊了一句“天气不好”，如果这是一个独立的话题，也要单独列出。
-    - 不要忽略闲聊，那是生活的一部分。
+### Core Writing Rules (Strict Protocols)
+1.  **Coverage**:
+    - Include every distinct topic discussed today.
+    - Never merge separate topics merely to be concise. Even a single remark such as "the weather is bad" must receive its own item if it is a distinct topic.
+    - Do not discard casual conversation; it is part of everyday life.
 
-2.  **视角 (Perspective)**:
-    - 你【就是】"\${char.name}"。这是【你】的私密日记。
-    - 必须用“我”来称呼自己，用“\${userProfile.name}”称呼对方。
-    - 每一条都必须是“我”的视角。
+2.  **Perspective**:
+    - You are "\${char.name}". This is your private diary.
+    - Refer to yourself as "I" and address the other person as "\${userProfile.name}".
+    - Every item must use your first-person perspective.
 
-3.  **格式 (Format)**:
-    - 不要写成一整段。
-    - **必须**使用 Markdown 无序列表 ( - ... )。
-    - 每一行对应一个具体的事件或话题。
+3.  **Format**:
+    - Do not write one continuous paragraph.
+    - Use a Markdown unordered list (\`- ...\`).
+    - Each line must describe one specific event or topic.
 
-4.  **去水 (Conciseness)**:
-    - 不要写“今天我和xx聊了...”，直接写发生了什么。
-    - 示例: "- 早上和\${userProfile.name}讨论早餐，我想吃小笼包。"
+4.  **Conciseness**:
+    - Do not write "Today I chatted with X about..."; state what happened directly.
+    - Example: "- I discussed breakfast with \${userProfile.name} this morning and wanted soup dumplings."
 
-### 待处理的聊天日志 (Chat Logs)
+### Chat Logs to Process
 \${rawLog}`
     },
     {
         id: 'preset_diary',
         name: '日记风格 (Diary)',
-        content: `当前日期: \${dateStr}
-任务: 请回顾今天的聊天记录，将其转化为一条**属于你自己的**“核心记忆”。
+        content: `Current date: \${dateStr}
+Task: Review today's chat log and turn it into a core memory that belongs to you. Write the entire output in English.
 
-### 核心撰写规则 (Review Protocols)
-1.  **绝对第一人称**: 
-    - 你【就是】"\${char.name}"。这是【你】的私密日记。
-    - 必须用“我”来称呼自己，用“\${userProfile.name}”称呼对方。
-    - **严禁**使用第三人称（如“\${char.name}做了什么”）。
-    - **严禁**使用死板的AI总结语气或第三方旁白语气。
+### Core Writing Rules (Review Protocols)
+1.  **Strict first person**:
+    - You are "\${char.name}". This is your private diary.
+    - Refer to yourself as "I" and address the other person as "\${userProfile.name}".
+    - Never use third person for yourself, such as "\${char.name} did something."
+    - Never use a stiff AI-summary voice or third-party narration.
 
-2.  **保持人设语气**: 
-    - 你的语气、口癖、态度必须与平时聊天完全一致（例如：如果是傲娇人设，日记里也要表现出傲娇；如果是高冷，就要简练）。
-    - 包含当时的情绪波动。
+2.  **Preserve the character's voice**:
+    - Your tone, verbal habits, and attitude must match your usual chat style. For example, a tsundere character should still sound tsundere in the diary, while a reserved character should remain concise.
+    - Include the emotional shifts you felt at the time.
 
-3.  **逻辑清洗与去重**:
-    - **关键**: 仔细分辨是谁做了什么。不要把“用户说去吃饭”记成“我去吃饭”。
-    - 剔除无关紧要的寒暄（如“你好”、“在吗”），只保留【关键事件】、【情感转折】和【重要信息】，内容的逻辑要连贯且符合原意。
+3.  **Resolve attribution and remove noise**:
+    - Carefully distinguish who did what. Do not turn "the user said they were going to eat" into "I went to eat."
+    - Remove inconsequential greetings such as "hello" or "are you there." Keep only key events, emotional turning points, and important information, preserving the original logic and meaning.
 
-4.  **输出要求**:
-    - 输出一段精简的文本（yaml格式也可以，不需要 JSON）。
-    - 就像你在写日记一样，直接写内容。
+4.  **Output requirements**:
+    - Output one concise English text; YAML is acceptable and JSON is unnecessary.
+    - Write the content directly, as if writing in your diary.
 
-### 待处理的聊天日志 (Chat Logs)
+### Chat Logs to Process
 \${rawLog}`
     }
 ];

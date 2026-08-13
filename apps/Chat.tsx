@@ -30,7 +30,7 @@ import McdMiniApp from '../components/mcd/McdMiniApp';
 import LuckinMiniApp from '../components/luckin/LuckinMiniApp';
 import LuckinLocationModal from '../components/luckin/LuckinLocationModal';
 import LuckinHelpModal from '../components/luckin/LuckinHelpModal';
-import { PRESET_THEMES, DEFAULT_ARCHIVE_PROMPTS } from '../components/chat/ChatConstants';
+import { PRESET_THEMES, DEFAULT_ARCHIVE_PROMPTS, MEMORY_SUMMARY_ENGLISH_INSTRUCTION } from '../components/chat/ChatConstants';
 import { resolveChatTheme } from '../utils/groupChat/theme';
 import ChatHeader from '../components/chat/ChatHeaderShell';
 import CharacterEntryTransition from '../components/chat/CharacterEntryTransition';
@@ -2380,7 +2380,7 @@ const Chat: React.FC = () => {
                     .map(m => formatMessageWithTime(m, char.name, userProfile.name, formatTime))
                     .join('\n');
                 
-                let prompt = template;
+                let prompt = `${MEMORY_SUMMARY_ENGLISH_INSTRUCTION}\n\n${template}`;
                 prompt = prompt.replace(/\$\{dateStr\}/g, dateStr);
                 prompt = prompt.replace(/\$\{char\.name\}/g, char.name);
                 prompt = prompt.replace(/\$\{userProfile\.name\}/g, userProfile.name);

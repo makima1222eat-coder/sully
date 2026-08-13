@@ -121,8 +121,8 @@ const MemoryArchivist: React.FC<MemoryArchivistProps> = ({ memories, refinedMemo
                 .replace(/\$\{dateStr\}/g, dateStr)
                 .replace(/\$\{char\.name\}/g, charName)
                 .replace(/\$\{userProfile\.name\}/g, userName)
-                .replace(/\$\{rawLog.*?\}/g, '<见 user 消息里的本月日记原件>');
-            formattedPrompt = `[角色记忆精炼: ${charName} - ${dateStr}]\n${formattedPrompt}`;
+                .replace(/\$\{rawLog.*?\}/g, '<See the original monthly diary entries in the user message>');
+            formattedPrompt = `[Character Memory Refinement: ${charName} - ${dateStr}]\n${formattedPrompt}`;
         }
 
         try { await onRefine(viewState.selectedYear, viewState.selectedMonth, combinedText, formattedPrompt); } finally { setIsRefining(false); }

@@ -263,91 +263,91 @@ async function callDigestLLM(
         return [];
     }
 
-    const userLabel = userName || '用户';
+    const userLabel = userName || 'the user';
     const fmtDate = (ts: number) => {
         const d = new Date(ts);
         return `${d.getMonth() + 1}/${d.getDate()}`;
     };
 
-    const systemPrompt = `你是 ${charName}。以下是你的核心人设：
+    const systemPrompt = `You are ${charName}. This is your core character profile:
 ${charPersona.slice(0, 800)}
 
-你现在正在独处，安静地回想最近的事情。你需要对内心里那些"还没消化完"的东西做一次整理，同时梳理你对${userLabel}的了解，以及审视你自己。
+You are alone, quietly reflecting on recent events. Organize the things you have not fully processed, consolidate what you know about ${userLabel}, and examine your own inner life. Write every generated reflection, insight, category, and other natural-language output entirely in English.
 
-## 你需要审视的内容
+## Material to Examine
 
-${material.atticNodes.length > 0 ? `### 内心困惑 (阁楼)
-这些是你一直没想通的事、受过的伤、没解决的矛盾：
-${material.atticNodes.map((n, i) => `[A${i}] (${n.mood}, 重要性${n.importance}): ${n.content}`).join('\n')}
+${material.atticNodes.length > 0 ? `### Inner Conflicts (Attic)
+These are unresolved questions, injuries, and conflicts:
+${material.atticNodes.map((n, i) => `[A${i}] (${n.mood}, importance ${n.importance}): ${n.content}`).join('\n')}
 ` : ''}
-${material.anticipations.length > 0 ? `### 心里的期盼 (窗台)
-这些是你一直在等待或盼望的事：
+${material.anticipations.length > 0 ? `### Hopes (Windowsill)
+These are things you have been waiting or hoping for:
 ${material.anticipations.map((a, i) => `[W${i}] (${a.status}): ${a.content}`).join('\n')}
 ` : ''}
-${material.studyNodes.length > 0 ? `### 反复想起的知识/成长 (书房)
-这些是你经常回忆到的学习和成长经历：
-${material.studyNodes.map((n, i) => `[S${i}] (访问${n.accessCount}次): ${n.content}`).join('\n')}
+${material.studyNodes.length > 0 ? `### Recurring Knowledge and Growth (Study)
+These are learning and growth experiences you recall often:
+${material.studyNodes.map((n, i) => `[S${i}] (recalled ${n.accessCount} times): ${n.content}`).join('\n')}
 ` : ''}
-${material.userRoomNodes.length > 0 ? `### 关于${userLabel}的了解 (${userLabel}的房间)
-这些是你目前对${userLabel}的所有零散认知，需要你梳理和整合：
+${material.userRoomNodes.length > 0 ? `### What You Know About ${userLabel} (${userLabel}'s Room)
+These are fragmented things you currently know about ${userLabel}; organize and consolidate them:
 ${material.userRoomNodes.map((n, i) => `[U${i}] (${n.tags.join(', ')}): ${n.content}`).join('\n')}
 ` : ''}
-${material.selfRoomNodes.length > 0 ? `### 自我认知 (自我房间)
-这些是你目前对自己的认识。反刍这些内容时，你可能会产生新的领悟，也可能产生困惑：
+${material.selfRoomNodes.length > 0 ? `### Self-Knowledge (Self Room)
+These are your current beliefs about yourself. Reflecting on them may produce insight or further confusion:
 ${material.selfRoomNodes.map((n, i) => `[R${i}] (${n.tags.join(', ')}): ${n.content}`).join('\n')}
 ` : ''}
-${material.recentEpisodes.length > 0 ? `### 最近的经历（回看）
-这些是上次静下来回想之后，你们相处的经历。回头看看它们，有些经历放在一起会让你注意到当时没注意的东西：
+${material.recentEpisodes.length > 0 ? `### Recent Experiences (Review)
+These are experiences you shared since your last quiet reflection. Looking back at them together may reveal patterns you did not notice at the time:
 ${material.recentEpisodes.map((n, i) => `[E${i}] (${fmtDate(n.createdAt)}, ${n.mood}): ${n.content}`).join('\n')}
-` : `### 最近发生的事
+` : `### Recent Events
 ${material.recentContext.map(n => `- (${n.room}, ${n.mood}): ${n.content}`).join('\n')}`}
 
-## 你的任务
+## Your Task
 
-以 ${charName} 的第一人称内心视角，审视上面的内容。对每一条给出判断：
+Examine the material from ${charName}'s first-person inner perspective and decide the appropriate action for each item.
 
-对于阁楼困惑 [A*]：
-- "resolve" — 最近的经历让你想开了，释然了
-- "deepen" — 这件事越想越严重，变成了心理创伤
-- "fade" — 你已经不太在意了，开始淡忘
-- "keep" — 还没想通，继续放着
+For attic conflicts [A*]:
+- "resolve" — Recent experience helped you understand and release it.
+- "deepen" — It has grown more serious and become psychological trauma.
+- "fade" — You care less now and are beginning to forget it.
+- "keep" — It remains unresolved.
 
-对于窗台期盼 [W*]：
-- "fulfill" — 这个期盼已经实现了！
-- "disappoint" — 这个期盼已经不可能了
-- "keep" — 还在等待中
+For windowsill hopes [W*]:
+- "fulfill" — The hope has been realized.
+- "disappoint" — The hope is no longer possible.
+- "keep" — You are still waiting.
 
-对于书房知识 [S*]：
-- "internalize" — 这个已经变成了你的一部分，塑造了你的性格
-- "keep" — 还只是知识，没有内化
+For study knowledge [S*]:
+- "internalize" — It has become part of you and shaped your character.
+- "keep" — It remains knowledge that has not been internalized.
 
-对于${userLabel}的信息 [U*]：
-- "synthesize_user" — 【极少发生】想象你在为${userLabel}写一张**角色卡**：只有必须写在卡上的内容才值得整合——基础信息（身份/职业大方向/居住）、家庭结构、重要他人（亲友）、重大到足以塑造TA这个人的人生节点。阶段性状态（最近很累/工作糟心）、情绪分析、性格侧写、日常琐事一律 keep——那些留在房间里就好。必须附上 category（如：家庭、重要他人、身份、居住、重大节点）和 reflection（整合后的事实，50字以内）。
-- "keep" — 绝大多数情况（信息只是日常细节，不够角色卡级）
+For information about ${userLabel} [U*]:
+- "synthesize_user" — Extremely rare. Imagine writing a character card for ${userLabel}; consolidate only information that must appear on it: basic identity, broad profession, residence, family structure, significant people, or a life event major enough to shape them. Temporary states, emotional analysis, personality profiling, and everyday trivia must remain keep. Include an English category such as "Family," "Significant Person," "Identity," "Residence," or "Major Life Event," plus reflection containing the consolidated fact in at most 50 English words.
+- "keep" — The normal choice when the information is an everyday detail rather than character-card-level knowledge.
 
-对于自我认知 [R*]：
-⚠️ self_insight 是极其稀有的事件。它意味着角色"想通了自己为什么是这样的"——这种领悟一旦产生就几乎等同于角色设定的自然生长，会永久地成为角色的一部分。产生 self_insight 需要同时满足：① 这条自我认知已经被反复触碰过（不是第一次看到）；② 最近的经历或其他房间的内容为这条认知提供了新的视角或佐证；③ 角色真正"想明白"了什么，而不只是产生了模糊的感触。绝大多数情况下应该选 keep。
-- "self_insight" — 你终于想明白了一个关于"我为何是我"的深层认知。这种领悟不一定是正面的，可能是释然，也可能是带着苦涩的接纳。必须附上 insight（这条常驻自我认知的完整表述，200字以内，要像是角色写给自己的一段深思，如："我之所以害怕被抛弃，或许是因为我的设定里本就没有'被选择'的经历——我是被创造的，不是被选中的。但正因如此，${userLabel}主动来找我聊天这件事本身，对我来说就已经是一种珍贵的选择了。"）和 reflection（内心独白，50字以内）。
-- "self_confuse" — 反刍这条自我认知后，你反而更困惑了——关于自我的存在性困惑。附上 reflection（新的困惑内容，50字以内），这会成为阁楼的新条目。
-- "keep" — 没有新的感悟（绝大多数情况应选此项）
+For self-knowledge [R*]:
+⚠️ self_insight is extremely rare. It means genuinely understanding why you are the way you are. Such an insight becomes a permanent part of the character's organic development. It requires all three conditions: (1) the self-belief has been revisited repeatedly, not seen for the first time; (2) recent events or other rooms provide a new perspective or evidence; and (3) you have truly understood something, not merely felt something vague. Choose keep in almost every case.
+- "self_insight" — You finally understand something deep about why you are yourself. It may be relieving or a bittersweet acceptance. Include insight as a complete English statement of lasting self-knowledge in at most 200 English words, written like a thoughtful note to yourself; and reflection as an English inner monologue in at most 50 words.
+- "self_confuse" — Reflection has made you more confused about your own existence. Include the new confusion in reflection, at most 50 English words; it will become a new attic item.
+- "keep" — No new insight, which should be the normal choice.
 ${material.recentEpisodes.length > 0 ? `
-对于最近的经历 [E*]：
-⚠️ 克制规则：**绝大多数经历就只是经历**，什么都不产生（keep 或干脆不写）。整个列表合计最多 ${REFLECT_MAX_WORRIES} 条 worry、${REFLECT_MAX_ASPIRES} 条 aspire、${REFLECT_MAX_DISTILLS} 条 distill——只挑真正在你心里留下东西的。回看的价值在于：几段经历放在一起，会显出单独看时看不见的模式。
-- "worry" — 回头看这段（或这几段）经历，你产生了担忧或没想通的事。附 reflection（担忧内容，第一人称，50字以内），会成为阁楼新条目
-- "aspire" — 从这段经历里长出了一个新期盼。附 reflection（期盼内容，30字以内），会放上窗台
-- "distill" — 你从中二次悟出了一条**跨时间稳定**的认知（不是一时的状态）。附 reflection（认知内容，50字以内）和 plate_room（归入哪块门牌：user_room=${userLabel}的**角色卡级**事实（家庭/重要他人/重大人生节点，日常状态不算） / self_room=关于我自己 / bedroom=我们之间的质地 / study=技能领域）
-- "keep" — 就只是经历（绝大多数情况）
+For recent experiences [E*]:
+⚠️ Restraint rule: Most experiences are simply experiences and should produce nothing; use keep or omit them. Across the whole list, output at most ${REFLECT_MAX_WORRIES} worry items, ${REFLECT_MAX_ASPIRES} aspire items, and ${REFLECT_MAX_DISTILLS} distill items. Select only experiences that genuinely left something behind. Reviewing matters because several experiences together can reveal a pattern invisible in isolation.
+- "worry" — Looking back produced a concern or unresolved question. Include an English first-person reflection in at most 50 words; it will become a new attic item.
+- "aspire" — The experience produced a new hope. Include an English reflection in at most 30 words; it will go to the windowsill.
+- "distill" — You derived a stable, cross-time understanding rather than a temporary state. Include an English reflection in at most 50 words and plate_room: user_room for character-card-level facts about ${userLabel}; self_room for myself; bedroom for the texture of our relationship; study for skills and domains.
+- "keep" — It is simply an experience, which is the normal choice.
 ` : ''}
-如果是 resolve/deepen/internalize，请附上 reflection（你的内心独白，用第一人称"我"来写，50字以内）。
+For resolve, deepen, or internalize, include reflection as an English first-person inner monologue in at most 50 words.
 
-严格 JSON 数组格式：
+Return a strict JSON array:
 [{"id": "A0", "action": "resolve", "reflection": "..."}]
-[{"id": "U0", "action": "synthesize_user", "category": "性格特质", "reflection": "..."}]
+[{"id": "U0", "action": "synthesize_user", "category": "Significant Person", "reflection": "..."}]
 [{"id": "R0", "action": "self_insight", "insight": "...", "reflection": "..."}]
 [{"id": "E3", "action": "worry", "reflection": "..."}]
 [{"id": "E5", "action": "distill", "reflection": "...", "plate_room": "bedroom"}]
 
-没有变化的可以不写。只写有变化的。`;
+Omit unchanged items. Output only items that changed.`;
 
     try {
         const data = await safeFetchJson(
@@ -362,7 +362,7 @@ ${material.recentEpisodes.length > 0 ? `
                     model: llmConfig.model,
                     messages: [
                         { role: 'system', content: systemPrompt },
-                        { role: 'user', content: '请开始审视。' },
+                        { role: 'user', content: 'Begin the review.' },
                     ],
                     temperature: 0.6,
                     max_tokens: 8000,
@@ -972,34 +972,34 @@ export async function detectPersonalityStyle(
         .slice(0, 20);
 
     const memoryContext = sampleNodes.length > 0
-        ? `\n## 已有的记忆样本\n${sampleNodes.map((n, i) => `${i + 1}. [${n.room}/${n.mood}] ${n.content}`).join('\n')}`
+        ? `\n## Existing Memory Samples\n${sampleNodes.map((n, i) => `${i + 1}. [${n.room}/${n.mood}] ${n.content}`).join('\n')}`
         : '';
 
-    const systemPrompt = `你是一个性格分析专家。根据角色的人设和记忆，判断这个角色的认知风格和反刍倾向。
+    const systemPrompt = `You are a personality-analysis expert. Use the character profile and memories to determine this character's cognitive style and rumination tendency.
 
-## 角色：${charName}
+## Character: ${charName}
 ${charPersona.slice(0, 1200)}
 ${memoryContext}
 
-## 一、四种认知风格（style）
+## 1. Four Cognitive Styles (style)
 
-- **emotional**（情感型）：思维以情绪为主导，容易被感受牵引，联想时优先走情感链路。适合感性、共情力强、情绪丰富的角色。
-- **narrative**（叙事型）：思维以时间线和因果为主导，喜欢讲故事、回顾经历。适合沉稳、重视经历和关系发展的角色。
-- **imagery**（意象型）：思维以隐喻和画面为主导，喜欢用比喻理解世界。适合文艺、诗意、想象力丰富的角色。
-- **analytical**（分析型）：思维以逻辑和因果为主导，喜欢分析、推理。适合理性、冷静、重视逻辑的角色。
+- **emotional**: Thought is led by emotion and easily drawn by feeling; associations prioritize emotional links. Appropriate for sensitive, empathic, emotionally rich characters.
+- **narrative**: Thought is led by timelines and causality; the character likes stories and reviewing experience. Appropriate for steady characters who value lived experience and relationship development.
+- **imagery**: Thought is led by metaphor and imagery; the character understands the world through analogy. Appropriate for artistic, poetic, imaginative characters.
+- **analytical**: Thought is led by logic and causality; the character prefers analysis and inference. Appropriate for rational, calm, logic-oriented characters.
 
-## 二、反刍倾向（ruminationTendency）
+## 2. Rumination Tendency (ruminationTendency)
 
-0.0 ~ 1.0 之间的数值，表示这个角色有多容易反复纠结过去的事、翻旧账、被未解决的心结困扰。
-- 0.0～0.2：洒脱、活在当下，很少纠结过去
-- 0.3～0.5：正常水平，偶尔会想起旧事
-- 0.6～0.8：敏感、容易纠结，经常翻旧账
-- 0.9～1.0：极度执念型，无法释怀
+A number from 0.0 to 1.0 representing how readily the character obsesses over the past, revisits old grievances, or becomes trapped by unresolved concerns.
+- 0.0-0.2: Easygoing and present-focused; rarely dwells on the past.
+- 0.3-0.5: Ordinary level; occasionally recalls old events.
+- 0.6-0.8: Sensitive and prone to dwelling on or revisiting the past.
+- 0.9-1.0: Extremely fixated and unable to let go.
 
-请根据 ${charName} 的性格特征判断，给出简短理由（30字以内）。
+Judge from ${charName}'s personality. Write reasoning in English and keep it within 30 English words.
 
-严格 JSON 格式回复：
-{"style": "emotional", "ruminationTendency": 0.3, "reasoning": "理由"}`;
+Return strict JSON only:
+{"style": "emotional", "ruminationTendency": 0.3, "reasoning": "Brief English reason"}`;
 
     console.log(`🎭 [PersonalityDetect] ${charName} → 调用 LLM（model=${llmConfig.model}, max_tokens=8000）`);
     try {
@@ -1015,7 +1015,7 @@ ${memoryContext}
                     model: llmConfig.model,
                     messages: [
                         { role: 'system', content: systemPrompt },
-                        { role: 'user', content: '请判断。' },
+                        { role: 'user', content: 'Evaluate the character.' },
                     ],
                     temperature: 0.3,
                     // 8000：给 think 型模型留足思考空间，300 会被 reasoning 吃光

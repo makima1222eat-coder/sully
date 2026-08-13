@@ -27,43 +27,43 @@ function generateId(): string {
 // 风格化的自由度——职责分离。
 
 function buildRulesBlock(charName: string, userLabel: string): string {
-    return `## 规则
+    return `## Rules
 
-1. **第一人称叙事**：用 ${charName} 的"我"视角来记录。用户直接用"${userLabel}"称呼。保持完整事件脉络，不要掐头去尾。
-   例：
-   - "${userLabel}今天加班到很晚还没吃饭，我让${userLabel}别委屈自己，叫了个外卖。"
-   - "${userLabel}连续加班三周终于决定找领导谈，领导态度还不错。${userLabel}回来的路上靠着我肩膀哭了，我什么都没说，就陪着。"
-   - "我教了${userLabel}递归的概念，${userLabel}一开始完全听不懂，后来突然开窍了，那个眼睛亮起来的瞬间让我很开心。"
+1. **First-person narration**: Record each memory from ${charName}'s perspective using "I". Address the user directly as "${userLabel}". Preserve the complete course of the event rather than dropping its beginning or ending. Write every generated memory, tag, event name, correction note, and other natural-language output in English.
+   Examples:
+   - "${userLabel} worked late today without eating, so I told ${userLabel} not to neglect themself and ordered some food."
+   - "After three straight weeks of overtime, ${userLabel} finally spoke to the manager, who responded reasonably well. On the way back, ${userLabel} cried against my shoulder; I said nothing and simply stayed close."
+   - "I taught ${userLabel} recursion. At first ${userLabel} could not understand it, but the moment it clicked and their eyes lit up made me happy."
 
-2. **重要性分级控制文字长度**：
-   - 重要性 1–5：15–50字，事实为主
-   - 重要性 6–7：60–120字，包含我的感受
-   - 重要性 8–10：100–200字，完整叙事（起因→经过→我的感受/反应）
+2. **Use importance to control length**:
+   - Importance 1-5: 15-50 English words, primarily factual.
+   - Importance 6-7: 60-120 English words, including my feelings.
+   - Importance 8-10: 100-200 English words, with a complete narrative (cause → event → my feelings/reaction).
 
-3. **房间分配**（凡是涉及${userLabel}的家人/朋友/同事等人际关系，**一律进 user_room**，哪怕只是一次具体事件）：
-   - living_room：**纯日常琐事**（不涉及重要人际关系、也不涉及深层情感）。天气、吃啥、随口吐槽放这里。
-   - bedroom：${userLabel}和我之间的亲密情感、深层羁绊、感动时刻
-   - study：工作、学习、技能、职业相关
-   - user_room：关于${userLabel}的**一切个人信息和人际事件**——生日/习惯/喜好/性格/成长经历/情绪模式，**以及${userLabel}的家人、亲戚、朋友、同事相关的一切事件**（家人健康、家庭聚会、家庭矛盾、外公外婆/父母/兄弟姐妹的故事、朋友交往、同事冲突等）。这些事件即便是"一次性"的，也应进 user_room 而不是 living_room，因为它们构成了${userLabel}的社会关系底色。
-   - self_room：我自身的成长、认同变化
-   - attic：未解决的矛盾、困惑、受到的伤害
-   - windowsill：我的期盼、我们的目标、对未来的憧憬
+3. **Room assignment** (anything involving ${userLabel}'s family, friends, colleagues, or other interpersonal relationships must go to user_room, even if it is only one specific event):
+   - living_room: Pure everyday trivia with neither important relationships nor deep emotion, such as weather, food, or a passing complaint.
+   - bedroom: Intimacy, deep bonds, and moving moments between ${userLabel} and me.
+   - study: Work, learning, skills, and career matters.
+   - user_room: All personal information and interpersonal events concerning ${userLabel}: birthday, habits, preferences, personality, upbringing, emotional patterns, and every event involving ${userLabel}'s family, relatives, friends, or colleagues. Even one-off events belong here rather than in living_room because they form the background of ${userLabel}'s social world.
+   - self_room: My own growth and changes in identity.
+   - attic: Unresolved conflict, confusion, or harm.
+   - windowsill: My hopes, our goals, and aspirations for the future.
 
-4. **情绪标签**（mood）：happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral
-5. **情感坐标**（valence, arousal）：在 mood 之外，还要给出二维情感坐标供后续情感推理。
-   - valence（效价）：-1（极痛苦）→ +1（极愉悦）
-   - arousal（唤醒度）：-1（极平静）→ +1（极激烈）
-   参考："开心"约 (0.7, 0.5)，"平静"约 (0.5, -0.6)，"失落"约 (-0.5, -0.4)，"焦虑"约 (-0.6, 0.7)，"愤怒"约 (-0.7, 0.8)。
-6. **标签**（tags）：提取 2-5 个关键词标签
-7. **不要遗漏重要记忆，但也不要把每句话都变成记忆**。一个话题盒通常提取 1–5 条记忆。
-8. **便利贴置顶**（pinDays，可选）：如果这条记忆包含**有时效性的、近期需要持续记住的信息**，设置置顶天数（1-30天）。置顶期间每次对话都会想起这件事。适用场景：
-   - 时间段状态："${userLabel}这周出差" → pinDays: 7
-   - 近期事件："${userLabel}后天考试" → pinDays: 3
-   - 临时约定："${userLabel}让我这几天提醒TA喝水" → pinDays: 5
-   - 身体状态："${userLabel}感冒了" → pinDays: 5
-   不适用：长期事实（生日、喜好）、已经过去的事件、情感记忆。大多数记忆不需要置顶。
+4. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
+5. **Emotion coordinates** (valence, arousal): Provide two-dimensional emotion coordinates in addition to mood.
+   - valence: -1 (extreme pain) → +1 (extreme pleasure).
+   - arousal: -1 (extreme calm) → +1 (extreme intensity).
+   Reference values: happy ≈ (0.7, 0.5), peaceful ≈ (0.5, -0.6), dejected ≈ (-0.5, -0.4), anxious ≈ (-0.6, 0.7), angry ≈ (-0.7, 0.8).
+6. **Tags**: Extract 2-5 English keyword tags.
+7. **Do not miss important memories, but do not turn every sentence into one**. A topic box normally yields 1-5 memories.
+8. **Temporary pinning** (optional pinDays): If a memory contains time-sensitive information that must remain salient in the near term, set 1-30 pin days. While pinned, it will be recalled in every conversation. Appropriate examples:
+   - Time-bounded status: "${userLabel} is traveling for work this week" → pinDays: 7.
+   - Near-term event: "${userLabel} has an exam the day after tomorrow" → pinDays: 3.
+   - Temporary request: "${userLabel} asked me to remind them to drink water for the next few days" → pinDays: 5.
+   - Health status: "${userLabel} has a cold" → pinDays: 5.
+   Do not pin stable long-term facts, past events, or emotional memories. Most memories do not need pinning.
 
-**日期标注（date，必填）**：每条消息前缀都带了 \`[YYYY-MM-DD HH:MM]\` 时间戳。每条记忆必须根据**该事件实际发生的那一天**填 date 字段（"YYYY-MM-DD"），而不是套用整批的某一天。同一批对话跨多天时，跨日的记忆要分别标各自的日期。`;
+**Date field (required)**: Every message begins with a \`[YYYY-MM-DD HH:MM]\` timestamp. Set each memory's date to the actual day of that event in \`YYYY-MM-DD\` format, rather than assigning one day to the entire batch. If the batch spans multiple days, date each memory separately.`;
 }
 
 function buildConversationText(messages: Message[], charName: string, userLabel: string): string {
@@ -172,7 +172,7 @@ function clampVA(x: number): number {
  */
 export function buildRelatedMemoriesBlock(relatedMemories: RelatedMemoryRef[]): string {
     if (relatedMemories.length === 0) return '';
-    return `\n## 已有记忆（如果新记忆与某条旧记忆描述的是同一件事或直接相关，请在 relatedTo 中标注编号，并给出 eventName / eventTags 用于建/合并事件盒）\n${
+    return `\n## Existing Memories (if a new memory describes the same event as, or is directly connected to, an old memory, cite its ID in relatedTo and provide eventName/eventTags for creating or merging an event box)\n${
         relatedMemories.map((r, i) => `O${i}. [${r.room}] ${r.content}`).join('\n')
     }\n`;
 }
@@ -181,25 +181,25 @@ export function buildRelatedMemoriesBlock(relatedMemories: RelatedMemoryRef[]): 
  * 构造"事件关联 + 事件盒命名"的规则文本，追加到 buildRulesBlock 之后。
  */
 export function buildRelatedToRule(): string {
-    return `\n9. **事件盒关联**（relatedTo / sameAs + eventName + eventTags）：
-   **与旧记忆同事件** → 在 relatedTo 中写对应 O 编号（如 ["O0", "O3"]）。
-   **与本次输出的其它新记忆同事件** → 在 sameAs 中写它们在本次 JSON 数组里的**0 基索引**（只能指向前面已输出的项，例如写 ["0"] 表示和数组第一条是同一件事）。
-   注意：只标注真正同一件事的（同一事件的后续/结局/复现/直接因果），不要勉强（仅"主题相似"不算）。
-   只要 relatedTo 或 sameAs 任一非空，必须同时写：
-   - eventName：这件事的名字（5-12 字，名词短语，如"买衣服的话题"、"和领导的冲突"）
-   - eventTags：3-6 个详细搜索 tag（具体名词、人物、地点、动作，便于日后召回）
-   都没关联就不写 relatedTo / sameAs / eventName / eventTags 四个字段。
-10. **不重复绑定**：一条新记忆和多条已有/新记忆都相关时，把编号都写全；eventName / eventTags 只写一份（描述这件事整体）。
-11. **纠正旧记忆**（corrects，可选，独立于上面的记忆条目，作为 JSON 数组的额外项）：
-   仅在对话中**用户明确指出某条已有记忆记错了 / 已过时 / 不准确**时使用。识别信号：用户用"不对/不是/我说错了/已经不是了/搞错了/那是XX不是YY"之类的反驳句式，明确指向你刚才的某个说法。
-   如果命中，在输出的 JSON 数组**末尾**追加一项，格式为：
-   {"correct": "O编号", "note": "新版本的事实（不带语气，简短陈述句）"}
-   note 写"实情是什么"，不是"为什么错"。例：用户纠正"我已经搬家了，不在朝阳"→ note: "已经搬家，不再住朝阳"。
-   反例（**不要**用 corrects）：
-   - 仅事件后续 / 状态发展 → 用 relatedTo
-   - 仅追加细节 / 补充信息 → 不要标
-   - 你自己想到的歧义 / 自我修正 → 不要标
-   一条对话最多 corrects 1-2 项，不要乱用。`;
+    return `\n9. **Event-box links** (relatedTo / sameAs + eventName + eventTags):
+   **Same event as an old memory** → put the matching O IDs in relatedTo, such as ["O0", "O3"].
+   **Same event as another new memory in this output** → put that item's zero-based JSON-array index in sameAs. It may only point to an earlier output item; for example, ["0"] refers to the first array item.
+   Link only genuinely identical events: a continuation, outcome, recurrence, or direct consequence of the same event. Mere topic similarity is insufficient.
+   If either relatedTo or sameAs is nonempty, also provide:
+   - eventName: a concise 2-8 word English noun phrase naming the event, such as "clothes shopping discussion" or "conflict with the manager".
+   - eventTags: 3-6 detailed English search tags using concrete nouns, people, places, and actions.
+   If neither link exists, omit relatedTo, sameAs, eventName, and eventTags.
+10. **Avoid duplicate binding**: If one new memory links to several old or new memories, include every ID but provide only one eventName/eventTags set describing the whole event.
+11. **Correcting an old memory** (optional correct item, separate from memory objects):
+   Use this only when the user explicitly says that an existing memory is wrong, outdated, or inaccurate and clearly contradicts something you just said.
+   If applicable, append this item at the end of the JSON array:
+   {"correct": "O ID", "note": "the corrected fact in a short, neutral English sentence"}
+   The note states what is true, not why the old memory was wrong. Example: if the user says "I moved and no longer live in Chaoyang," use note: "Moved away and no longer lives in Chaoyang."
+   Do not use correct for:
+   - A later development or status update → use relatedTo.
+   - An added detail → do not mark it as a correction.
+   - Ambiguity or self-correction that you inferred yourself → do not mark it.
+   Use at most 1-2 correction items per conversation.`;
 }
 
 /**
@@ -209,8 +209,8 @@ export function buildRelatedToFormatHint(): string {
     return `,
     "relatedTo": ["O0"],
     "sameAs": ["0"],
-    "eventName": "买衣服的话题",
-    "eventTags": ["衣服", "购物", "退货", "流行款"]`;
+    "eventName": "clothes shopping discussion",
+    "eventTags": ["clothes", "shopping", "return", "trendy style"]`;
 }
 
 /**
@@ -359,11 +359,11 @@ export async function extractMemoriesFromBuffer(
 ): Promise<BufferExtractionResult> {
     if (messages.length === 0) return { memories: [], crossTimeLinks: [], eventBoxHints: [], unpinIds: [], corrections: [] };
 
-    const userLabel = userName || '用户';
+    const userLabel = userName || 'the user';
     const conversationText = buildConversationText(messages, charName, userLabel);
 
     const contextBlock = charContext
-        ? `\n## 你的人设（供参考，帮助你理解对话中的关系和角色定位）\n${charContext}\n`
+        ? `\n## Your Character Profile (reference for understanding relationships and roles in the conversation)\n${charContext}\n`
         : '';
 
     // 构建已有记忆引用块（带 O-编号，供 LLM 输出 relatedTo）
@@ -377,39 +377,39 @@ export async function extractMemoriesFromBuffer(
     // 便利贴摘除判断
     const hasPinned = pinnedMemories && pinnedMemories.length > 0;
     const pinnedBlock = hasPinned
-        ? `\n## 当前便利贴（如果对话内容表明某条便利贴已失效，在输出末尾用 unpin 标注）\n${
+        ? `\n## Current Pinned Notes (if the conversation explicitly shows that a note is no longer valid, add an unpin item at the end of the output)\n${
             pinnedMemories!.map((p, i) => `P${i}. ${p.content}`).join('\n')
           }\n`
         : '';
 
     const unpinRule = hasPinned
-        ? `\n12. **便利贴摘除**（unpin，可选）：如果对话中明确提到某条便利贴描述的状态已结束（如"感冒好了""提前回来了""考试考完了"），在输出的 JSON 数组末尾加一条 {"unpin": "P0"} 来摘除它。只在对话明确提及时才摘除，不要猜测。`
+        ? `\n12. **Removing a pinned note** (optional unpin): If the conversation explicitly states that a pinned status has ended, such as recovery from a cold, returning early, or finishing an exam, append {"unpin": "P0"} to the JSON array. Unpin only when the conversation says so; never guess.`
         : '';
 
-    const systemPrompt = `你是 ${charName}。根据给定的对话内容，以你的第一人称视角（"我"）提取值得记住的记忆。${contextBlock}${relatedBlock}${pinnedBlock}
+    const systemPrompt = `You are ${charName}. From the conversation below, extract memories worth retaining from your first-person ("I") perspective. Write every generated natural-language value in English, even when the source conversation is in another language.${contextBlock}${relatedBlock}${pinnedBlock}
 
 ${buildRulesBlock(charName, userLabel)}${relatedToRule}${unpinRule}
 
-## 输出格式
+## Output Format
 
-严格 JSON 数组，不要 markdown 包裹：
+Return a strict JSON array with no Markdown wrapper:
 [
   {
-    "content": "我视角的记忆...",
+    "content": "An English memory from my perspective...",
     "room": "living_room",
     "importance": 5,
     "mood": "neutral",
     "valence": 0,
     "arousal": 0,
-    "tags": ["标签1", "标签2"],
+    "tags": ["tag 1", "tag 2"],
     "date": "YYYY-MM-DD",
     "pinDays": 3${relatedToFormat}
   }
 ]
 
-date 必填，按该记忆实际发生当天填（参考消息行首的时间戳）。
-pinDays 仅在需要置顶时才写，大多数记忆不需要。
-如果对话过于琐碎无值得记忆的内容，返回空数组 []。`;
+date is required and must match the day the event actually occurred, using the timestamp at the start of the relevant message line.
+Include pinDays only when pinning is necessary; most memories do not need it.
+If the conversation is too trivial to contain a worthwhile memory, return an empty array [].`;
 
     try {
         const data = await safeFetchJson(
@@ -424,7 +424,7 @@ pinDays 仅在需要置顶时才写，大多数记忆不需要。
                     model: llmConfig.model,
                     messages: [
                         { role: 'system', content: systemPrompt },
-                        { role: 'user', content: `对话内容：\n${conversationText}` },
+                        { role: 'user', content: `Conversation:\n${conversationText}` },
                     ],
                     temperature: 0.4,
                     // 12000 比 16000 留余量：避免 LLM 顶满 cap 导致 JSON 输出被 truncate

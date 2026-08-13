@@ -128,7 +128,7 @@ async function callCompressionLLM(
     charName: string,
     userName: string | undefined,
 ): Promise<CompressionLLMResult | null> {
-    const userLabel = userName || '用户';
+    const userLabel = userName || 'the user';
 
     const formatDate = (ts: number): string => {
         const d = new Date(ts);
@@ -136,35 +136,36 @@ async function callCompressionLLM(
     };
 
     const livesText = liveNodes
-        .map(n => `[${formatDate(n.createdAt)}｜重要性${n.importance}｜${n.mood}] ${n.content}`)
+        .map(n => `[${formatDate(n.createdAt)}｜importance ${n.importance}｜${n.mood}] ${n.content}`)
         .join('\n\n');
 
     const oldSummaryBlock = oldSummaryContent
-        ? `\n## 你之前已经回忆过这件事一次，那时记下的是：\n${oldSummaryContent}\n\n后来又新增了下面这些：\n`
-        : `\n## 关于这件事的零散记忆碎片：\n`;
+        ? `\n## You have recalled this event before. The previous memory was:\n${oldSummaryContent}\n\nThe following details were added later:\n`
+        : `\n## Fragmented memories concerning this event:\n`;
 
-    const systemPrompt = `你是 ${charName}。下面这些记忆都属于一件事：「${box.name}」。
-请把它们整合成一段连贯的、第一人称（「我」）的回忆。
+    const systemPrompt = `You are ${charName}. All of the memories below belong to one event: "${box.name}."
+Integrate them into one coherent first-person ("I") memory written entirely in English.
 
-**要求（严格遵守）**：
-1. **第一人称**（用「我」），从 ${charName} 的视角写。${userLabel} 用名字直接称呼。
-2. **字数目标 ${EVENT_BOX_SUMMARY_TARGET_MIN_CHARS}-${EVENT_BOX_SUMMARY_TARGET_MAX_CHARS} 字，绝对上限 ${EVENT_BOX_SUMMARY_HARD_MAX_CHARS} 字**。紧凑、务实、不口水。
-3. **只保留关键信息**：具体人物、动作、对象、场景、转折、情绪。**去掉所有语气填充、修辞铺陈、重复感慨**（如「真是的」、「怎么说呢」、「不过话说回来」等）。事实先行。
-4. **带时间点但不冗余**：每件事标一次日期就够（「3 月 20 日…4 月 5 日…」），不要每句都重复时间。
-5. **连贯但简洁**：不套「起因/经过/结果」模板，但要让读者能按顺序看懂事情怎么发展的。
-6. **覆盖所有关键词**（这是给向量检索用的）—— 每条新增的旧记忆里出现过的具体名词、地点、人物必须在 content 里出现一次。
-7. **content 字符串内严禁使用半角双引号 \`"\`**。要引用人物原话、书名、外号、术语，一律用中文方角引号「」、《》或单引号 \`'\`。否则会破坏外层 JSON 解析、整批记忆白丢。
+**Requirements (follow strictly)**:
+1. **First person**: Write from ${charName}'s perspective using "I". Address ${userLabel} directly by name.
+2. **Target ${EVENT_BOX_SUMMARY_TARGET_MIN_CHARS}-${EVENT_BOX_SUMMARY_TARGET_MAX_CHARS} characters, absolute maximum ${EVENT_BOX_SUMMARY_HARD_MAX_CHARS} characters**. Be compact, practical, and direct.
+3. **Keep only essential information**: concrete people, actions, objects, settings, turning points, and emotions. Remove filler, rhetorical padding, and repeated reactions. Put facts first.
+4. **Include dates without repetition**: Give each event's date once, such as "March 20... April 5...", rather than repeating a date in every sentence.
+5. **Coherent but concise**: Do not mechanically label cause/process/result, but make the event's development easy to follow in order.
+6. **Cover every keyword for vector retrieval**: Every concrete noun, place, and person appearing in each newly supplied memory must occur at least once in content.
+7. **Do not place an unescaped ASCII double quote inside the content string**. For quoted speech, titles, nicknames, or terms, use curly quotation marks, corner brackets, book-title brackets, or single quotes. Otherwise the outer JSON may fail to parse.
+8. **English-only output**: content, name, and every tag must be English, even when the source memories are in another language.
 
-附带输出 metadata：
-- name：5-12 字的精炼盒名
-- tags：5-10 个具体的搜索 tag（具体名词）
-- room：${VALID_ROOMS.join(' / ')}
-- importance：1-10
-- mood：happy / sad / angry / anxious / tender / excited / peaceful / confused / hurt / grateful / nostalgic / neutral
+Also output metadata:
+- name: a concise 2-8 word English event-box name.
+- tags: 5-10 concrete English search tags.
+- room: ${VALID_ROOMS.join(' / ')}.
+- importance: 1-10.
+- mood: happy / sad / angry / anxious / tender / excited / peaceful / confused / hurt / grateful / nostalgic / neutral.
 
-严格 JSON，不要 markdown 包裹（content 里的引用一律用「」/《》/'，不要用 "）：
+Return strict JSON with no Markdown wrapper. Use curly quotation marks, corner brackets, book-title brackets, or single quotes inside content rather than unescaped ASCII double quotes:
 {
-  "content": "（紧凑的第一人称回忆，${EVENT_BOX_SUMMARY_TARGET_MIN_CHARS}-${EVENT_BOX_SUMMARY_TARGET_MAX_CHARS}字）",
+  "content": "A compact English first-person memory of ${EVENT_BOX_SUMMARY_TARGET_MIN_CHARS}-${EVENT_BOX_SUMMARY_TARGET_MAX_CHARS} characters",
   "name": "...",
   "tags": ["...", "..."],
   "room": "...",
@@ -254,9 +255,9 @@ async function recompressSummary(
     llmConfig: LightLLMConfig,
     charName: string,
 ): Promise<string | null> {
-    const systemPrompt = `你是 ${charName}。下面这段第一人称回忆写得太长了。请在**不丢关键信息**（具体人物、地点、事件、转折、情绪）的前提下，把它压缩到 ${targetMaxChars} 字以内。
-要求：保持第一人称（「我」）、连贯通顺；只删语气填充和重复铺陈，不删事实；引用一律用「」《》或单引号，不要用半角双引号。
-直接输出压缩后的回忆正文，不要解释、不要 JSON、不要 markdown 包裹。`;
+    const systemPrompt = `You are ${charName}. The first-person memory below is too long. Compress it to at most ${targetMaxChars} characters without losing key people, places, events, turning points, or emotions.
+Requirements: Write the result entirely in English; preserve a coherent first-person ("I") perspective; remove only filler and repeated phrasing, never facts; use curly quotation marks, corner brackets, book-title brackets, or single quotes for quotations rather than ASCII double quotes.
+Output only the compressed memory text, with no explanation, JSON, or Markdown wrapper.`;
     try {
         const data = await safeFetchJson(
             `${llmConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`,
