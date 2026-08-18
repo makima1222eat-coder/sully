@@ -13,6 +13,7 @@ import type { MemoryRoom } from './types';
 import type { LightLLMConfig } from './pipeline';
 import { safeFetchJson } from '../safeApi';
 import { safeParseJsonArray } from './jsonUtils';
+import { buildUserPronounRule } from './userPronoun';
 
 /** 群记忆草稿——尚未指派 charId（一份记忆稍后会复制给每个成员持久化） */
 export interface GroupMemoryDraft {
@@ -49,30 +50,31 @@ function buildGroupRulesBlock(groupName: string, memberNames: string[], userLabe
    - Begin every memory with: "In 【${groupName}】, ..."
    - Write every generated memory and tag in English, even when the source conversation is in another language.
    Examples:
-   - "In 【${groupName}】, ${memberNames[0] || 'A'} mentioned a show they had been watching, ${memberNames[1] || 'B'} recommended it too, and ${userLabel} said they were convinced to try it."
+   - "In 【${groupName}】, ${memberNames[0] || 'A'} mentioned a show they had been watching, ${memberNames[1] || 'B'} recommended it too, and ${userLabel} said she was convinced to try it."
    - "In 【${groupName}】, ${memberNames[0] || 'A'} complained about weekend overtime. Everyone offered advice: ${memberNames[1] || 'B'} suggested refusing directly, while ${memberNames[2] || 'C'} suggested waiting to see what happened."
 
-2. **Use importance to control length**:
+2. ${buildUserPronounRule(userLabel)}
+3. **Use importance to control length**:
    - Importance 1-5: 20-60 English words, primarily factual.
    - Importance 6-7: 60-140 English words, including the group's atmosphere.
    - Importance 8-10: 120-220 English words, with a complete narrative (cause → development → group reaction).
 
-3. **Room assignment** (from the group's collective viewpoint):
+4. **Room assignment** (from the group's collective viewpoint):
    - living_room: Everyday group chatter, running jokes, repetition, and inconsequential lively atmosphere.
    - bedroom: Warm moments, deep interactions, mutual care, or playful teasing of ${userLabel}.
    - study: Group discussion of work, study, interests, skills, or news.
-   - user_room: Things in the group concerning ${userLabel}: their state, emotions, family or friends they mention, teasing directed at them, and similar matters.
+   - user_room: Things in the group concerning ${userLabel}: her state, emotions, family or friends she mentions, teasing directed at her, and similar matters.
    - self_room: Changes in relationships among group members or in the group's overall atmosphere.
    - attic: Unresolved conflict, awkward silence, abandoned topics, or simmering interpersonal tension.
    - windowsill: Group promises, shared hopes, and collective goals such as meeting offline or making plans together.
 
-4. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
-5. **Emotion coordinates** (valence, arousal):
+5. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
+6. **Emotion coordinates** (valence, arousal):
    - valence: -1 (extreme pain) → +1 (extreme pleasure).
    - arousal: -1 (extreme calm) → +1 (extreme intensity).
-6. **Tags**: Extract 2-5 English keyword tags, preferably including the names of the people involved.
-7. **Do not miss worthwhile events, but do not turn every sentence into a memory**. A group-chat segment normally yields 1-5 memories.
-8. **Do not output pinDays / relatedTo / sameAs / eventName / eventTags**. Group Memory v1 does not participate in pinned notes or event boxes.`;
+7. **Tags**: Extract 2-5 English keyword tags, preferably including the names of the people involved.
+8. **Do not miss worthwhile events, but do not turn every sentence into a memory**. A group-chat segment normally yields 1-5 memories.
+9. **Do not output pinDays / relatedTo / sameAs / eventName / eventTags**. Group Memory v1 does not participate in pinned notes or event boxes.`;
 }
 
 function buildGroupConversationText(messages: Message[], speakerNameOf: (m: Message) => string): string {

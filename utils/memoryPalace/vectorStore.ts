@@ -6,7 +6,7 @@
  * 然后存入 memory_nodes 和 memory_vectors。
  */
 
-import type { EmbeddingConfig, MemoryNode, MemoryVector, RemoteVectorConfig } from './types';
+import type { EmbeddingConfig, MemoryNode, MemoryRoom, MemoryVector, RemoteVectorConfig } from './types';
 import { MemoryNodeDB, MemoryVectorDB, ensureFloat32 } from './db';
 import { getEmbeddings, cosineSimilarity } from './embedding';
 import { upsertVector as remoteUpsert } from './supabaseVector';
@@ -88,6 +88,73 @@ export async function vectorizeAndStore(
 
     console.log(`✅ [VectorStore] Stored ${stored}, skipped ${skipped} duplicates`);
     return { stored, skipped };
+}
+
+/** 手动新建单条记忆的草稿（记忆宫殿里用户自己写的那条）。 */
+export interface ManualMemoryDraft {
+    content: string;
+    room: MemoryRoom;
+    importance: number;
+    mood: string;
+    tags: string[];
+    /** 记忆发生的时间。补录旧事时往回调，缺省 = 此刻。 */
+    createdAt?: number;
+}
+
+/**
+ * 手动新建一条记忆并入库。
+ *
+ * 和提取管线的两点不同：
+ * - **不去重**：用户自己写下的这条就是要它进去。走语义去重的话，和已有记忆撞了会被
+ *   静默跳过，界面上却是"保存成功"，变成一条查无此人的记忆。
+ * - **关联只走规则不调 LLM**：单条新建没必要为了连线再花一次 token；时间/情绪链
+ *   够把它挂进现有网络。建链失败也不回滚，记忆本身已经存住了。
+ */
+export async function createManualMemoryNode(
+    charId: string,
+    draft: ManualMemoryDraft,
+    embeddingConfig: EmbeddingConfig,
+    remoteVectorConfig?: RemoteVectorConfig,
+): Promise<MemoryNode> {
+    const content = draft.content.trim();
+    if (!content) throw new Error('记忆内容不能为空');
+    if (!embeddingConfig?.baseUrl || !embeddingConfig.apiKey || !embeddingConfig.model) {
+        throw new Error('请先配置 Embedding API，新建记忆需要生成语义向量');
+    }
+
+    const createdAt = draft.createdAt && draft.createdAt > 0 ? draft.createdAt : Date.now();
+    const node: MemoryNode = {
+        id: `mn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        charId,
+        content,
+        room: draft.room,
+        tags: draft.tags.filter(Boolean).slice(0, 8),
+        importance: Math.min(10, Math.max(1, Math.round(draft.importance) || 5)),
+        mood: draft.mood.trim() || 'neutral',
+        embedded: false,
+        createdAt,
+        lastAccessedAt: createdAt,
+        accessCount: 0,
+        origin: 'system',
+    };
+
+    const { stored } = await vectorizeAndStore(
+        [node],
+        embeddingConfig,
+        remoteVectorConfig,
+        { skipDedup: true },
+    );
+    if (stored === 0) throw new Error('记忆没能写入，请重试');
+
+    try {
+        const { buildLinks } = await import('./links');
+        const others = (await MemoryNodeDB.getByCharId(charId)).filter(n => n.id !== node.id);
+        await buildLinks([node], others);
+    } catch (e: any) {
+        console.warn(`🔗 [VectorStore] 手动记忆建链失败（记忆已保存）: ${e?.message}`);
+    }
+
+    return { ...node, embedded: true };
 }
 
 export interface UpdateStoredMemoryNodeResult {

@@ -26,8 +26,8 @@ export type { RerankApiConfig, RerankResult } from './rerank';
 
 // 输入管线
 export { extractMemoriesFromBuffer } from './extraction';
-export { vectorizeAndStore, updateStoredMemoryNode, checkModelConsistency, rebuildAllVectors } from './vectorStore';
-export type { UpdateStoredMemoryNodeResult } from './vectorStore';
+export { vectorizeAndStore, createManualMemoryNode, updateStoredMemoryNode, checkModelConsistency, rebuildAllVectors } from './vectorStore';
+export type { ManualMemoryDraft, UpdateStoredMemoryNodeResult } from './vectorStore';
 
 // 认知过程
 export { runConsolidation, calculateEffectiveImportance, shouldPromote } from './consolidation';

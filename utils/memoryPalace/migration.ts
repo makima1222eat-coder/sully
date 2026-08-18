@@ -24,6 +24,7 @@ import type { RelatedMemoryRef, EventBoxHint } from './extraction';
 import { fetchRelatedMemoriesForExtraction, splitLogsToBullets, sampleSnippetsFromMessages } from './relatedMemories';
 import { bindMemoriesIntoEventBox } from './eventBox';
 import { maybeCompressEventBoxes } from './eventBoxCompression';
+import { buildUserPronounRule } from './userPronoun';
 
 function generateId(): string {
     return `mn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -106,11 +107,12 @@ async function extractMonthMemories(
 ## Rules
 
 1. **First-person narration**: Record each memory using "I" and address the user as "${userLabel}". Preserve the complete course of each event rather than dropping its beginning or ending.
-2. **Importance levels**:
+2. ${buildUserPronounRule(userLabel)}
+3. **Importance levels**:
    - 1-5: Everyday details, 15-50 English words.
    - 6-7: Emotionally meaningful events, 60-120 English words, including my feelings.
    - 8-10: Major events, 100-200 English words, including complete causality and my reaction.
-3. **Room assignment** (anything involving ${userLabel}'s family, friends, colleagues, or other interpersonal relationships must go to user_room, even if it is only one specific event):
+4. **Room assignment** (anything involving ${userLabel}'s family, friends, colleagues, or other interpersonal relationships must go to user_room, even if it is only one specific event):
    - living_room: Pure everyday trivia with neither important relationships nor deep emotion.
    - bedroom: Intimacy, deep bonds, and moving moments between ${userLabel} and me.
    - study: Work, learning, and skills.
@@ -118,13 +120,13 @@ async function extractMonthMemories(
    - self_room: My own growth and changes in identity.
    - attic: Unresolved conflict, confusion, or harm.
    - windowsill: Hopes, goals, and aspirations.
-4. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
-5. **Emotion coordinates** (valence, arousal): Provide two-dimensional emotion coordinates in addition to mood.
+5. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
+6. **Emotion coordinates** (valence, arousal): Provide two-dimensional emotion coordinates in addition to mood.
    - valence: -1 (extreme pain) → +1 (extreme pleasure).
    - arousal: -1 (extreme calm) → +1 (extreme intensity).
    Reference values: happy ≈ (0.7, 0.5), peaceful ≈ (0.5, -0.6), dejected ≈ (-0.5, -0.4), anxious ≈ (-0.6, 0.7), angry ≈ (-0.7, 0.8).
-6. **Do not omit any event**. These daily summaries are already distilled; each event deserves its own memory. If a daily summary contains three events, extract three memories. Prefer extracting more over compressing away details.
-7. **Preserve exact dates**: Set date to the event's specific date from the log label and mention the timing naturally in the content.${relatedToRule}
+7. **Do not omit any event**. These daily summaries are already distilled; each event deserves its own memory. If a daily summary contains three events, extract three memories. Prefer extracting more over compressing away details.
+8. **Preserve exact dates**: Set date to the event's specific date from the log label and mention the timing naturally in the content.${relatedToRule}
 
 ## Output
 

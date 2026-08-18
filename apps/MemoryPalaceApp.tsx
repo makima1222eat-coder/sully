@@ -12,7 +12,7 @@ import {
     DigestReportDB, PLATE_TITLES,
     bootstrapPlatesFromHistory, markPlateBootstrapDone,
     getBootstrapResume, setBootstrapResume, clearBootstrapResume,
-    updateStoredMemoryNode,
+    updateStoredMemoryNode, createManualMemoryNode,
 } from '../utils/memoryPalace';
 import type { Anticipation, MigrationProgress, DigestResult, MemoryLink, EventBox, DigestReport } from '../utils/memoryPalace';
 import { confirmExportSafety } from '../utils/exportGuard';
@@ -406,6 +406,12 @@ const Icon: React.FC<{ name: string; size?: number; style?: React.CSSProperties 
                     <path d="M6 3v5l6 4 6-4V3M6 21v-5l6-4 6 4v5" />
                 </svg>
             );
+        case 'plus':
+            return (
+                <svg {...p}>
+                    <path d="M12 5v14M5 12h14" />
+                </svg>
+            );
         default:
             return null;
     }
@@ -433,6 +439,15 @@ const StatusMessage: React.FC<{ msg: string | null | undefined; style?: React.CS
         </span>
     );
 };
+
+/**
+ * 记忆详情编辑 / 手动新建共用的一份情绪清单。
+ *
+ * neutral / confused / hurt 必须在里面：提取管线（extraction.ts 的 mood 枚举）会写出这三种，
+ * 清单里没有的话 <select> 匹配不到 value，界面上一律显示成第一项 happy——存的是 neutral、
+ * 看到的是 happy，还没法手动改回去。
+ */
+const MEMORY_MOODS = ['neutral', 'happy', 'sad', 'angry', 'anxious', 'tender', 'peaceful', 'excited', 'nostalgic', 'confused', 'hurt', 'frustrated', 'hopeful', 'lonely', 'grateful'];
 
 const ROOM_COLORS: Record<MemoryRoom, string> = {
     living_room: '#22c55e',
@@ -662,7 +677,7 @@ export default function MemoryPalaceApp() {
     const char = characters.find(c => c.id === activeCharacterId);
     const [selectGroupId, setSelectGroupId] = useState(GROUP_FILTER_ALL); // 选角色页的分组筛选
 
-    const [view, setView] = useState<'picker' | 'palace' | 'room' | 'memory' | 'settings' | 'globalSettings' | 'all' | 'boxes'>('picker');
+    const [view, setView] = useState<'picker' | 'palace' | 'room' | 'memory' | 'newMemory' | 'settings' | 'globalSettings' | 'all' | 'boxes'>('picker');
     const [selectedRoom, setSelectedRoom] = useState<MemoryRoom | null>(null);
     const [selectedNode, setSelectedNode] = useState<MemoryNode | null>(null);
     const [roomCounts, setRoomCounts] = useState<Record<MemoryRoom, number>>({} as any);
@@ -833,6 +848,17 @@ export default function MemoryPalaceApp() {
         mpEmb: any;
         mpLLM: any;
     } | null>(null);
+
+    // 手动新建单条记忆（和提取管线并行的一条手工入口）
+    const [draftContent, setDraftContent] = useState('');
+    const [draftRoom, setDraftRoom] = useState<MemoryRoom>('living_room');
+    const [draftImportance, setDraftImportance] = useState(5);
+    const [draftMood, setDraftMood] = useState('neutral');
+    const [draftTags, setDraftTags] = useState('');
+    const [draftDate, setDraftDate] = useState('');
+    const [creating, setCreating] = useState(false);
+    /** 存完回哪儿：从房间进来的回房间，从全部记忆进来的回全部记忆 */
+    const [draftReturnView, setDraftReturnView] = useState<'room' | 'all' | 'palace'>('palace');
 
     // 记忆编辑状态
     const [editing, setEditing] = useState(false);
@@ -1333,6 +1359,67 @@ export default function MemoryPalaceApp() {
         setPrevView(from || 'room');
         setView('memory');
         loadLinkedMemories(node.id);
+    };
+
+    /** 本地日期 → <input type="date"> 用的 YYYY-MM-DD（不能用 toISOString，那是 UTC，跨零点会差一天） */
+    const toDateInputValue = (ts: number): string => {
+        const d = new Date(ts);
+        const pad = (n: number) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    };
+
+    const openNewMemory = (from: 'room' | 'all' | 'palace', room?: MemoryRoom) => {
+        setDraftContent('');
+        setDraftRoom(room || selectedRoom || 'living_room');
+        setDraftImportance(5);
+        setDraftMood('neutral');
+        setDraftTags('');
+        setDraftDate(toDateInputValue(Date.now()));
+        setDraftReturnView(from);
+        setSelectMode(false);
+        setSelectedIds(new Set());
+        setView('newMemory');
+    };
+
+    const handleCreateMemory = async () => {
+        if (!char) return;
+        setCreating(true);
+        try {
+            // 日期只到天，落到当天中午——和提取管线里 LLM 写的 date 一个口径，
+            // 免得补录的记忆在时间轴上跑到当天最前或最后。
+            const [y, m, d] = draftDate.split('-').map(n => parseInt(n, 10));
+            const createdAt = (y && m && d) ? new Date(y, m - 1, d, 12, 0, 0, 0).getTime() : Date.now();
+
+            const node = await createManualMemoryNode(
+                char.id,
+                {
+                    content: draftContent.trim(),
+                    room: draftRoom,
+                    importance: draftImportance,
+                    mood: draftMood.trim(),
+                    tags: draftTags.split(/[,，]/).map(t => t.trim()).filter(Boolean),
+                    createdAt,
+                },
+                memoryPalaceConfig.embedding,
+                remoteVectorConfig,
+            );
+            trackEvent('手动新建记忆', { room: draftRoom });
+            addToast('记忆已存进宫殿', 'success');
+
+            // 回到来的地方，并把那张列表刷新到包含新记忆
+            if (draftReturnView === 'room') {
+                await openRoom(node.room);
+            } else if (draftReturnView === 'all') {
+                await openAllMemories();
+            } else {
+                setView('palace');
+            }
+            loadStats();
+        } catch (error: any) {
+            addToast(error?.message || '新建记忆失败', 'error');
+        } finally {
+            setCreating(false);
+        }
     };
 
     const handleSaveEdit = async () => {
@@ -5172,7 +5259,16 @@ create table if not exists memory_vectors (
                     >
                         ← 返回宫殿
                     </div>
-                    <div style={{ fontSize: 12, color: '#9ca3af' }}>{allNodes.length} 条记忆</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        <div
+                            onClick={() => openNewMemory('all')}
+                            style={{ fontSize: 12, color: '#3b82f6', cursor: 'pointer', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                        >
+                            <Icon name="plus" size={13} />
+                            <span>写一条</span>
+                        </div>
+                        <div style={{ fontSize: 12, color: '#9ca3af' }}>{allNodes.length} 条记忆</div>
+                    </div>
                 </div>
 
                 <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -5539,14 +5635,25 @@ create table if not exists memory_vectors (
                     >
                         ← 返回宫殿
                     </div>
-                    {roomNodes.length > 0 && (
-                        <div
-                            onClick={() => { setSelectMode(!selectMode); setSelectedIds(new Set()); }}
-                            style={{ fontSize: 12, color: selectMode ? '#dc2626' : '#6b7280', cursor: 'pointer', fontWeight: 600 }}
-                        >
-                            {selectMode ? '取消选择' : '选择'}
-                        </div>
-                    )}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        {!selectMode && (
+                            <div
+                                onClick={() => openNewMemory('room', selectedRoom)}
+                                style={{ fontSize: 12, color: '#3b82f6', cursor: 'pointer', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                            >
+                                <Icon name="plus" size={13} />
+                                <span>写一条</span>
+                            </div>
+                        )}
+                        {roomNodes.length > 0 && (
+                            <div
+                                onClick={() => { setSelectMode(!selectMode); setSelectedIds(new Set()); }}
+                                style={{ fontSize: 12, color: selectMode ? '#dc2626' : '#6b7280', cursor: 'pointer', fontWeight: 600 }}
+                            >
+                                {selectMode ? '取消选择' : '选择'}
+                            </div>
+                        )}
+                    </div>
                 </div>
 
                 <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -5629,11 +5736,160 @@ create table if not exists memory_vectors (
         );
     }
 
+    // ─── 手动新建单条记忆 ────────────────────────────
+
+    if (view === 'newMemory') {
+        const roomColor = ROOM_COLORS[draftRoom];
+        const backLabel = draftReturnView === 'all'
+            ? '全部记忆'
+            : draftReturnView === 'room'
+                ? getRoomLabel(selectedRoom || draftRoom, userProfile?.name)
+                : '宫殿';
+
+        return (
+            <div style={{ paddingLeft: 16, paddingRight: 16, paddingBottom: 16, paddingTop: SAFE_PAD_TOP, maxHeight: '100%', overflowY: 'auto' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                    <div
+                        onClick={() => setView(draftReturnView)}
+                        style={{ fontSize: 13, color: '#6b7280', cursor: 'pointer' }}
+                    >
+                        ← 返回 {backLabel}
+                    </div>
+                </div>
+
+                <div style={{ marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ color: roomColor, display: 'inline-flex' }}><RoomIcon room={draftRoom} size={22} /></span>
+                    <span style={{ fontSize: 18, fontWeight: 700, color: roomColor }}>写一条记忆</span>
+                </div>
+
+                <div style={{
+                    padding: 16, borderRadius: 12,
+                    border: `1px solid ${roomColor}44`,
+                    backgroundColor: `${roomColor}08`,
+                    display: 'flex', flexDirection: 'column', gap: 12,
+                }}>
+                    <div>
+                        <label className={labelClass}>内容</label>
+                        <textarea
+                            value={draftContent}
+                            onChange={e => setDraftContent(e.target.value)}
+                            className={inputClass}
+                            style={{ minHeight: 120, resize: 'vertical', fontFamily: 'inherit' }}
+                            placeholder={`用${char?.name || '角色'}的第一人称写，提到你就写你的名字。例：今天她加班到很晚没吃饭，我让她别不管自己，点了份粥。`}
+                        />
+                        <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 4, lineHeight: 1.6 }}>
+                            这条会和自动提取的记忆一起参与召回，写法保持一致检索得更准。
+                        </div>
+                    </div>
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                        <div>
+                            <label className={labelClass}>房间</label>
+                            <select
+                                value={draftRoom}
+                                onChange={e => setDraftRoom(e.target.value as MemoryRoom)}
+                                className={inputClass}
+                                style={{ fontFamily: 'inherit' }}
+                            >
+                                {(Object.keys(ROOM_CONFIGS) as MemoryRoom[]).map(r => (
+                                    <option key={r} value={r}>{getRoomLabel(r, userProfile?.name)}</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className={labelClass}>情绪</label>
+                            <select
+                                value={draftMood}
+                                onChange={e => setDraftMood(e.target.value)}
+                                className={inputClass}
+                                style={{ fontFamily: 'inherit' }}
+                            >
+                                {MEMORY_MOODS.map(m => <option key={m} value={m}>{m}</option>)}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div>
+                        <label className={labelClass}>发生日期</label>
+                        <input
+                            type="date"
+                            value={draftDate}
+                            onChange={e => setDraftDate(e.target.value)}
+                            className={inputClass}
+                            style={{ fontFamily: 'inherit' }}
+                        />
+                        <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 4 }}>
+                            补录很久以前的事就往回调；时近性打分和时间线都看这个日期。
+                        </div>
+                    </div>
+
+                    <div>
+                        <label className={labelClass}>重要性: {draftImportance}</label>
+                        <input
+                            type="range" min="1" max="10" step="1"
+                            value={draftImportance}
+                            onChange={e => setDraftImportance(parseInt(e.target.value))}
+                            style={{ width: '100%' }}
+                        />
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#9ca3af' }}>
+                            <span>1</span>
+                            <span style={{ color: roomColor, fontWeight: 600 }}>{'★'.repeat(draftImportance)}{'☆'.repeat(10 - draftImportance)}</span>
+                            <span>10</span>
+                        </div>
+                    </div>
+
+                    <div>
+                        <label className={labelClass}>标签（逗号分隔）</label>
+                        <input
+                            value={draftTags}
+                            onChange={e => setDraftTags(e.target.value)}
+                            className={inputClass}
+                            placeholder="标签1, 标签2, ..."
+                        />
+                    </div>
+
+                    {!hasEmbeddingConfig && (
+                        <div style={{
+                            fontSize: 11, lineHeight: 1.6, padding: '8px 10px', borderRadius: 8,
+                            background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412',
+                        }}>
+                            还没配 Embedding API。新建记忆要生成语义向量才能被召回，先去设置里配好。
+                        </div>
+                    )}
+
+                    <div style={{ display: 'flex', gap: 8 }}>
+                        <button
+                            onClick={handleCreateMemory}
+                            disabled={creating || !draftContent.trim() || !hasEmbeddingConfig}
+                            style={{
+                                flex: 1, padding: '10px 0', borderRadius: 10, border: 'none',
+                                fontSize: 13, fontWeight: 700, color: 'white',
+                                background: (creating || !draftContent.trim() || !hasEmbeddingConfig) ? '#d4d4d4' : '#3b82f6',
+                                cursor: (creating || !draftContent.trim() || !hasEmbeddingConfig) ? 'not-allowed' : 'pointer',
+                            }}
+                        >
+                            {creating ? '存入中...' : '存进宫殿'}
+                        </button>
+                        <button
+                            onClick={() => setView(draftReturnView)}
+                            style={{
+                                padding: '10px 16px', borderRadius: 10, border: '1px solid #e5e7eb',
+                                fontSize: 13, fontWeight: 600, color: '#6b7280', background: 'white',
+                                cursor: 'pointer',
+                            }}
+                        >
+                            取消
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
     // ─── 单条记忆详情 ────────────────────────────────
 
     if (view === 'memory' && selectedNode) {
         const roomColor = ROOM_COLORS[editing ? editRoom : selectedNode.room];
-        const MOODS = ['happy', 'sad', 'angry', 'anxious', 'tender', 'peaceful', 'excited', 'nostalgic', 'frustrated', 'hopeful', 'lonely', 'grateful'];
 
         return (
             <div style={{ paddingLeft: 16, paddingRight: 16, paddingBottom: 16, paddingTop: SAFE_PAD_TOP, maxHeight: '100%', overflowY: 'auto' }}>
@@ -5693,7 +5949,7 @@ create table if not exists memory_vectors (
                                         className={inputClass}
                                         style={{ fontFamily: 'inherit' }}
                                     >
-                                        {MOODS.map(m => <option key={m} value={m}>{m}</option>)}
+                                        {MEMORY_MOODS.map(m => <option key={m} value={m}>{m}</option>)}
                                     </select>
                                 </div>
                             </div>

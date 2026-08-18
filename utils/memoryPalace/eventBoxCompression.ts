@@ -29,6 +29,7 @@ import { vectorizeAndStore } from './vectorStore';
 import { bulkSetArchived } from './supabaseVector';
 import { safeFetchJson, extractJson } from '../safeApi';
 import { enforceSummaryLengthBudget } from './summaryLengthBudget';
+import { buildUserPronounRule } from './userPronoun';
 
 const VALID_ROOMS: MemoryRoom[] = [
     'living_room', 'bedroom', 'study', 'user_room',
@@ -148,13 +149,14 @@ Integrate them into one coherent first-person ("I") memory written entirely in E
 
 **Requirements (follow strictly)**:
 1. **First person**: Write from ${charName}'s perspective using "I". Address ${userLabel} directly by name.
-2. **Target ${EVENT_BOX_SUMMARY_TARGET_MIN_CHARS}-${EVENT_BOX_SUMMARY_TARGET_MAX_CHARS} characters, absolute maximum ${EVENT_BOX_SUMMARY_HARD_MAX_CHARS} characters**. Be compact, practical, and direct.
-3. **Keep only essential information**: concrete people, actions, objects, settings, turning points, and emotions. Remove filler, rhetorical padding, and repeated reactions. Put facts first.
-4. **Include dates without repetition**: Give each event's date once, such as "March 20... April 5...", rather than repeating a date in every sentence.
-5. **Coherent but concise**: Do not mechanically label cause/process/result, but make the event's development easy to follow in order.
-6. **Cover every keyword for vector retrieval**: Every concrete noun, place, and person appearing in each newly supplied memory must occur at least once in content.
-7. **Do not place an unescaped ASCII double quote inside the content string**. For quoted speech, titles, nicknames, or terms, use curly quotation marks, corner brackets, book-title brackets, or single quotes. Otherwise the outer JSON may fail to parse.
-8. **English-only output**: content, name, and every tag must be English, even when the source memories are in another language.
+2. ${buildUserPronounRule(userLabel)}
+3. **Target ${EVENT_BOX_SUMMARY_TARGET_MIN_CHARS}-${EVENT_BOX_SUMMARY_TARGET_MAX_CHARS} characters, absolute maximum ${EVENT_BOX_SUMMARY_HARD_MAX_CHARS} characters**. Be compact, practical, and direct.
+4. **Keep only essential information**: concrete people, actions, objects, settings, turning points, and emotions. Remove filler, rhetorical padding, and repeated reactions. Put facts first.
+5. **Include dates without repetition**: Give each event's date once, such as "March 20... April 5...", rather than repeating a date in every sentence.
+6. **Coherent but concise**: Do not mechanically label cause/process/result, but make the event's development easy to follow in order.
+7. **Cover every keyword for vector retrieval**: Every concrete noun, place, and person appearing in each newly supplied memory must occur at least once in content.
+8. **Do not place an unescaped ASCII double quote inside the content string**. For quoted speech, titles, nicknames, or terms, use curly quotation marks, corner brackets, book-title brackets, or single quotes. Otherwise the outer JSON may fail to parse.
+9. **English-only output**: content, name, and every tag must be English, even when the source memories are in another language.
 
 Also output metadata:
 - name: a concise 2-8 word English event-box name.

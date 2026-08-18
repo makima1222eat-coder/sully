@@ -29,6 +29,7 @@ import {
 import { MemoryNodeDB, RoomPlateDB, plateId } from './db';
 import type { LightLLMConfig } from './pipeline';
 import { safeFetchJson } from '../safeApi';
+import { buildUserPronounRule } from './userPronoun';
 import { safeParseJsonArray } from './jsonUtils';
 
 // ─── 基础工具 ─────────────────────────────────────────
@@ -158,7 +159,7 @@ export function mergePlateEntries(
 const ROOM_RULES: Record<PlateRoom, string> = {
     user_room:
         `Imagine writing a **character card** for the other person. Only information that must appear on that card belongs here: ` +
-        `basic identity, broad profession, residence, family structure, significant people (for example, "Their friend Mei: a close university roommate"), ` +
+        `basic identity, broad profession, residence, family structure, significant people (for example, "Her friend Mei: a close university roommate"), ` +
         `core facts established through long-term interaction, and life events major enough to shape the person, such as bereavement or emigrating. ` +
         `The threshold is extremely high; prefer omission over clutter. Exclude temporary states, emotional analysis, personality profiling, and ongoing events without conclusions.`,
     self_room:
@@ -166,7 +167,7 @@ const ROOM_RULES: Record<PlateRoom, string> = {
     bedroom:
         `The **texture** of our relationship: shared habits and rituals, private jokes, unspoken understanding, and real but uncertain feelings. ` +
         `Hard rule: never name or classify the relationship. Do not write definitions such as "we are lovers, partners, friends, or family." ` +
-        `Describe only observable patterns and feelings; uncertainty itself may be retained, for example, "I cannot define us, but I am the first person they seek when they are hurting."`,
+        `Describe only observable patterns and feelings; uncertainty itself may be retained, for example, "I cannot define us, but I am the first person she seeks when she is hurting."`,
     study:
         `My domains: what I can do, what I am learning, and what we study together. Retain accumulated knowledge, not one-off topics.`,
 };
@@ -233,7 +234,8 @@ Each plate below contains existing entries and new material. Output the complete
 3. **Keep each entry within ${PLATE_ENTRY_TARGET_CHARS} characters**. Write a gist rather than a narrative; do not include dates or phrases such as "I remember."
 4. **Respect each plate's entry cap**. When space is limited, keep the most important items; deliberate omission is expected.
 5. Give every entry a short English **tag** of 1-3 words, such as Family, Residence, Significant Person, Work, Boundary, Habit, Personality, Promise, Understanding, or Skill.
-6. Address ${userName} directly by name. Do not place an unescaped ASCII double quote inside entry text; use curly quotation marks or single quotes for quotations.
+6. ${buildUserPronounRule(userName)}
+7. Address ${userName} directly by name. Do not place an unescaped ASCII double quote inside entry text; use curly quotation marks or single quotes for quotations.
 
 ${roomBlocks}
 

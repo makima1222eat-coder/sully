@@ -216,9 +216,16 @@ export const installIOSStandaloneWorkaround = () => {
 
     // 键盘弹出时锁死外层滚动：只放行可滚区（消息列表等 .overflow-y-auto）内部滚动，其余 touchmove 一律拦掉。
     // 不锁的话 iOS 会在输入框聚焦时随手势把整页顶飞（visualViewport.offsetTop 漂移、露出底层色块、闪烁）。
+    //
+    // 输入框本身必须放行：在输入框里拖光标 / 拖选择手柄，走的就是落在输入框上的 touchmove。
+    // 一起拦掉的话「双击选词、长按全选」还能用（不需要拖），但拖不动光标——聊天输入栏、
+    // 记忆宫殿编辑框这些不在 .overflow-y-auto 里（宫殿那边用的是内联 overflowY，选择器也命中不了）
+    // 的输入框全中招。放行的只是输入框内部的一段拖动，外层滚动照样锁着。
     const handleTouchMove = (event: TouchEvent) => {
         if (!document.body.classList.contains('ios-keyboard-open')) return;
         const target = event.target as Element | null;
+        if (isTextEntryElement(target)) return;
+        if (target?.closest('[contenteditable="true"], [contenteditable=""]')) return;
         if (target?.closest('.overflow-y-auto')) return;
         event.preventDefault();
     };
