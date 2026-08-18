@@ -143,3 +143,89 @@ describe('iOS 全屏 PWA 键盘态', () => {
         expect(appHeight()).toBe(`${SCREEN_H + SAFE_BOTTOM}px`);
     });
 });
+
+/**
+ * 键盘态会把非可滚区的 touchmove 全部 preventDefault，防 iOS 把整页顶飞。
+ * 但「在输入框里拖光标」走的也是落在输入框上的 touchmove——一起拦掉之后，
+ * 双击选词、长按全选还在（不需要拖），光标却拖不动了。
+ */
+describe('键盘态 touchmove 锁：输入框内的拖动要放行', () => {
+    beforeEach(() => {
+        document.body.className = '';
+        document.body.innerHTML = '';
+        document.documentElement.removeAttribute('style');
+        setupIOSStandalone();
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    /** 进键盘态后在 el 上发一个可取消的 touchmove，返回是否被拦下。 */
+    const touchMoveBlocked = (el: Element): boolean => {
+        const event = new Event('touchmove', { bubbles: true, cancelable: true });
+        el.dispatchEvent(event);
+        return event.defaultPrevented;
+    };
+
+    const enterKeyboardMode = async () => {
+        await install();
+        focusTextarea().remove();          // 只为触发一次重算，元素本身不参与用例
+        emitViewportResize(SCREEN_H - KEYBOARD_H);
+        expect(inKeyboardMode()).toBe(true);
+    };
+
+    it('聊天输入栏这类不在可滚区里的 textarea：拖动放行', async () => {
+        await enterKeyboardMode();
+        const textarea = document.createElement('textarea');
+        document.body.appendChild(textarea);
+
+        expect(touchMoveBlocked(textarea)).toBe(false);
+    });
+
+    it('记忆宫殿那种内联 overflowY 的编辑框（选择器命中不了）：拖动同样放行', async () => {
+        await enterKeyboardMode();
+        const panel = document.createElement('div');
+        panel.style.overflowY = 'auto';    // 内联样式，不是 .overflow-y-auto 类
+        const textarea = document.createElement('textarea');
+        panel.appendChild(textarea);
+        document.body.appendChild(panel);
+
+        expect(touchMoveBlocked(textarea)).toBe(false);
+    });
+
+    it('单行 input 和 contenteditable 一样放行', async () => {
+        await enterKeyboardMode();
+        const input = document.createElement('input');
+        const editable = document.createElement('div');
+        editable.setAttribute('contenteditable', 'true');
+        const span = document.createElement('span');   // 拖动可能落在子节点上
+        editable.appendChild(span);
+        document.body.append(input, editable);
+
+        expect(touchMoveBlocked(input)).toBe(false);
+        expect(touchMoveBlocked(span)).toBe(false);
+    });
+
+    it('输入框以外仍然锁死，可滚区仍然放行', async () => {
+        await enterKeyboardMode();
+        const plain = document.createElement('div');
+        const scroller = document.createElement('div');
+        scroller.className = 'overflow-y-auto';
+        const row = document.createElement('div');
+        scroller.appendChild(row);
+        document.body.append(plain, scroller);
+
+        expect(touchMoveBlocked(plain)).toBe(true);
+        expect(touchMoveBlocked(row)).toBe(false);
+    });
+
+    it('没进键盘态时一律不拦', async () => {
+        await install();
+        const plain = document.createElement('div');
+        document.body.appendChild(plain);
+
+        expect(inKeyboardMode()).toBe(false);
+        expect(touchMoveBlocked(plain)).toBe(false);
+    });
+});

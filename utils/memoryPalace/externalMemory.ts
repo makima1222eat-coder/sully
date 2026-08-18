@@ -11,6 +11,7 @@
 import type { MemoryNode, MemoryRoom } from './types';
 import type { LightLLMConfig } from './pipeline';
 import { safeFetchJson } from '../safeApi';
+import { buildUserPronounRule } from './userPronoun';
 
 export const EXTERNAL_MEMORY_MAX_CHARS = 50_000;
 export const EXTERNAL_MEMORY_CHUNK_CHARS = 10_000;
@@ -115,6 +116,7 @@ B. Migrate the source losslessly: organize only time and structure without compr
    - First-person language inside quoted dialogue belongs to the original speaker. Translate the dialogue faithfully but never replace its "I" with the memory owner.
    - If a fragment has no speaker label and a pronoun cannot be resolved reliably, retain the original form of address or pronoun in faithful English and do not invent a relationship.
    Example: if the source is labeled "${userLabel}: I took the doll outside," write "${userLabel} took the doll outside," not "I took the doll outside." Only a source labeled "${charName}: I did not dare ask" may become "I did not dare ask."
+   ${buildUserPronounRule(userLabel)} This is a rewriting rule for pronouns only; it never overrides the identity evidence above, and it never changes who did what.
 4. The 1,500-character guidance is only a splitting cue for one content value, not a compression target. If an event is too long, split it continuously at natural paragraph boundaries and carry every detail forward. Never delete, abbreviate, or truncate to meet a length target.
 5. Set date to the event's actual date in YYYY-MM-DD format. If the source gives only a month, use YYYY-MM; if only a year, use YYYY; if completely uncertain, use null. Never guess a date.
 6. Assign room by the memory's subject and purpose; do not put something in attic merely because it is negative:

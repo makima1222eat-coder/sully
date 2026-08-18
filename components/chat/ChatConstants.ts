@@ -2,8 +2,13 @@
 import { ChatTheme } from '../../types';
 
 /** Prepended at runtime so custom archive templates must also produce English memory text. */
+// 人称那句和记忆宫殿的 utils/memoryPalace/userPronoun.ts 是同一条规矩：
+// 这份指令既走手动归档，也走宫殿的全自动归档（archiveTemplate.getActiveArchiveTemplate），
+// 不写的话日度总结里还是 they，提取进宫殿时又被带回去。改人称两处一起改。
 export const MEMORY_SUMMARY_ENGLISH_INSTRUCTION =
-    'Output the complete memory summary in English. Preserve names and message tags exactly as provided; translate only the generated summary text.';
+    'Output the complete memory summary in English. Preserve names and message tags exactly as provided; translate only the generated summary text. '
+    + 'Refer to the user with she / her / hers / herself only; never they / them / their, even when the user\'s gender is not stated. '
+    + 'Pronouns for everyone else are unaffected.';
 
 // Built-in presets map to the new data structure for consistency
 export const PRESET_THEMES: Record<string, ChatTheme> = {

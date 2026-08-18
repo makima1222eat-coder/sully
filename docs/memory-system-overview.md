@@ -74,6 +74,13 @@
 #### Step 2 — LLM 提取记忆（extraction.ts）
 
 - 以角色第一人称视角叙事，用户称"TA"
+- **用户人称统一 she/her**：提示词改英文之后，LLM 拿不到性别线索会默认用 they 兜底，
+  同一个人在不同批次里 she / they 混着出现。规则统一放在
+  [`utils/memoryPalace/userPronoun.ts`](../utils/memoryPalace/userPronoun.ts)，
+  由 extraction / migration / groupExtraction / eventBoxCompression / digestion /
+  roomPlates / externalMemory / memoryRepair 八处提示词共用；日度总结那半段在
+  `MEMORY_SUMMARY_ENGLISH_INSTRUCTION`（components/chat/ChatConstants.ts）里，
+  **换人称两处一起改**。只约束用户，第三方保持原文称呼
 - LLM 输出 JSON 数组，每条含：
   - `content`：第三人称叙事
   - `room`：分配到哪个房间
@@ -129,6 +136,23 @@
 抢救；输出正文相对原批次明显缩水时也会拒绝。格式/完整性失败会自动重试
 一次，仍失败则整次不入库并保留输入，避免出现“前几批成功、后几批丢失”
 的半份搬家。
+
+#### 手动新建单条记忆
+
+补一件管线没收进来的事（线下发生的、别处聊的、想直接塞给角色的设定），
+不用等缓冲攒够也不用走搬家：**房间列表 / 全部记忆 → 写一条**，填正文、房间、
+情绪、重要性、标签和发生日期，存下即入库。
+
+落地在 `createManualMemoryNode`（vectorStore.ts），和提取管线的两点不同：
+
+- **不去重**：手写的这条就是要它进去。走语义去重的话，和已有记忆撞了会被静默跳过，
+  界面上却是"保存成功"，变成一条查无此人的记忆
+- **建链只走规则不调 LLM**：时间/情绪链够把它挂进现有网络；建链失败不回滚，
+  记忆本身已经存住了
+
+发生日期落到当天 12:00（和提取管线里 LLM 写的 date 一个口径），补录旧事往回调即可；
+时近性打分和时间线都看这个日期。`origin` 标 `system`，和提取（extraction）、
+消化（digestion）产物区分开。需要 Embedding API——没配的话表单里会提示，保存键置灰。
 
 ### 三、检索逻辑（Retrieval Pipeline）
 

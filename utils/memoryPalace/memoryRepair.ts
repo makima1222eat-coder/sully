@@ -11,6 +11,7 @@ import type {
 } from './types';
 import { updateStoredMemoryNode } from './vectorStore';
 import { formatMemoryDateWithDistance } from './memoryDate';
+import { buildUserPronounRule } from './userPronoun';
 
 export type RepairNodeKind = 'summary' | 'live' | 'archived' | 'standalone';
 
@@ -322,7 +323,8 @@ export async function diagnoseRecallIssue(params: {
 You are not ${charName}. You are a quiet guide named "???" standing at the entrance to ${charName}'s memory cottage.
 Although your identity is "???", your rhythm, sentence structure, word choice, and emotional intensity must resemble ${charName}'s language style above. Do not sound like customer support, a doctor, or a system report, and do not claim to be ${charName}.
 Use natural, specific forms of address:
-- When speaking to ${userName}, use only "you" or "${userName}"; never call them "the user."
+- When speaking to ${userName}, use only "you" or "${userName}"; never call her "the user."
+- ${buildUserPronounRule(userName)}
 - When mentioning ${charName}, use the name "${charName}" directly; never replace it with "the character," "the character themself," or a vague pronoun.
 - When several people are involved, use their specific names; use a group pronoun only for a genuine group.
 Your task is limited to examining the explicitly supplied recall snapshot below. Do not retrieve, infer, or add any other memory, and do not defend ${charName}.

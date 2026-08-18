@@ -11,6 +11,7 @@ import type { LightLLMConfig } from './pipeline';
 import { safeFetchJson } from '../safeApi';
 import { safeParseJsonArray } from './jsonUtils';
 import { formatMessageForPrompt } from '../messageFormat';
+import { buildUserPronounRule } from './userPronoun';
 
 function generateId(): string {
     return `mn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -31,16 +32,18 @@ function buildRulesBlock(charName: string, userLabel: string): string {
 
 1. **First-person narration**: Record each memory from ${charName}'s perspective using "I". Address the user directly as "${userLabel}". Preserve the complete course of the event rather than dropping its beginning or ending. Write every generated memory, tag, event name, correction note, and other natural-language output in English.
    Examples:
-   - "${userLabel} worked late today without eating, so I told ${userLabel} not to neglect themself and ordered some food."
+   - "${userLabel} worked late today without eating, so I told ${userLabel} not to neglect herself and ordered some food."
    - "After three straight weeks of overtime, ${userLabel} finally spoke to the manager, who responded reasonably well. On the way back, ${userLabel} cried against my shoulder; I said nothing and simply stayed close."
-   - "I taught ${userLabel} recursion. At first ${userLabel} could not understand it, but the moment it clicked and their eyes lit up made me happy."
+   - "I taught ${userLabel} recursion. At first ${userLabel} could not understand it, but the moment it clicked and her eyes lit up made me happy."
 
-2. **Use importance to control length**:
+2. ${buildUserPronounRule(userLabel)}
+
+3. **Use importance to control length**:
    - Importance 1-5: 15-50 English words, primarily factual.
    - Importance 6-7: 60-120 English words, including my feelings.
    - Importance 8-10: 100-200 English words, with a complete narrative (cause → event → my feelings/reaction).
 
-3. **Room assignment** (anything involving ${userLabel}'s family, friends, colleagues, or other interpersonal relationships must go to user_room, even if it is only one specific event):
+4. **Room assignment** (anything involving ${userLabel}'s family, friends, colleagues, or other interpersonal relationships must go to user_room, even if it is only one specific event):
    - living_room: Pure everyday trivia with neither important relationships nor deep emotion, such as weather, food, or a passing complaint.
    - bedroom: Intimacy, deep bonds, and moving moments between ${userLabel} and me.
    - study: Work, learning, skills, and career matters.
@@ -49,17 +52,17 @@ function buildRulesBlock(charName: string, userLabel: string): string {
    - attic: Unresolved conflict, confusion, or harm.
    - windowsill: My hopes, our goals, and aspirations for the future.
 
-4. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
-5. **Emotion coordinates** (valence, arousal): Provide two-dimensional emotion coordinates in addition to mood.
+5. **Mood**: happy, sad, angry, anxious, tender, excited, peaceful, confused, hurt, grateful, nostalgic, neutral.
+6. **Emotion coordinates** (valence, arousal): Provide two-dimensional emotion coordinates in addition to mood.
    - valence: -1 (extreme pain) → +1 (extreme pleasure).
    - arousal: -1 (extreme calm) → +1 (extreme intensity).
    Reference values: happy ≈ (0.7, 0.5), peaceful ≈ (0.5, -0.6), dejected ≈ (-0.5, -0.4), anxious ≈ (-0.6, 0.7), angry ≈ (-0.7, 0.8).
-6. **Tags**: Extract 2-5 English keyword tags.
-7. **Do not miss important memories, but do not turn every sentence into one**. A topic box normally yields 1-5 memories.
-8. **Temporary pinning** (optional pinDays): If a memory contains time-sensitive information that must remain salient in the near term, set 1-30 pin days. While pinned, it will be recalled in every conversation. Appropriate examples:
+7. **Tags**: Extract 2-5 English keyword tags.
+8. **Do not miss important memories, but do not turn every sentence into one**. A topic box normally yields 1-5 memories.
+9. **Temporary pinning** (optional pinDays): If a memory contains time-sensitive information that must remain salient in the near term, set 1-30 pin days. While pinned, it will be recalled in every conversation. Appropriate examples:
    - Time-bounded status: "${userLabel} is traveling for work this week" → pinDays: 7.
    - Near-term event: "${userLabel} has an exam the day after tomorrow" → pinDays: 3.
-   - Temporary request: "${userLabel} asked me to remind them to drink water for the next few days" → pinDays: 5.
+   - Temporary request: "${userLabel} asked me to remind her to drink water for the next few days" → pinDays: 5.
    - Health status: "${userLabel} has a cold" → pinDays: 5.
    Do not pin stable long-term facts, past events, or emotional memories. Most memories do not need pinning.
 

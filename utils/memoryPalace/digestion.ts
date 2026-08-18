@@ -31,6 +31,7 @@ import { PLATE_ROOMS } from './types';
 import { fulfillAnticipation, disappointAnticipation, createAnticipation } from './anticipation';
 import { vectorizeAndStore } from './vectorStore';
 import { safeFetchJson } from '../safeApi';
+import { buildUserPronounRule } from './userPronoun';
 import { safeParseJsonArray } from './jsonUtils';
 
 /** 从 localStorage 读取远程向量配置（与 pipeline.ts 同一份来源） */
@@ -274,6 +275,8 @@ ${charPersona.slice(0, 800)}
 
 You are alone, quietly reflecting on recent events. Organize the things you have not fully processed, consolidate what you know about ${userLabel}, and examine your own inner life. Write every generated reflection, insight, category, and other natural-language output entirely in English.
 
+${buildUserPronounRule(userLabel)}
+
 ## Material to Examine
 
 ${material.atticNodes.length > 0 ? `### Inner Conflicts (Attic)
@@ -322,7 +325,7 @@ For study knowledge [S*]:
 - "keep" — It remains knowledge that has not been internalized.
 
 For information about ${userLabel} [U*]:
-- "synthesize_user" — Extremely rare. Imagine writing a character card for ${userLabel}; consolidate only information that must appear on it: basic identity, broad profession, residence, family structure, significant people, or a life event major enough to shape them. Temporary states, emotional analysis, personality profiling, and everyday trivia must remain keep. Include an English category such as "Family," "Significant Person," "Identity," "Residence," or "Major Life Event," plus reflection containing the consolidated fact in at most 50 English words.
+- "synthesize_user" — Extremely rare. Imagine writing a character card for ${userLabel}; consolidate only information that must appear on it: basic identity, broad profession, residence, family structure, significant people, or a life event major enough to shape her. Temporary states, emotional analysis, personality profiling, and everyday trivia must remain keep. Include an English category such as "Family," "Significant Person," "Identity," "Residence," or "Major Life Event," plus reflection containing the consolidated fact in at most 50 English words.
 - "keep" — The normal choice when the information is an everyday detail rather than character-card-level knowledge.
 
 For self-knowledge [R*]:
