@@ -18,169 +18,42 @@
  * 定义只存在于质地的负空间里。prompt 层约束 + mergePlateEntries 兜底过滤。
  */
 
-import type { MemoryNode, PlateEntry, PlateRoom, RoomPlate } from './types';
-import {
-    PLATE_ENTRY_CAPS,
-    PLATE_ENTRY_HARD_MAX_CHARS,
-    PLATE_ENTRY_TARGET_CHARS,
-    PLATE_ROOMS,
-    PLATE_TITLES,
-} from './types';
-import { MemoryNodeDB, RoomPlateDB, plateId } from './db';
+import type { MemoryNode, PlateRoom, RoomPlate } from './types';
+import { PLATE_ROOMS, PLATE_TITLES } from './types';
+import { MemoryNodeDB, RoomPlateDB, loadOrCreatePlate, mutatePlate } from './db';
 import type { LightLLMConfig } from './pipeline';
 import { safeFetchJson } from '../safeApi';
-import { buildUserPronounRule } from './userPronoun';
-import { safeParseJsonArray } from './jsonUtils';
+import {
+    PLATE_LLM_MAX_TOKENS,
+    PLATE_LLM_TEMPERATURE,
+    PLATE_LLM_TIMEOUT_MS,
+    PLATE_USER_TURN,
+    buildPlateConsolidationPrompt,
+    mergeSubmissionsIntoEntries,
+    parsePlateLlmReply,
+} from './roomPlateCore';
 
-// ─── 基础工具 ─────────────────────────────────────────
-
-export function isPlateRoom(room: string): room is PlateRoom {
-    return (PLATE_ROOMS as string[]).includes(room);
-}
-
-function generateEntryId(): string {
-    return `pe_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-// 每个房间的条目标签前缀（与消化提示词的 U0/R0 标签习惯对齐）
-const ROOM_LABEL_PREFIX: Record<PlateRoom, string> = {
-    user_room: 'U',
-    self_room: 'R',
-    bedroom:   'B',
-    study:     'S',
-};
-
-async function loadOrCreatePlate(charId: string, room: PlateRoom): Promise<RoomPlate> {
-    const existing = await RoomPlateDB.get(charId, room);
-    if (existing) return existing;
-    return {
-        id: plateId(charId, room),
-        charId,
-        room,
-        entries: [],
-        updatedAt: Date.now(),
-        version: 0,
-    };
-}
-
-// ─── 合并逻辑（纯函数，可测） ─────────────────────────
-
-export interface PlateLLMItem {
-    room: string;
-    text: string;
-    /** 引用现有条目标签（如 "U2"）= 这是对旧条目的延续/更新，继承 firstLearnedAt */
-    basedOn?: string | null;
-    /** 2-4 字分类标签（家庭/居住/重要他人/工作/雷区/习惯…） */
-    tag?: string | null;
-}
-
-/**
- * 卧室兜底过滤：拦"给关系下定义"的条目。
- *
- * 窄匹配原则：只拦"我们(是/算是/成了)××"这种明确的命名句式，
- * 不拦定性词本身——"TA说我像她理想中的家人"是合法的质地描述。
- * 主约束在 prompt 层，这里只是最后一道窄栅栏，宁可漏过不可误杀。
- */
-const BEDROOM_LABEL_RE = /我们(?:现在|如今|已经)?(?:是|算是|成了|成为|变成)[^，。；！？]{0,8}(?:恋人|情侣|男女朋友|男朋友|女朋友|夫妻|朋友|兄妹|姐弟|家人|知己|暧昧)/;
-
-export function violatesBedroomRule(text: string): boolean {
-    return BEDROOM_LABEL_RE.test(text);
-}
-
-/**
- * 把 LLM 输出的完整新列表合并进现有门牌条目。
- *
- * - basedOn 命中现有标签 → 继承 id/firstLearnedAt，sourceCount+1，
- *   文本未变时连 updatedAt 也不动（纯保留不算更新）
- * - 无 basedOn → 新条目
- * - 现有条目未被任何输出引用且未被原样保留 → 淘汰（容量压力语义）
- * - 超长截断、卧室命名过滤、cap 裁剪
- */
-export function mergePlateEntries(
-    room: PlateRoom,
-    existing: PlateEntry[],
-    items: Array<{ text: string; basedOn?: string | null; tag?: string | null }>,
-    now: number,
-): PlateEntry[] {
-    const prefix = ROOM_LABEL_PREFIX[room];
-    const byLabel = new Map<string, PlateEntry>();
-    existing.forEach((e, i) => byLabel.set(`${prefix}${i}`, e));
-
-    const merged: PlateEntry[] = [];
-    const usedIds = new Set<string>();
-
-    for (const item of items) {
-        let text = (item.text || '').replace(/\s+/g, ' ').trim();
-        if (!text) continue;
-        if (text.length > PLATE_ENTRY_HARD_MAX_CHARS) {
-            text = text.slice(0, PLATE_ENTRY_HARD_MAX_CHARS);
-        }
-        if (room === 'bedroom' && violatesBedroomRule(text)) {
-            console.warn(`🚪 [RoomPlate] 卧室门牌拦截关系命名条目: "${text.slice(0, 40)}"`);
-            continue;
-        }
-        const tag = (item.tag || '').replace(/\s+/g, '').slice(0, 6) || undefined;
-
-        const base = item.basedOn ? byLabel.get(String(item.basedOn).trim().toUpperCase()) : undefined;
-        if (base && !usedIds.has(base.id)) {
-            usedIds.add(base.id);
-            const changed = base.text !== text;
-            merged.push({
-                ...base,
-                text,
-                tag: tag ?? base.tag,
-                updatedAt: changed ? now : base.updatedAt,
-                sourceCount: base.sourceCount + 1,
-            });
-        } else {
-            // 同文本条目已存在但 LLM 忘了标 basedOn → 按原样保留而不是当新条目重开
-            const sameText = existing.find(e => e.text === text && !usedIds.has(e.id));
-            if (sameText) {
-                usedIds.add(sameText.id);
-                merged.push({ ...sameText, tag: tag ?? sameText.tag, sourceCount: sameText.sourceCount + 1 });
-            } else {
-                merged.push({
-                    id: generateEntryId(),
-                    text,
-                    tag,
-                    firstLearnedAt: now,
-                    updatedAt: now,
-                    sourceCount: 1,
-                });
-            }
-        }
-    }
-
-    return merged.slice(0, PLATE_ENTRY_CAPS[room]);
-}
+// 提示词拼装、回复解析、合并语义都搬进 roomPlateCore 了——浏览器和 amsg worker
+// 共用同一份，各写一份会让同一批材料在两条路上整理出不一样的门牌。这里只留
+// 「读库 → 调用 → 落库」的编排。原有导出原样转发，调用方与单测不受影响。
+export {
+    isPlateRoom,
+    mergePlateEntries,
+    parseSubmissionLine,
+    violatesBedroomRule,
+} from './roomPlateCore';
+export type { PlateLLMItem, PlateMaterial } from './roomPlateCore';
+import type { PlateLLMItem, PlateMaterial } from './roomPlateCore';
+import { isPlateRoom, mergePlateEntries } from './roomPlateCore';
 
 // ─── LLM 蒸馏调用 ─────────────────────────────────────
 
-const ROOM_RULES: Record<PlateRoom, string> = {
-    user_room:
-        `Imagine writing a **character card** for the other person. Only information that must appear on that card belongs here: ` +
-        `basic identity, broad profession, residence, family structure, significant people (for example, "Her friend Mei: a close university roommate"), ` +
-        `core facts established through long-term interaction, and life events major enough to shape the person, such as bereavement or emigrating. ` +
-        `The threshold is extremely high; prefer omission over clutter. Exclude temporary states, emotional analysis, personality profiling, and ongoing events without conclusions.`,
-    self_room:
-        `Stable knowledge about **myself**: who I am, my underlying disposition, important changes, and insights I have internalized. Exclude opinions about other people.`,
-    bedroom:
-        `The **texture** of our relationship: shared habits and rituals, private jokes, unspoken understanding, and real but uncertain feelings. ` +
-        `Hard rule: never name or classify the relationship. Do not write definitions such as "we are lovers, partners, friends, or family." ` +
-        `Describe only observable patterns and feelings; uncertainty itself may be retained, for example, "I cannot define us, but I am the first person she seeks when she is hurting."`,
-    study:
-        `My domains: what I can do, what I am learning, and what we study together. Retain accumulated knowledge, not one-off topics.`,
-};
-
-interface PlateMaterial {
-    room: PlateRoom;
-    /** 蒸馏原料：盒子 summary 或高价值记忆节点的内容 */
-    lines: string[];
-}
-
 /**
- * 一次 LLM 调用整理若干房间的门牌。
+ * 一次 LLM 调用整理若干房间的门牌（浏览器侧那条路）。
  * 输入：每房间的现有条目（带标签）+ 新原料；输出：每房间完整的新条目列表。
+ *
+ * 请求仍走 safeFetchJson——那份带着「设置 → API 调用记录」的埋点，是浏览器侧的东西。
+ * 提示词与解析共用 roomPlateCore，跟云端那条路一字不差。
  */
 async function callPlateLLM(
     charName: string,
@@ -190,57 +63,13 @@ async function callPlateLLM(
     llmConfig: LightLLMConfig,
     identityContext: string,
 ): Promise<PlateLLMItem[]> {
-    const materialByRoom = new Map(materials.map(m => [m.room, m.lines]));
-    const promptTitles: Record<PlateRoom, string> = {
-        user_room: `Facts About ${userName}`,
-        self_room: 'Who I Am',
-        bedroom: 'Between Us',
-        study: 'My Domains',
-    };
-
-    const roomBlocks = plates.map(plate => {
-        const prefix = ROOM_LABEL_PREFIX[plate.room];
-        const title = promptTitles[plate.room];
-        const existingBlock = plate.entries.length > 0
-            ? plate.entries.map((e, i) => `[${prefix}${i}] ${e.text}`).join('\n')
-            : '(No entries yet)';
-        const lines = materialByRoom.get(plate.room) || [];
-        const materialBlock = lines.length > 0
-            ? lines.map(l => `- ${l}`).join('\n')
-            : '(No new material this round; organize the existing entries only)';
-        return `## Plate "${title}" (room: ${plate.room}; maximum ${PLATE_ENTRY_CAPS[plate.room]} entries)
-Scope: ${ROOM_RULES[plate.room]}
-
-Existing entries:
-${existingBlock}
-
-New material (recent experiences or conclusions from which to distill lasting knowledge):
-${materialBlock}`;
-    }).join('\n\n');
-
-    const systemPrompt = `${identityContext ? `${identityContext}
----
-
-` : ''}You are ${charName}, and ${userName} is the person who shares your daily life. All material below comes from memories of your time together.
-
-You are alone, quietly organizing your background knowledge: things you know without deliberate recall about ${userName}, yourself, and the space between you.
-
-**Identity check**: "Facts About ${userName}" contains only facts about ${userName}; "Who I Am" contains only facts about you (${charName}). Never swap identities. In the material, "I" means you and "TA/${userName}" means the other person.
-
-Each plate below contains existing entries and new material. Output the complete new entry list for every plate. Write every generated text and tag entirely in English, even when source material is in another language.
-
-1. **Merge rather than append**: To retain an existing entry, output it again and cite its label in basedOn. An omitted entry is discarded. If a fact changed, rewrite it and cite the old entry in basedOn.
-2. **Retain only settled knowledge**: A plate holds stable knowledge that remains true across time. Exclude temporary states and ongoing situations without conclusions.
-3. **Keep each entry within ${PLATE_ENTRY_TARGET_CHARS} characters**. Write a gist rather than a narrative; do not include dates or phrases such as "I remember."
-4. **Respect each plate's entry cap**. When space is limited, keep the most important items; deliberate omission is expected.
-5. Give every entry a short English **tag** of 1-3 words, such as Family, Residence, Significant Person, Work, Boundary, Habit, Personality, Promise, Understanding, or Skill.
-6. ${buildUserPronounRule(userName)}
-7. Address ${userName} directly by name. Do not place an unescaped ASCII double quote inside entry text; use curly quotation marks or single quotes for quotations.
-
-${roomBlocks}
-
-Return a strict JSON array. Even an unchanged plate must output every entry it retains:
-[{"room": "user_room", "text": "...", "basedOn": "U0", "tag": "Family"}, {"room": "bedroom", "text": "...", "basedOn": null, "tag": "Understanding"}]`;
+    const systemPrompt = buildPlateConsolidationPrompt({
+        charName,
+        userName,
+        identityContext,
+        plates: plates.map(p => ({ room: p.room, entries: p.entries.map(e => e.text) })),
+        materials,
+    });
 
     const data = await safeFetchJson(
         `${llmConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`,
@@ -254,72 +83,54 @@ Return a strict JSON array. Even an unchanged plate must output every entry it r
                 model: llmConfig.model,
                 messages: [
                     { role: 'system', content: systemPrompt },
-                    { role: 'user', content: 'Begin organizing the plates.' },
+                    { role: 'user', content: PLATE_USER_TURN },
                 ],
-                temperature: 0.3,
-                max_tokens: 8000,
+                temperature: PLATE_LLM_TEMPERATURE,
+                max_tokens: PLATE_LLM_MAX_TOKENS,
                 stream: false,
             }),
         },
-        2, 120_000, { appName: '记忆宫殿', purpose: '门牌整理' }
+        2, PLATE_LLM_TIMEOUT_MS, { appName: '记忆宫殿', purpose: '门牌整理' }
     );
 
-    const reply = data.choices?.[0]?.message?.content || '';
-    return safeParseJsonArray(reply)
-        .filter(item => item && typeof item.text === 'string' && isPlateRoom(item.room)) as PlateLLMItem[];
+    return parsePlateLlmReply(data.choices?.[0]?.message?.content || '');
 }
 
 /**
- * 解析消化提交的候选行："[家庭] 父母离异……" → { tag: '家庭', text: '父母离异……' }。
- * 无前缀则整行作 text。
- */
-export function parseSubmissionLine(line: string): { text: string; tag?: string } {
-    const m = /^\s*[\[【]([^\]】]{1,6})[\]】]\s*(.+)$/s.exec(line || '');
-    if (m) return { tag: m[1].trim(), text: m[2].trim() };
-    return { text: (line || '').trim() };
-}
-
-/**
- * 送达保证兜底：LLM 整理没跑成（报错/输出解析为空）时，把消化刚提交的候选
- * **机械并入**门牌——同文本去重、容量上限、卧室命名过滤照常，不做改写重排。
- * 没有这一步，候选会静默蒸发：消化日志记着"已提交"，门牌上却什么都没有
- * （提交的源节点已打 digestedAt，不会再来第二次）。下轮整理 LLM 会重排这些条目。
+ * 送达保证兜底：把消化刚提交的候选**机械并入**门牌——同文本去重、容量上限、
+ * 卧室命名过滤照常，不做改写重排。没有这一步，候选会静默蒸发：消化日志记着"已提交"，
+ * 门牌上却什么都没有（提交的源节点已打 digestedAt，不会再来第二次）。
+ * 下轮整理 LLM 会重排这些条目。
+ *
+ * 两条路都用它，但时机不同，所以 `why` 要说清是哪一种，别让日志误报：
+ * 本地那条路是 LLM 整理没跑成（报错/输出解析为空）之后才兜底；
+ * 上云那条路是**提交之前**先并进去保底——那时整理还没开始，什么都没失败。
  */
 async function fallbackMergeSubmissions(
     plates: RoomPlate[],
     submissions: Partial<Record<PlateRoom, string[]>>,
     now: number,
+    why: string = 'LLM 整理未跑成',
 ): Promise<PlateRoom[]> {
     const updated: PlateRoom[] = [];
     for (const plate of plates) {
         const lines = submissions[plate.room];
         if (!lines || lines.length === 0) continue;
-        const seen = new Set(plate.entries.map(e => e.text));
-        let added = 0;
-        for (const line of lines) {
-            if (plate.entries.length >= PLATE_ENTRY_CAPS[plate.room]) break;
-            const { text: rawText, tag } = parseSubmissionLine(line);
-            const text = rawText.replace(/\s+/g, ' ').trim().slice(0, PLATE_ENTRY_HARD_MAX_CHARS);
-            if (!text || seen.has(text)) continue;
-            if (plate.room === 'bedroom' && violatesBedroomRule(text)) continue;
-            seen.add(text);
-            plate.entries.push({
-                id: generateEntryId(),
-                text,
-                tag,
-                firstLearnedAt: now,
-                updatedAt: now,
-                sourceCount: 1,
-            });
-            added++;
-        }
-        if (added > 0) {
-            plate.updatedAt = now;
-            plate.version += 1;
-            await RoomPlateDB.save(plate);
-            updated.push(plate.room);
-            console.warn(`🚪 [RoomPlate] 兜底并入「${PLATE_TITLES[plate.room]}」${added} 条候选（LLM 整理未跑成）`);
-        }
+        const before = plate.entries.length;
+        // 走 mutatePlate：这块门牌上还有别的路在写（云端结果落地、门牌面板的手改），
+        // 拿手上这份改完整块存回去就是把中间那次更新原地抹掉。
+        const saved = await mutatePlate(plate.charId, plate.room, fresh => {
+            const merged = mergeSubmissionsIntoEntries(fresh.room, fresh.entries, lines, now);
+            return merged ? { ...fresh, entries: merged, updatedAt: now, version: fresh.version + 1 } : null;
+        });
+        if (!saved) continue;
+        // 手上这份也要跟着换成落库后的那份：调用方随后拿 plates 当快照交给云端 / 交给
+        // 本地 LLM，留着并入之前那份的话，这批刚保底的候选在 LLM 眼里压根不存在。
+        plate.entries = saved.entries;
+        plate.updatedAt = saved.updatedAt;
+        plate.version = saved.version;
+        updated.push(plate.room);
+        console.warn(`🚪 [RoomPlate] 兜底并入「${PLATE_TITLES[plate.room]}」${saved.entries.length - before} 条候选（${why}）`);
     }
     return updated;
 }
@@ -330,6 +141,9 @@ async function fallbackMergeSubmissions(
  * LLM 输出里**一个条目都没提到的房间**跳过保存——区分"LLM 决定清空"
  * 和"LLM 忘了这个房间/输出被截断"，宁可保守不动，等下轮消化再整理。
  * LLM 整体失败/输出为空时，prioritySubmissions（消化刚提交的候选）走机械兜底并入。
+ *
+ * `preferCloud` 的那条路见 roomPlateCloud.ts：整理交给用户自己的 CF Worker 跑，
+ * 页面关着也能跑完，结果晚点回来再合并落库。交不出去就原地退回本地跑。
  */
 async function consolidatePlates(
     charId: string,
@@ -338,8 +152,15 @@ async function consolidatePlates(
     materials: PlateMaterial[],
     llmConfig: LightLLMConfig,
     prioritySubmissions?: Partial<Record<PlateRoom, string[]>>,
-): Promise<{ updated: PlateRoom[] }> {
+    preferCloud = false,
+): Promise<{ updated: PlateRoom[]; cloudPending?: boolean }> {
     const rooms = materials.map(m => m.room);
+    // 快照时刻要在**读之前**取。读完门牌之后还要拼身份上下文、过一遍能不能交云端那几道门
+    // （其中一道要发请求）、把消化刚提交的候选先保底并进去，才轮到提交；这一段少则几百
+    // 毫秒、多则好几秒，期间用户在门牌面板上改的字 LLM 是看不到的。取在读之后（更别说
+    // 取在提交那一刻）就会把这段时间的编辑漏判成「LLM 见过」，一份陈旧结果回来把用户刚
+    // 敲的字原样盖回去。宁可反过来错——顶多丢掉整理结果对那一条的改写。
+    const snapshotAt = Date.now();
     const plates = await Promise.all(rooms.map(r => loadOrCreatePlate(charId, r)));
 
     const hasMaterial = materials.some(m => m.lines.length > 0);
@@ -347,6 +168,10 @@ async function consolidatePlates(
     if (!hasMaterial && !hasEntries) {
         return { updated: [] };
     }
+
+    /** 交云端失败之前，送达保证已经当场并入的房间。退回本地跑也要连它们一起报。 */
+    let cloudRescued: PlateRoom[] = [];
+    const withRescued = (updated: PlateRoom[]) => ({ updated: [...new Set([...cloudRescued, ...updated])] });
 
     // 身份上下文：直接走 ContextBuilder.buildCoreContext(char, user, false)——
     // 与全 App 统一的人设口径（身份/核心指令/世界观/用户画像/印象/核心记忆），不重复造轮子。
@@ -362,6 +187,17 @@ async function consolidatePlates(
         if (profile && up) identityContext = ContextBuilder.buildCoreContext(profile, up, false);
     } catch { /* 拿不到就裸跑，prompt 里仍有名字与身份确认段 */ }
 
+    if (preferCloud) {
+        const cloud = await tryCloudConsolidation({
+            charId, charName, userName, identityContext, plates, materials, llmConfig, prioritySubmissions, snapshotAt,
+        });
+        if (cloud.handled) return { updated: cloud.updated, cloudPending: cloud.pending };
+        // 交不出去（没配 worker / 副 API 缺字段 / 服务端答复了不行）→ 原地退回本地跑。
+        // plates 可能已经被上面的送达保证并入过候选，本地这轮拿到的就是并入后的那份，
+        // LLM 的完整新列表照常覆盖它。
+        cloudRescued = cloud.rescued;
+    }
+
     let items: PlateLLMItem[] = [];
     try {
         items = await callPlateLLM(charName, userName, plates, materials, llmConfig, identityContext);
@@ -371,9 +207,9 @@ async function consolidatePlates(
     if (items.length === 0) {
         console.warn(`🚪 [RoomPlate] LLM 未返回有效条目，门牌保持不动`);
         if (prioritySubmissions) {
-            return { updated: await fallbackMergeSubmissions(plates, prioritySubmissions, Date.now()) };
+            return withRescued(await fallbackMergeSubmissions(plates, prioritySubmissions, Date.now()));
         }
-        return { updated: [] };
+        return withRescued([]);
     }
 
     const now = Date.now();
@@ -382,13 +218,19 @@ async function consolidatePlates(
     for (const plate of plates) {
         const roomItems = items.filter(i => i.room === plate.room);
         if (roomItems.length === 0) { skippedPlates.push(plate); continue; }
-        const mergedEntries = mergePlateEntries(plate.room, plate.entries, roomItems, now);
-        plate.entries = mergedEntries;
-        plate.updatedAt = now;
-        plate.version += 1;
-        await RoomPlateDB.save(plate);
+        // 同上：这块门牌上还有别的路在写，落库统一走 mutatePlate 那条队。
+        const saved = await mutatePlate(plate.charId, plate.room, fresh => ({
+            ...fresh,
+            entries: mergePlateEntries(fresh.room, fresh.entries, roomItems, now),
+            updatedAt: now,
+            version: fresh.version + 1,
+        }));
+        if (!saved) continue;
+        plate.entries = saved.entries;
+        plate.updatedAt = saved.updatedAt;
+        plate.version = saved.version;
         updated.push(plate.room);
-        console.log(`🚪 [RoomPlate] 「${PLATE_TITLES[plate.room]}」v${plate.version}：${mergedEntries.length} 条`);
+        console.log(`🚪 [RoomPlate] 「${PLATE_TITLES[plate.room]}」v${saved.version}：${saved.entries.length} 条`);
     }
     // 半失败态：LLM 只给部分房间输出了条目。没被提到的房间若有本次提交的候选，
     // 同样机械兜底并入——按房间粒度保证送达。
@@ -396,7 +238,92 @@ async function consolidatePlates(
         const rescued = await fallbackMergeSubmissions(skippedPlates, prioritySubmissions, now);
         updated.push(...rescued);
     }
-    return { updated };
+    return withRescued(updated);
+}
+
+/**
+ * 交云端这一轮的三种结局。
+ *
+ * `handled: false` 那支要把 `rescued` 一起交回去：送达保证已经真的把候选并进门牌、
+ * 落库、升过版本号了。丢掉的话消化日志会说「这次一块门牌都没动」，而门牌上明明多了
+ * 几条——本地那条路末尾的兜底并入是按文本去重的，那批已经在里面了，它一条也不会再报。
+ */
+type CloudConsolidationOutcome =
+    /**
+     * 云端接手了。`pending` = **云端正有一份整理在跑、结果会晚点落地**——这一轮刚交上去
+     * 的算，上一份还没回来所以这轮没重复交的也算。它最后决定消化日志上说哪句话，问的是
+     * 「门牌等会儿还会不会动」，不是「这一轮交没交」。两者混起来的话，第二种会被写成
+     * 「⚠️ 本次提交的候选未合并进门牌（整理未跑成或未被采纳）」——而它正在用户自己的
+     * Worker 上好好跑着，几分钟后就落地。
+     */
+    | { handled: true; updated: PlateRoom[]; pending: boolean }
+    /** 交不出去，调用方退回本地跑。`rescued` 是送达保证当场并入的房间。 */
+    | { handled: false; rescued: PlateRoom[] };
+
+/**
+ * 试着把这一轮整理交给云端。云端接手了（交出去了 / 上一份还在跑）就返回 `handled: true`
+ * ——`updated` 只有送达保证当场并入的那些，整理结果要等它回来才落地；交不出去返回
+ * `handled: false`，调用方退回本地跑。
+ *
+ * **送达保证要前置**：本地那条路是「LLM 挂了才机械并入候选」，而上云之后「挂没挂」
+ * 要几分钟后才知道，候选的源节点却已经打了 digestedAt、不会再来第二次。所以改成
+ * 先并进去保底，再把并入后的门牌当快照交上去——云端整理出的完整新列表会把这批粗糙
+ * 条目改写掉，云端要是最终没回来，它们也已经在门牌上了，不会静默蒸发。
+ */
+async function tryCloudConsolidation(args: {
+    charId: string;
+    charName: string;
+    userName: string;
+    identityContext: string;
+    plates: RoomPlate[];
+    materials: PlateMaterial[];
+    llmConfig: LightLLMConfig;
+    prioritySubmissions?: Partial<Record<PlateRoom, string[]>>;
+    /** `plates` 是什么时候读的（epoch 毫秒），原样传给提交侧记进在飞记号。 */
+    snapshotAt: number;
+}): Promise<CloudConsolidationOutcome> {
+    // 动态 import：没开主动消息 2.0 的用户不该为这条路付首屏包体。
+    // 只引这一个模块——「能不能交」那几道门也收在它里面（plateCloudGate），
+    // 判定入口分散到两处的话，改一处漏一处就是「点了灯却走本地」那种查不出来的静默分流。
+    const { plateCloudGate, readPlateJobInFlight, submitPlateConsolidation } = await import('./roomPlateCloud');
+
+    const gate = await plateCloudGate({ charId: args.charId, lightLLM: args.llmConfig });
+    if (gate === 'local') return { handled: false, rescued: [] };
+
+    const rescued = args.prioritySubmissions
+        ? await fallbackMergeSubmissions(args.plates, args.prioritySubmissions, Date.now(), '先保底再交云端整理')
+        : [];
+
+    // 上一份整理还在云端跑：这轮只做送达保证，整理本身不重复交也不退回本地——本地再全量
+    // 跑一遍会白烧一次 API，跑出来的结果还会和在飞那份互相覆盖。
+    // `pending: true` —— 云端确实有一份在跑，门牌等会儿就会动。报 false 的话，候选恰好
+    // 都已经在门牌上（送达保证按文本去重、一条都没并进去）的那次消化，日志上会写成
+    // 「整理未跑成」。
+    if (gate === 'skip') return { handled: true, updated: rescued, pending: true };
+
+    try {
+        await submitPlateConsolidation({
+            charId: args.charId,
+            charName: args.charName,
+            userName: args.userName,
+            identityContext: args.identityContext,
+            plates: args.plates,
+            materials: args.materials,
+            lightLLM: args.llmConfig,
+            snapshotAt: args.snapshotAt,
+        });
+        return { handled: true, updated: rescued, pending: true };
+    } catch (e: any) {
+        // 在飞记号还在 = 请求发出去了却没等到答复，任务可能已经在云端建起来了（提交那侧
+        // 只在「服务端答复了不行」时才收记号）。这时候退回本地全量跑一遍，就是拿同一份
+        // 快照烧两次 API，两份结果还先后落地互相盖。宁可这轮不整理，等它回来。
+        if (readPlateJobInFlight(args.charId)) {
+            console.warn(`🚪 [RoomPlate] 交云端整理没等到答复，任务可能已经建起来了，这轮不退回本地: ${e?.message || e}`);
+            return { handled: true, updated: rescued, pending: true };
+        }
+        console.warn(`🚪 [RoomPlate] 交云端整理失败，退回本地跑: ${e?.message || e}`);
+        return { handled: false, rescued };
+    }
 }
 
 // ─── 触发点 1：EventBox 压缩/封盒 → 增量合并 ─────────
@@ -471,7 +398,7 @@ export async function consolidateAllPlates(
     llmConfig: LightLLMConfig,
     extraMaterial?: Partial<Record<PlateRoom, string[]>>,
     sinceTs: number = 0,
-): Promise<{ updated: PlateRoom[] }> {
+): Promise<{ updated: PlateRoom[]; cloudPending?: boolean }> {
     const allNodes = await MemoryNodeDB.getByCharId(charId);
     const materials: PlateMaterial[] = PLATE_ROOMS.map(room => {
         const extra = (extraMaterial?.[room] || [])
@@ -483,8 +410,14 @@ export async function consolidateAllPlates(
             lines: [...extra, ...pickMaterialLines(allNodes, room, sinceTs)],
         };
     });
-    // extraMaterial 同时作为 prioritySubmissions 传入：LLM 整理失败时机械兜底并入，不许蒸发
-    return consolidatePlates(charId, charName, userName || '用户', materials, llmConfig, extraMaterial);
+    // extraMaterial 同时作为 prioritySubmissions 传入：LLM 整理失败时机械兜底并入，不许蒸发。
+    //
+    // 这个触发点走云端（配了主动消息 2.0 的话）：消化跑在一轮对话刚结束的时候，用户
+    // 大概率正准备切走，而四块门牌全量整理是这条链上最慢的一次调用。同一个角色同时只许
+    // 一份整理在飞（见 roomPlateCloud 的在飞记号），两份结果先后落地就是拿两份旧快照
+    // 互相盖。另外两个触发点留在本地——盒子压缩那个一轮里可能跑好几次、后一次要看到前
+    // 一次的结果；手动回填有进度条，批次之间也是串行依赖的。
+    return consolidatePlates(charId, charName, userName || '用户', materials, llmConfig, extraMaterial, true);
 }
 
 // ─── 历史回填（Bootstrap — 老用户的门牌不能从零开始） ──

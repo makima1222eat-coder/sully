@@ -26,6 +26,19 @@ vi.mock('./keepAlive', () => ({
   KeepAlive: { init: vi.fn().mockResolvedValue(undefined), reregister: vi.fn().mockResolvedValue(undefined) },
 }));
 
+// 后台任务结果的分发口：真的那份会动态 import 记忆宫殿那一整套（IndexedDB），
+// 这里只关心「补收有没有把它交出去、销账判断对不对」。
+const { resultDispatch } = vi.hoisted(() => ({
+  resultDispatch: { calls: [] as unknown[], contexts: [] as unknown[], settle: true },
+}));
+vi.mock('./amsgResults', () => ({
+  dispatchAmsgResult: vi.fn(async (payload: unknown, context?: unknown) => {
+    resultDispatch.calls.push(payload);
+    resultDispatch.contexts.push(context);
+    return resultDispatch.settle;
+  }),
+}));
+
 const { storeState } = vi.hoisted(() => ({
   storeState: {
     config: {
@@ -909,6 +922,68 @@ describe('推送丢了的补收（服务端账本）', () => {
     expect(ackNow).toEqual([messageId]);
   });
 
+  // 线上真实事故的第二半：一条回复在账本上躺了 28 小时，用户隔天开 App 时被自动补收
+  // 按「太旧了」销掉，一个字都没上屏；他后来去点「找回没收到的消息」，看到的是
+  // 「账本上没有漏收的消息——这条链路是通的」。窗口拉到两天能盖住「隔一夜 + 第二天
+  // 想起来」这个最常见的节奏，而超窗的那些必须数出来说给用户听。
+  it('窗口是两天：47 小时的补回来，49 小时的算作「拿不回来了」', async () => {
+    const fresh = 'msg-47h';
+    const stale = 'msg-49h';
+    stubOutbox([
+      entry(fresh, outboxPush(fresh), Date.now() - 47 * 3_600_000),
+      entry(stale, outboxPush(stale), Date.now() - 49 * 3_600_000),
+    ]);
+    const { written, ackNow, staleDropped } = await drainOutbox();
+    expect(written, '47 小时还在窗口内').toBe(1);
+    expect(ackNow, '49 小时的只销账').toEqual([stale]);
+    expect(staleDropped, '超窗的要数出来，界面靠它说话').toBe(1);
+  });
+
+  // 账本行躺到超龄，最常见的成因根本不是「消息丢了」，而是**消息早就送达了**：收尾那笔
+  // 销账是 fire-and-forget，用户看完随手锁屏就被掐断，账一直挂着。不核对本地就一律按
+  // 「永久拿不回来了」报的话，用户会收到一句红字说自己丢了消息——而那条消息就躺在聊天
+  // 记录里，他刚刚才看过。
+  it('超龄但本地已经有同 id 的消息 → 只补销账，不算「拿不回来了」', async () => {
+    const messageId = 'msg_task_7@1700000000000_hook_0';
+    const tooOld = Date.now() - OUTBOX_BACKFILL_MAX_AGE_MS - 1;
+    stubOutbox([entry(messageId, outboxPush(messageId), tooOld)]);
+    // 落库的每条气泡都继承 metadata.activeMsg2.messageId，核对认的就是它。
+    vi.spyOn(DB, 'getRecentMessagesByCharId').mockResolvedValue([
+      { role: 'assistant', metadata: { activeMsg2: { messageId } } },
+    ] as any);
+
+    const { written, ackNow, staleDropped } = await drainOutbox();
+
+    expect(written).toBe(0);
+    expect(ackNow, '账还是要销，不然每趟都把它捞回来').toEqual([messageId]);
+    expect(staleDropped, '消息就在聊天记录里，一条都没丢').toBe(0);
+  });
+
+  it('超龄且本地确实没有 → 照旧算「拿不回来了」', async () => {
+    const messageId = 'msg-really-lost';
+    const tooOld = Date.now() - OUTBOX_BACKFILL_MAX_AGE_MS - 1;
+    stubOutbox([entry(messageId, outboxPush(messageId), tooOld)]);
+    vi.spyOn(DB, 'getRecentMessagesByCharId').mockResolvedValue([] as any);
+
+    const { ackNow, staleDropped } = await drainOutbox();
+
+    expect(ackNow).toEqual([messageId]);
+    expect(staleDropped).toBe(1);
+  });
+
+  // staleDropped 只数「本该收到、现在永久拿不回来」的那一档。思维链、工具请求这些
+  // 本来就不进聊天流，销掉不损失任何东西——混进来的话，界面会把「丢了 1 条」说成
+  // 「丢了 3 条」，用户白紧张一场，真出事时也就不信这个数了。
+  it('只数超窗的那一档，不进聊天流的那几类不算「丢了」', async () => {
+    stubOutbox([
+      entry('msg-reasoning', outboxPush('msg-reasoning', { messageKind: 'reasoning' })),
+      entry('msg-tool', outboxPush('msg-tool', { messageKind: 'tool_request' })),
+    ]);
+    const { ackNow, staleDropped } = await drainOutbox();
+    expect(ackNow).toHaveLength(2);
+    expect(staleDropped).toBe(0);
+  });
+
   // 补收回来已经没有意义的那几类：思维链要挂在正文上、工具请求那头的云端早就收工了、
   // 隔了一阵子的报错弹出来只会让人摸不着头脑。但账还是要销，不然每趟都把它们捞回来。
   it.each(['reasoning', 'tool_request', 'error'])('%s 类不进聊天流，当场销账', async (kind) => {
@@ -918,6 +993,60 @@ describe('推送丢了的补收（服务端账本）', () => {
     expect(written).toBe(0);
     expect(storeState.saved).toHaveLength(0);
     expect(ackNow).toEqual([messageId]);
+  });
+
+  // 后台任务（门牌整理这类）跑完送回来的结果**只走这条路**：不弹通知的结果上游只落
+  // 账本、不发推送，所以补收是它唯一的入口。跟 reasoning/error 那批一起当场销账丢掉的
+  // 话，云端跑完的东西会一声不响地全部蒸发——面板全绿、日志干净、就是东西没了。
+  describe('后台任务的结果（messageKind: result）', () => {
+    beforeEach(() => {
+      resultDispatch.calls = [];
+      resultDispatch.contexts = [];
+      resultDispatch.settle = true;
+    });
+
+    it('交给分发口，不写进聊天流', async () => {
+      const messageId = 'msg-result';
+      const push = outboxPush(messageId, {
+        messageKind: 'result',
+        resultKind: 'plate-consolidate',
+        message: undefined,
+        items: [{ room: 'user_room', text: '小明搬去合租了' }],
+      });
+      stubOutbox([entry(messageId, push)]);
+      const { written, ackNow } = await drainOutbox();
+
+      expect(written).toBe(0);
+      expect(storeState.saved).toHaveLength(0);
+      expect(resultDispatch.calls).toEqual([push]);
+      expect(ackNow).toEqual([messageId]);
+    });
+
+    it('消化失败就不销账，下次上线再拉回来', async () => {
+      resultDispatch.settle = false;
+      const messageId = 'msg-result-retry';
+      stubOutbox([entry(messageId, outboxPush(messageId, {
+        messageKind: 'result', resultKind: 'plate-consolidate',
+      }))]);
+      const { ackNow } = await drainOutbox();
+      expect(ackNow).toEqual([]);
+    });
+
+    // 回归守卫：这条路刻意跳过了聊天那两天的时效窗（结果晚到本来就是常态），可跳过
+    // 之后没换上任何上限。账本留 28 天——重装 PWA 的用户第一次接上账本会把一个月前的结果
+    // 一次性拉回来。这里不替各种产物定规矩，但账本上记的时间必须原样交出去，认领它的
+    // 那一方才判得了「陈到不能用了没有」。
+    it('时效窗那道判断不套在结果上，但账本上记的时间要交出去', async () => {
+      const messageId = 'msg-result-old';
+      const tooOld = Date.now() - OUTBOX_BACKFILL_MAX_AGE_MS - 1;
+      stubOutbox([entry(messageId, outboxPush(messageId, {
+        messageKind: 'result', resultKind: 'plate-consolidate',
+      }), tooOld)]);
+      await drainOutbox();
+      expect(resultDispatch.calls).toHaveLength(1);
+      expect(resultDispatch.contexts[0], '不交时间的话它连「这份躺了多久」都问不出来')
+        .toEqual({ createdAt: tooOld });
+    });
   });
 
   it('情绪结果显式标成 emotion_update（冲刷管线靠它分流，认不出会当正文气泡渲染）', async () => {
@@ -1036,6 +1165,28 @@ describe('第一次接上服务端账本', () => {
     expect(written).toBe(1);
     expect(storeState.saved.map((m: any) => m.messageId)).toEqual(['m-awaited']);
     expect(ack).toHaveBeenCalledWith(['m-old']);
+  });
+
+  // 回归守卫：换设备 / 重装 PWA / 清过 localStorage 的用户，启动第一趟走的就是这条路。
+  // 后台任务的结果不进聊天流，没有「存量重放刷屏」这回事，而补收是它唯一的入口（不弹
+  // 通知的结果上游只落账本、不发推送）。跟存量一起销掉的话，云端已经跑完的门牌整理会
+  // 一声不响地蒸发，面板全绿、日志干净、就是东西没了。
+  it('后台任务的结果不算存量，照常交给分发口', async () => {
+    resultDispatch.calls = [];
+    resultDispatch.settle = true;
+    const resultEntry = {
+      ...entry('m-result', 'uuid-job'),
+      push: { messageKind: 'result', resultKind: 'plate-consolidate', messageId: 'm-result' },
+    };
+    stubOutboxOnce([entry('m-old', 'uuid-old'), resultEntry]);
+    const ack = vi.spyOn(ActiveMsgClient, 'ackOutboxMessages').mockResolvedValue(undefined);
+
+    const { ackNow } = await drainOutbox();
+
+    expect(ack, '结果不在整批销账那一批里').toHaveBeenCalledWith(['m-old']);
+    expect(resultDispatch.calls).toHaveLength(1);
+    expect(ackNow, '消化成功之后才销它自己那一条').toEqual(['m-result']);
+    expect(localStorage.getItem(AMSG_OUTBOX_ADOPTED_LS_KEY)).toBeTruthy();
   });
 
   // 先记标记再销账的话，销账一失败，剩下的存量下一趟就会被当成补收倒进聊天流。

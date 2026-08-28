@@ -10,7 +10,8 @@ const PROMPT_FILES = [
     'groupExtraction.ts',
     'eventBoxCompression.ts',
     'digestion.ts',
-    'roomPlates.ts',
+    // 门牌整理提示词已随上游重构搬进 roomPlateCore.ts（浏览器与 worker 共用）
+    'roomPlateCore.ts',
     'externalMemory.ts',
     'memoryRepair.ts',
 ];

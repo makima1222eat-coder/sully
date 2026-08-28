@@ -6,12 +6,13 @@
  */
 
 import type { Message } from '../../types';
-import type { MemoryNode, MemoryRoom } from './types';
+import type { MemoryEntity, MemoryNode, MemoryRoom } from './types';
 import type { LightLLMConfig } from './pipeline';
 import { safeFetchJson } from '../safeApi';
 import { safeParseJsonArray } from './jsonUtils';
 import { formatMessageForPrompt } from '../messageFormat';
 import { buildUserPronounRule } from './userPronoun';
+import { readRecallRuntimeSnapshot } from './trace';
 
 function generateId(): string {
     return `mn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -27,7 +28,11 @@ function generateId(): string {
 // 会让 embedding 语义轻微漂移。保持 palace 内置风格稳定，手动归档路径提供
 // 风格化的自由度——职责分离。
 
-function buildRulesBlock(charName: string, userLabel: string): string {
+function buildRulesBlock(charName: string, userLabel: string, includeEntities: boolean): string {
+    const entityRule = includeEntities
+        ? `
+   **Named entities** (entities): Separately list every person name, nickname, place, organization, project, product, account, or domain that explicitly appears in the conversation. Include proper names only — never generic references like "a friend", "he", or "that project", and never guess aliases. Format: {"name":"Mist","type":"person"} (fictional example).`
+        : '';
     return `## Rules
 
 1. **First-person narration**: Record each memory from ${charName}'s perspective using "I". Address the user directly as "${userLabel}". Preserve the complete course of the event rather than dropping its beginning or ending. Write every generated memory, tag, event name, correction note, and other natural-language output in English.
@@ -57,7 +62,7 @@ function buildRulesBlock(charName: string, userLabel: string): string {
    - valence: -1 (extreme pain) → +1 (extreme pleasure).
    - arousal: -1 (extreme calm) → +1 (extreme intensity).
    Reference values: happy ≈ (0.7, 0.5), peaceful ≈ (0.5, -0.6), dejected ≈ (-0.5, -0.4), anxious ≈ (-0.6, 0.7), angry ≈ (-0.7, 0.8).
-7. **Tags**: Extract 2-5 English keyword tags.
+7. **Tags**: Extract 2-5 English keyword tags.${entityRule}
 8. **Do not miss important memories, but do not turn every sentence into one**. A topic box normally yields 1-5 memories.
 9. **Temporary pinning** (optional pinDays): If a memory contains time-sensitive information that must remain salient in the near term, set 1-30 pin days. While pinned, it will be recalled in every conversation. Appropriate examples:
    - Time-bounded status: "${userLabel} is traveling for work this week" → pinDays: 7.
@@ -93,7 +98,7 @@ const VALID_ROOMS: MemoryRoom[] = [
 
 /** 从消息缓冲区直接解析记忆节点（不依赖 TopicBox） */
 function parseMemoryNodesFromBuffer(
-    parsed: any[], charId: string, messages: Message[], _batchLabel: string,
+    parsed: any[], charId: string, messages: Message[], _batchLabel: string, includeEntities: boolean,
 ): MemoryNode[] {
     if (parsed.length === 0) return [];
 
@@ -126,6 +131,30 @@ function parseMemoryNodesFromBuffer(
         return ts;
     };
 
+    const parseEntities = (value: unknown): MemoryEntity[] => {
+        if (!Array.isArray(value)) return [];
+        const validTypes = new Set<NonNullable<MemoryEntity['type']>>([
+            'person', 'place', 'organization', 'project', 'product', 'account', 'domain', 'other',
+        ]);
+        const seen = new Set<string>();
+        const result: MemoryEntity[] = [];
+        for (const raw of value) {
+            if (!raw || typeof raw !== 'object') continue;
+            const item = raw as Record<string, unknown>;
+            const name = typeof item.name === 'string' ? item.name.trim().slice(0, 80) : '';
+            const key = name.normalize('NFKC').toLocaleLowerCase();
+            if (name.length < 2 || !key || seen.has(key)) continue;
+            seen.add(key);
+            const entity: MemoryEntity = { name };
+            if (validTypes.has(item.type as NonNullable<MemoryEntity['type']>)) {
+                entity.type = item.type as NonNullable<MemoryEntity['type']>;
+            }
+            result.push(entity);
+            if (result.length >= 12) break;
+        }
+        return result;
+    };
+
     return parsed
         .filter(item => item.content && item.room)
         .map((item): MemoryNode => {
@@ -139,7 +168,7 @@ function parseMemoryNodesFromBuffer(
             // (v, a) 非必需：LLM 没给就不写，下游 getEmotionVA 查表兜底
             const v = typeof item.valence === 'number' ? clampVA(item.valence) : undefined;
             const a = typeof item.arousal === 'number' ? clampVA(item.arousal) : undefined;
-            return {
+            const memory: MemoryNode = {
                 id: generateId(),
                 charId,
                 content: item.content,
@@ -157,6 +186,8 @@ function parseMemoryNodesFromBuffer(
                 eventBoxId: null,  // 由 pipeline 在 binding 阶段设置
                 origin: 'extraction',
             };
+            if (includeEntities) memory.entities = parseEntities(item.entities);
+            return memory;
         });
 }
 
@@ -362,6 +393,7 @@ export async function extractMemoriesFromBuffer(
 ): Promise<BufferExtractionResult> {
     if (messages.length === 0) return { memories: [], crossTimeLinks: [], eventBoxHints: [], unpinIds: [], corrections: [] };
 
+    const includeEntities = readRecallRuntimeSnapshot().featureFlagsSnapshot.recallRouter;
     const userLabel = userName || 'the user';
     const conversationText = buildConversationText(messages, charName, userLabel);
 
@@ -391,7 +423,7 @@ export async function extractMemoriesFromBuffer(
 
     const systemPrompt = `You are ${charName}. From the conversation below, extract memories worth retaining from your first-person ("I") perspective. Write every generated natural-language value in English, even when the source conversation is in another language.${contextBlock}${relatedBlock}${pinnedBlock}
 
-${buildRulesBlock(charName, userLabel)}${relatedToRule}${unpinRule}
+${buildRulesBlock(charName, userLabel, includeEntities)}${relatedToRule}${unpinRule}
 
 ## Output Format
 
@@ -404,7 +436,8 @@ Return a strict JSON array with no Markdown wrapper:
     "mood": "neutral",
     "valence": 0,
     "arousal": 0,
-    "tags": ["tag 1", "tag 2"],
+    "tags": ["tag 1", "tag 2"],${includeEntities ? `
+    "entities": [{"name": "an explicitly mentioned proper name", "type": "person"}],` : ''}
     "date": "YYYY-MM-DD",
     "pinDays": 3${relatedToFormat}
   }
@@ -456,7 +489,7 @@ If the conversation is too trivial to contain a worthwhile memory, return an emp
         const fmt = (d: Date) => `${d.getMonth() + 1}/${d.getDate()}`;
         const batchLabel = fmt(d1) === fmt(d2) ? fmt(d1) : `${fmt(d1)}-${fmt(d2)}`;
 
-        const memories = parseMemoryNodesFromBuffer(parsed, charId, messages, batchLabel);
+        const memories = parseMemoryNodesFromBuffer(parsed, charId, messages, batchLabel, includeEntities);
 
         // 解析跨时间关联（→ EventBox 绑定信号）+ eventName/eventTags 提示
         const { crossTimeLinks, eventBoxHints } = parseRelatedToAndHints(

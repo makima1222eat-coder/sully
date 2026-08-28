@@ -85,6 +85,7 @@ export interface RealtimeConfig {
     xhsEnabled?: boolean;
     xhsMcpConfig?: {
         enabled: boolean;
+        mode?: 'local' | 'lite';
         serverUrl: string;
         cookie?: string;        // Lite 模式：登录后的完整小红书 cookie
         platform?: 'xhs' | 'rednote'; // Lite 自动识别出的国内 / 全球后端
@@ -115,6 +116,7 @@ export const defaultRealtimeConfig: RealtimeConfig = {
     xhsEnabled: false,
     xhsMcpConfig: {
         enabled: false,
+        mode: 'lite',
         serverUrl: `${getProxyWorkerUrl()}/api`,
         cookie: undefined,
         platform: undefined,

@@ -11,6 +11,7 @@ import {
   handleInstantChat,
   isInstantChatTask,
 } from './instantChat';
+import { TIME_FRAMING_CONVERSATIONAL } from '../../../utils/timeFramingNote';
 
 const USER_ID = '3637dae1-1461-4444-a747-34e406f67acc';
 const TASK_UUID = '7a1f0b4c-2c9d-4a3e-8b21-9f0f3c5d7e11';
@@ -187,6 +188,54 @@ describe('POST /instant-chat — 请求体', () => {
     expect(noTask.status).toBe(400);
     expect((await noTask.json() as any).error.code).toBe('INVALID_TASK_PAYLOAD');
     expect(calls).toHaveLength(0);
+  });
+});
+
+// 客户端在 body 超阈值时会 gzip 再发（这条路上的正文是整轮聊天，最大的一份）。
+// 这三条钉的是「解压这一步不能因为链路上有人插手就炸」——挂了的表现是所有大 body
+// 的请求统统 400 INVALID_JSON，而小 body 一切正常，从外面看像是「长消息发不出去」。
+describe('POST /instant-chat — gzip 上行', () => {
+  const gzip = async (text: string): Promise<ArrayBuffer> => {
+    const stream = new Response(new TextEncoder().encode(text)).body!
+      .pipeThrough(new CompressionStream('gzip'));
+    return new Response(stream).arrayBuffer();
+  };
+
+  const postRaw = (body: BodyInit, headers: Record<string, string> = {}) =>
+    new Request('https://w.example/instant-chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-User-Id': USER_ID, ...headers },
+      body,
+    });
+
+  it('压过的请求体解得开，转发出去的还是原来那两个信封', async () => {
+    const { upstream, calls } = makeUpstream();
+    const payload = JSON.stringify(validBody());
+    const response = await run({
+      request: postRaw(await gzip(payload), { 'Content-Encoding': 'gzip' }),
+      upstream,
+    });
+    expect(response.status).toBe(202);
+    // 信封原样搬到上游，一个字段都不能在解压途中掉（转发时信封本身就是整个 body）。
+    expect(JSON.parse(calls[0].body)).toEqual(envelope('state'));
+    expect(JSON.parse(calls[1].body)).toEqual(envelope('task'));
+  });
+
+  // 最要命的一档：`Content-Encoding` 是标准头，链路上的边缘节点会替你把请求体解开
+  // 却把头留着（SullyOS 在 instant-push 那条路上实测过）。只看头就去解压的话，
+  // 这里拿到的是明文，解压器当场抛错，用户侧是一句「请求体不是合法的 JSON」。
+  it('头写着 gzip、字节其实是明文（边缘替我们解过了）→ 照常按明文读', async () => {
+    const { upstream } = makeUpstream();
+    const response = await run({
+      request: postRaw(JSON.stringify(validBody()), { 'Content-Encoding': 'gzip' }),
+      upstream,
+    });
+    expect(response.status).toBe(202);
+  });
+
+  it('没有这个头 → 一字不差地走老路（老客户端不压）', async () => {
+    const { upstream } = makeUpstream();
+    expect((await run({ request: post(validBody()), upstream })).status).toBe(202);
   });
 });
 
@@ -538,6 +587,23 @@ describe('buildInstantTimelyBlock', () => {
     expect(block).toContain('2026年8月1日 周六 早晨 08:00');
   });
 
+  // 报时后面必须跟那句语境框定，而且跟前台聊天用的是同一份常量。少了它，深夜的那行钟
+  // 就够让角色每轮往「快睡吧、明天见」上收——本地聊天治好了、云端没治的话，同一个角色
+  // 走两条路的分寸不一样，而即时对话恰恰是主路径。
+  it('报时后面跟着语境框定，跟前台聊天同一份常量', () => {
+    const block = buildInstantTimelyBlock({ ...base, blocks: [] });
+    expect(block).toContain(TIME_FRAMING_CONVERSATIONAL);
+    // 顺序也钉住：框定必须紧跟在钟点后面（贴在注意力最强的位置才起作用）。
+    expect(block.indexOf('现在是')).toBeLessThan(block.indexOf(TIME_FRAMING_CONVERSATIONAL));
+  });
+
+  it('关了时间感知时框定也一起消失（没有钟就没有要框的东西）', () => {
+    const block = buildInstantTimelyBlock({
+      ...base, timeAwarenessEnabled: false, blocks: ['\n\n【热搜】\n- 某某'],
+    });
+    expect(block).not.toContain(TIME_FRAMING_CONVERSATIONAL);
+  });
+
   it('有时差时补一行「对方那边几点」，同时区不补（一份提示词里两个钟会打架）', () => {
     expect(buildInstantTimelyBlock({ ...base, userTzId: 'America/New_York', blocks: [] }))
       .toContain('对方所在时区参考');
@@ -579,13 +645,36 @@ describe('buildInstantTimelyBlock', () => {
 });
 
 describe('applyInstantNotificationPolicy', () => {
-  // 用户正盯着聊天窗口等这条回复，锁屏横幅在这时候弹出来纯属打扰（页面自己会把消息上屏）；
-  // 窗口不可见时又必须弹，不然「发完就自由了」这件事没人来叫他。表态写在载荷里，
-  // 真正的判定由 SW 的 shouldRenderNotification 按窗口可见性做。
-  it('标 when-hidden：前台可见时 SW 不弹系统通知，不可见照弹', () => {
+  // 订阅是按 userVisibleOnly 建的：推了却不弹，Firefox 按配额退订、iOS 过了宽限期直接
+  // 吊销，两边都静默发生。所以即时对话这条必推的路只能标 always，打扰交给折叠 + 静音压。
+  // 回到 when-hidden（或任何「有时候不弹」的档）就是把订阅重新押上去，这条守着别退回去。
+  it('标 always + 按角色折叠：推了就一定弹，不靠不弹来防打扰', () => {
     const push = applyInstantNotificationPolicy(
-      { message: 'hi', notification: { title: '来自 Nyah', body: 'hi' } });
-    expect(push.notification).toEqual({ title: '来自 Nyah', body: 'hi', show: 'when-hidden' });
+      { message: 'hi', notification: { title: '来自 Nyah', body: 'hi' } }, 'char-1', true);
+    expect(push.notification).toEqual({
+      title: '来自 Nyah', body: 'hi', show: 'always',
+      silent: 'when-visible', tag: 'amsg-instant-char-1', renotify: true,
+    });
+  });
+
+  // 静不静音是 SW 收到这条时按窗口可见性算的。写死 true 的话，切后台、锁屏收到回复
+  // 也不响——worker 发推那一刻并不知道用户在不在前台，这个判定只能推迟到 SW 去做。
+  it('静音标成 when-visible，不写死 true（写死了切后台也不响）', () => {
+    const push = applyInstantNotificationPolicy(
+      { message: 'hi', notification: { title: 't' } }, 'char-1');
+    expect((push.notification as any).silent).toBe('when-visible');
+  });
+
+  it('没显式传 charId 就从 metadata 上认', () => {
+    const push = applyInstantNotificationPolicy(
+      { message: 'hi', metadata: { charId: 'char-2' }, notification: { title: 't' } });
+    expect((push.notification as any).tag).toBe('amsg-instant-char-2');
+  });
+
+  // 折叠是为了不刷屏，但两个角色共用一个 tag 会互相顶掉——那是真丢消息，宁可多几条。
+  it('认不出角色就不折叠（tag 留空，交给库按 messageId 兜底）', () => {
+    const push = applyInstantNotificationPolicy({ message: 'hi', notification: { title: 't' } });
+    expect(push.notification).toEqual({ title: 't', show: 'always', silent: 'when-visible' });
   });
 
   it('载荷本来没有 notification 就不凭空造一个（造出来只会弹一条空白横幅）', () => {
@@ -597,6 +686,27 @@ describe('applyInstantNotificationPolicy', () => {
 
   // 信封的其余部分（messageId / sessionId / 段号 / 任务身份）全交给库去补。这里多写一份
   // 就是多一处会跟库漂掉的副本，而账本里存的本来就是库发出去的那一份。
+  // 同 tag 的通知默认是静默替换。上一轮的横幅还躺在通知栏没点掉时，新一轮的第一段
+  // 不带 renotify 就会被当成替换、不出声——用户那句「有时候响有时候不响」就是这么来的。
+  it('每一轮的第一段带 renotify，后面几段不带（一轮只响一声）', () => {
+    const first = applyInstantNotificationPolicy(
+      { message: 'hi', notification: { title: 't' } }, 'char-1', true);
+    expect((first.notification as any).renotify).toBe(true);
+
+    const rest = applyInstantNotificationPolicy(
+      { message: 'hi', notification: { title: 't' } }, 'char-1', false);
+    expect(rest.notification).not.toHaveProperty('renotify');
+  });
+
+  // renotify 为 true 而 tag 是空串时 showNotification 直接抛 TypeError，那一条就
+  // 一个字都弹不出来。认不出角色时不折叠 = 没有 tag，这时哪怕是第一段也不能带。
+  it('没有 tag 就绝不带 renotify（带了 showNotification 会抛 TypeError）', () => {
+    const push = applyInstantNotificationPolicy(
+      { message: 'hi', notification: { title: 't' } }, null, true);
+    expect(push.notification).not.toHaveProperty('tag');
+    expect(push.notification).not.toHaveProperty('renotify');
+  });
+
   it('除通知策略外一个字段都不添（正文 / metadata 原样保留）', () => {
     const push = applyInstantNotificationPolicy({ message: 'hi', metadata: { directives: [1] } });
     expect(push).toEqual({ message: 'hi', metadata: { directives: [1] } });

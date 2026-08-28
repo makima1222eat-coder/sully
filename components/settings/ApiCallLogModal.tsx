@@ -20,6 +20,7 @@ import type {
     PromptBlockStat,
 } from '../../utils/apiCallLog';
 import { trackEvent } from '../../utils/analytics';
+import { shareOrDownloadFile } from '../../utils/shareExport';
 
 interface ApiCallLogModalProps {
     isOpen: boolean;
@@ -318,7 +319,9 @@ const ApiCallLogModal: React.FC<ApiCallLogModalProps> = ({ isOpen, onClose }) =>
                                 )}
                                 {expanded && e.promptBreakdown && (
                                     <>
-                                        {e.route && (
+                                        {/* 只有聊天那条路会被云端二次加料（当前时间、天气热搜这些当下才知道的东西）。
+                                            后台活儿（门牌整理）交上去的就是最终提示词，别让用户以为还有看不见的部分 */}
+                                        {e.route === 'cloud-instant-chat' && (
                                             <p className="mt-2 text-[10px] text-slate-400 leading-relaxed">
                                                 这里统计的是本地拼好、交给云端的那份。云端真正发出前还会补上当前时间、天气热搜这些当下才知道的内容，所以实际输入会比下面略大一点。
                                             </p>
@@ -378,19 +381,16 @@ async function copyCaptureText(value: string): Promise<void> {
     textarea.remove();
 }
 
-function downloadCaptureTxt(capture: ApiRequestCapture, content: string): void {
+async function downloadCaptureTxt(capture: ApiRequestCapture, content: string): Promise<void> {
     const d = new Date(capture.capturedAt);
     const pad = (value: number) => String(value).padStart(2, '0');
     const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
-    const blob = new Blob(['\uFEFF', content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `SullyOS-LLM本次发送统计-${stamp}.txt`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+    await shareOrDownloadFile({
+        content: `\uFEFF${content}`,
+        fileName: `SullyOS-LLM本次发送统计-${stamp}.txt`,
+        mimeType: 'text/plain;charset=utf-8',
+        shareTitle: 'SullyOS LLM 本次发送统计',
+    });
 }
 
 const OneShotCapturePanel: React.FC<{
@@ -467,9 +467,9 @@ const OneShotCapturePanel: React.FC<{
             .sort((a, b) => b.chars - a.chars);
     }, [capture]);
 
-    const exportTxt = useCallback(() => {
+    const exportTxt = useCallback(async () => {
         if (!capture || !txtReport) return;
-        downloadCaptureTxt(capture, txtReport);
+        await downloadCaptureTxt(capture, txtReport);
         setCopyNotice('TXT 已导出');
         window.setTimeout(() => setCopyNotice(''), 1600);
     }, [capture, txtReport]);

@@ -89,6 +89,20 @@ export interface ScheduleCardAppearance {
   customCss?: string;
 }
 
+export type JournalAppearancePresetId =
+  | 'original'
+  | 'letterpress'
+  | 'sakura'
+  | 'forest'
+  | 'midnight';
+
+/** 交换日记 App 的全局皮肤。预设负责开箱即用，自定义 CSS 最后注入并可覆盖预设。 */
+export interface JournalAppearance {
+  preset?: JournalAppearancePresetId;
+  /** 仅允许 .sully-journal-* 作用域，避免样式影响其它 App。 */
+  customCss?: string;
+}
+
 export interface OSTheme {
   hue: number;
   saturation: number;
@@ -98,6 +112,12 @@ export interface OSTheme {
   lockWallpaper?: string;
   darkMode: boolean;
   contentColor?: string;
+  /** 冷启动时是否播放整机开机过场。默认开启（undefined 视为 true）。 */
+  bootAnimationEnabled?: boolean;
+  /** 进入聊天或切换角色时是否播放角色登场过场。默认开启。 */
+  chatCharacterSwitchAnimationEnabled?: boolean;
+  /** App 代码块加载较慢时是否显示加载柔光动画。默认开启；超时恢复页不受影响。 */
+  appLoadingAnimationEnabled?: boolean;
   /** 桌面整体皮肤。'animalcrossing' = 动森风格（NookPhone 彩色圆角图标 + 暖色界面）；
    *  'mobilegame' = 二次元手游首页风格（角色卡 + 等级经验条 + 货币栏 + 网格卡 + 罗盘 dock）；
    *  'tamagotchi' = 电子宠物养成机（桌面即角色的小屋舞台 + 四颗糖果实体键）。默认 'default'。 */
@@ -118,6 +138,8 @@ export interface OSTheme {
   nowPlayingWidgetLight?: boolean;
   /** 日程卡片统一皮肤：桌面、全屏、房间与聊天内同步。 */
   scheduleCardAppearance?: ScheduleCardAppearance;
+  /** 交换日记 App 全局皮肤与自定义 CSS。 */
+  journalAppearance?: JournalAppearance;
   desktopDecorations?: DesktopDecoration[];
   customFont?: string;
   /** 顶部时间栏布局：安全显示（安全区下方）/ 紧凑显示（嵌入安全区）/ 完全隐藏。 */
@@ -226,9 +248,8 @@ export interface VirtualTime {
 
 export type MinimaxRegion = 'domestic' | 'overseas';
 
-// 语音合成（TTS）服务商。'minimax'（默认）走 MiniMax T2A；'fishaudio' 走鱼声 Fish Audio。
-// 全局二选一：切换后所有语音场景（聊天语音条 / 约会 / 电话）统一用同一家。
-export type TtsProvider = 'minimax' | 'fishaudio';
+// 语音合成（TTS）服务商。全局三选一：切换后聊天语音条 / 约会 / 电话统一用同一家。
+export type TtsProvider = 'minimax' | 'fishaudio' | 'elevenlabs';
 
 export interface VisionApiConfig {
   /** 开启后，聊天图片先由独立视觉模型转成文字，再交给主对话模型。 */
@@ -249,15 +270,24 @@ export interface APIConfig {
   // 'overseas' → https://api.minimax.io  (海外站)
   // Missing / unknown falls back to domestic.
   minimaxRegion?: MinimaxRegion;
-  // 语音服务商二选一。缺省 → 'minimax'。
+  // 语音服务商三选一。缺省 → 'minimax'。
   ttsProvider?: TtsProvider;
   // 鱼声 Fish Audio API Key（https://fish.audio/）。仅 ttsProvider === 'fishaudio' 时使用。
   fishAudioApiKey?: string;
   // 鱼声默认模型（s2.1-pro / s2-pro / s1）。缺省 → 's2.1-pro'。
   // 角色 voiceProfile.fishModel 优先于这个全局默认。
   fishAudioModel?: string;
+  // ElevenLabs BYOK 配置。Voice ID 存在角色 voiceProfile.elevenLabsVoiceId，避免角色串音色。
+  elevenLabsApiKey?: string;
+  // 缺省使用低延迟 eleven_flash_v2_5；也支持 eleven_v3 / eleven_multilingual_v2。
+  elevenLabsModel?: string;
+  // ElevenLabs Voice Settings（请求级覆盖，不修改 ElevenLabs 控制台里的音色默认值）。
+  elevenLabsStability?: number;
+  elevenLabsSimilarityBoost?: number;
+  elevenLabsStyle?: number;
+  elevenLabsUseSpeakerBoost?: boolean;
   // 用户自定义「语音表演指南」——注入到角色 system prompt、教模型怎么写出有情绪的语音台词。
-  // minimax / fishaudio：聊天 + 电话共用，按 TTS 服务商分别存（两家标记体系不同，不能共用一份）；
+  // minimax / fishaudio / elevenlabs：聊天 + 电话共用，按 TTS 服务商分别存；
   //   留空 → 用内置默认（minimaxTts.VOICE_ACTING_GUIDE / fishAudioTts.FISH_VOICE_ACTING_GUIDE）。
   // dateVoice：见面（DateApp）专用的 [v:xxx] 语音情绪规则，与服务商无关、单独一份；
   //   留空 → 用内置默认（datePrompts.DATE_VOICE_GUIDE）。
@@ -265,6 +295,7 @@ export interface APIConfig {
   voicePrompts?: {
     minimax?: string;
     fishaudio?: string;
+    elevenlabs?: string;
     dateVoice?: string;
   };
   // Replicate token (r8_xxx) for ACE-Step song generation in 写歌 App.
@@ -381,8 +412,6 @@ export interface ActiveMsg2TaskRecord {
   promptHint?: string;
   /** 防穿帮策略；fixed 任务恒为 'force'（见 amsg2Tasks.resolveExpirePolicy）。 */
   expirePolicy: ActiveMsg2ExpirePolicy;
-  /** 排程时最后一条真实用户消息的时间戳（作废判定锚点；当时无消息为 0）。 */
-  anchorLastUserMsgAt?: number;
   source: ActiveMsg2TaskSource;
   status: ActiveMsg2TaskStatus;
   createdAt: number;
@@ -609,6 +638,30 @@ export interface MemoryPalaceBackupConfig {
     model: string;
     topN: number;
   };
+  /**
+   * 实验管线总开关。旧备份没有这一块时按全部关闭处理，确保升级后行为不突变。
+   */
+  featureFlags?: MemoryPalaceFeatureFlags;
+}
+
+export interface MemoryPalaceFeatureFlags {
+  recallRouter: boolean;
+  interactionAdaptation: boolean;
+  deepEngagement: boolean;
+  /** 预留的薄事实约束层，不属于 M3 Deep Engagement。 */
+  epistemicState: boolean;
+}
+
+/**
+ * 角色在 ChatApp 里愿意向用户当前交流步伐靠近多少。每维 0..1；这是角色属性，
+ * 不是用户状态。缺省时使用保守默认值，且不会从角色实际回复中自动学习。
+ */
+export interface CharacterAccommodationPolicy {
+  length?: number;
+  rhythm?: number;
+  energy?: number;
+  punctuation?: number;
+  emoji?: number;
 }
 
 export interface MemoryFragment {
@@ -789,6 +842,13 @@ export interface BubbleStyle {
     backgroundImage?: string;
     backgroundImageOpacity?: number;
     borderRadius: number;
+    /** 四角独立圆角；未设置的角继续跟随 borderRadius，兼容旧主题。 */
+    borderTopLeftRadius?: number;
+    borderTopRightRadius?: number;
+    borderBottomRightRadius?: number;
+    borderBottomLeftRadius?: number;
+    /** 自定义 CSS 伪元素尾巴的出现频率。旧主题缺省为 every，新建主题默认 last。 */
+    tailMode?: 'every' | 'last' | 'none';
     opacity: number;
     
     decoration?: string;
@@ -1202,6 +1262,10 @@ export interface VRWorldCharState {
      * 这是"每个角色书签不一样"的落点。
      */
     novelBookmarks?: Record<string, number>;
+    /** 用户为该角色圈定的优先书单。为空时从全书库自动轮换。 */
+    preferredNovelIds?: string[];
+    /** 上一次图书馆活动选中的小说，用于有其它候选时避免连续读同一本。 */
+    lastNovelId?: string;
     /** 最近一次活动落在哪个房间（UI 立绘站位用） */
     currentRoom?: VRRoomId;
     /** 最近一次活动时间戳（UI / 调度展示用） */
@@ -2114,6 +2178,8 @@ export interface StoryTheaterEntry {
     presetOverride?: StoryTheaterPresetDocument;
     /** 仅供拒绝 assistant prefill、要求最后一条消息必须为 user 的接口使用；默认关闭以保留原生预设效果。 */
     forceUserLastMessage?: boolean;
+    /** 兼容不接受酒馆高级采样参数的接口；默认关闭，完整发送预设中的 top_p 与两项 penalty。 */
+    omitSamplingParams?: boolean;
     createdAt: number;
     updatedAt: number;
 }
@@ -2159,7 +2225,7 @@ export interface StoryTheaterPreset {
 
 export interface SpecialMomentRecord {
     content: string;
-    image?: string; // base64 PNG (stored separately so export tools can handle it)
+    image?: string; // 活动留存的大图，存 blobref 令牌（二进制在 blob_assets）
     timestamp: number;
     source?: 'generated' | 'migrated';
     /** Free-form per-event extra data (e.g. like520 captureface state, anchors, etc.) */
@@ -2504,6 +2570,27 @@ export interface CompanionStartupSettings {
   updatedAt?: number;
 }
 
+export interface CompanionStartupPreset {
+  id: string;
+  name: string;
+  startup: CompanionStartupSettings;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CompanionTouchPreset {
+  id: string;
+  name: string;
+  enabledZones: CompanionTouchZone[];
+  reactions: Partial<Record<CompanionTouchZone, CompanionTouchReaction[]>>;
+  voiceLanguage?: string;
+  voiceEnabled?: boolean;
+  voiceGeneratedCount?: number;
+  generatedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface CompanionTouchSettings {
   enabledZones: CompanionTouchZone[];
   reactions: Partial<Record<CompanionTouchZone, CompanionTouchReaction[]>>;
@@ -2514,6 +2601,12 @@ export interface CompanionTouchSettings {
   voiceEnabled?: boolean;
   voiceGeneratedCount?: number;
   generatedAt?: number;
+  /** 多套开机演出独立保存；startup 仍是当前实际启用的兼容字段。 */
+  startupPresets?: CompanionStartupPreset[];
+  activeStartupPresetId?: string;
+  /** 多套触摸反馈独立保存；顶层 reactions 等字段仍是当前实际启用包。 */
+  touchPresets?: CompanionTouchPreset[];
+  activeTouchPresetId?: string;
 }
 
 export type MemoryPalaceWaterlinePreset = 'online' | 'balanced' | 'offline' | 'custom';
@@ -2659,14 +2752,14 @@ export interface CharacterProfile {
   companionAvatar?: CompanionAvatarConfig;
   /**
    * 视频通话舞台的自定义背景：`blobref:<id>` 令牌（本地图片，存 IndexedDB
-   * blob_assets，备份导出时由 resolveBlobRefsDeep 自动还原）或 http(s) 图床直链。
+   * blob_assets，备份令牌原样进包、二进制走 blobs/* 旁路）或 http(s) 图床直链。
    * 空 = 默认氛围渐变。
    */
   videoCallBackground?: string;
   /**
    * 触感陪伴桌面（companion 皮肤）的背景：`preset:<id>`（内置华丽渐变场景）、
-   * `blobref:<id>` 令牌（本地图片，备份由 resolveBlobRefsDeep 还原）或 http(s)
-   * 图床直链。空 = 默认时段天光。
+   * `blobref:<id>` 令牌（本地图片，备份令牌原样进包、二进制走 blobs/* 旁路）
+   * 或 http(s) 图床直链。空 = 默认时段天光。
    */
   companionBackground?: string;
   /**
@@ -2738,6 +2831,7 @@ export interface CharacterProfile {
   spriteConfig?: SpriteConfig;
   customDateSprites?: string[]; // User-added custom emotion names for date mode (per-character)
   dateLightReading?: boolean;   // Light reading mode for novel/text view in date
+  dateReadingShowAvatars?: boolean; // Show both participants' avatars beside messages in date reading mode
   dateSkinSets?: SkinSet[];     // Multiple skin sets for portrait mode
   activeSkinSetId?: string;     // Currently active skin set ID
   dateStyleConfig?: DateStyleConfig; // 见面模式文风（写作风格 / 叙事人称 / 自定义补充）
@@ -2794,11 +2888,15 @@ export interface CharacterProfile {
   voiceProfile?: {
       provider?: 'minimax' | 'custom';
       voiceId?: string;
+      // MiniMax 合成参数版本。缺省/legacy 保持历史效果；natural-v2 需由用户主动开启。
+      minimaxParamVersion?: 'legacy' | 'natural-v2';
       // 鱼声 Fish Audio 音色：从 fish.audio 语音库复制的 reference_id。
       // 与 MiniMax 的 voiceId 不通用，单独保存，切换 provider 时各取各的。
       fishReferenceId?: string;
       // 该角色单独指定的鱼声模型（覆盖全局 fishAudioModel）。
       fishModel?: string;
+      // ElevenLabs 角色音色 ID。与 MiniMax voiceId / Fish reference_id 各存各的。
+      elevenLabsVoiceId?: string;
       voiceName?: string;
       source?: 'system' | 'voice_cloning' | 'voice_generation' | 'custom';
       model?: string;
@@ -2897,6 +2995,8 @@ export interface CharacterProfile {
   };
   personalityStyle?: 'emotional' | 'narrative' | 'imagery' | 'analytical';
   ruminationTendency?: number;  // 反刍倾向 0-1，默认 0.3
+  /** ChatApp 专属的语言趋同强度；不影响其他 App 的写作人格。 */
+  interactionAccommodation?: CharacterAccommodationPolicy;
   memoryPalaceInjection?: string;  // 记忆宫殿检索结果，注入到 System Prompt（运行时填充，不持久化）
   roomPlatesInjection?: string;    // 房间门牌（常驻语义层），注入到 System Prompt（运行时填充，来源 room_plates 表）
 
@@ -3135,6 +3235,8 @@ export interface GalleryImage {
     charId: string;
     url: string;
     timestamp: number;
+    /** 原图来自聊天时指向消息主键；相册与收藏只关联，不再复制第三份图片。 */
+    sourceMessageId?: number;
     review?: string;
     reviewTimestamp?: number;
     savedDate?: string; // YYYY-MM-DD format
@@ -3710,6 +3812,8 @@ export interface FullBackupData {
     version: number;
     theme?: OSTheme;
     apiConfig?: APIConfig;
+    /** 查手机 App 独立 API；null/缺省时跟随聊天默认。 */
+    checkPhoneApi?: APIConfig | null;
     instantPushConfig?: InstantPushConfig;
     pushVapid?: { vapidPublicKey: string; vapidPrivateKey: string; vapidEmail?: string; updatedAt?: number; };
     /**
@@ -3787,6 +3891,7 @@ export interface FullBackupData {
         charId: string;
         avatar?: string;
         companionAvatar?: CompanionAvatarConfig;
+        companionTouchSettings?: CompanionTouchSettings;
         sprites?: Record<string, string>;
         dateSkinSets?: SkinSet[];
         activeSkinSetId?: string;
@@ -3864,6 +3969,7 @@ export interface FullBackupData {
     chatTranslateSourceLangByChar?: Record<string, string>;
     chatTranslateTargetLangByChar?: Record<string, string>;
     chatTranslateEnabledByChar?: Record<string, boolean>;
+    chatTranslateExpandedByChar?: Record<string, boolean>;
     chatArchivePrompts?: any;
     chatActiveArchivePromptId?: string;
     characterRefinePrompts?: any;
@@ -3904,6 +4010,7 @@ export interface CloudBackupConfig {
     githubOwner?: string;
     githubRepo?: string;
     githubUseProxy?: boolean;   // route through Cloudflare Worker (for GFW)
+    githubProxyConsentVersion?: number; // must be 1: user explicitly accepted proxy transit after the safety change
 
     lastBackupTime?: number;    // timestamp
     lastBackupSize?: number;    // bytes
@@ -3912,8 +4019,13 @@ export interface CloudBackupConfig {
 export interface CloudBackupFile {
     name: string;
     size: number;
-    lastModified: string;       // ISO date string
+    lastModified: string | number; // ISO date string or epoch timestamp
     href: string;               // WebDAV: remote path. GitHub: 'releaseId:assetId'
+    /** GitHub can expose an interrupted draft/release without a restorable asset set. */
+    status?: 'ready' | 'incomplete';
+    statusMessage?: string;
+    /** Expected GitHub asset sizes, in the same order as the ids encoded in href. */
+    partSizes?: number[];
 }
 
 // --- GUIDEBOOK (攻略本) APP TYPES ---
@@ -4021,6 +4133,7 @@ export interface XhsFreeRoamSession {
 
 export interface XhsMcpConfig {
     enabled: boolean;
+    mode?: 'local' | 'lite'; // 部署模式；不要再用 /api 路径推断（本地 Skills 与 Lite 都使用 /api）
     serverUrl: string;  // MCP: "http://localhost:18060/mcp" | Skills: "http://localhost:18061/api" | Lite Worker: "https://xhs-lite.<acct>.workers.dev/api"
     cookie?: string;    // Lite 模式：登录后的小红书完整 cookie（含 a1 / web_session）。仅 lite Worker 用。
     platform?: 'xhs' | 'rednote'; // Lite 自动识别出的国内小红书 / 全球 RedNote 后端

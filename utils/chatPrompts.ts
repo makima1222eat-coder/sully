@@ -3,6 +3,7 @@ import { CharacterProfile, UserProfile, Message, Emoji, EmojiCategory, GroupProf
 import { ContextBuilder } from './context';
 import { DB } from './db';
 import { formatLifeSimResetCardForContext } from './lifeSimChatCard';
+import { formatQixiEventCardForContext, tryParseQixiEventChatCard } from './qixiChatCard';
 import { normalizeMessageContent, stickerNameFromUrl, theaterWhenPhrase } from './messageFormat';
 import { formatTransferRecord } from './transferFormat';
 import { computeCurrentListening, getCurrentSlot } from './charMusicSchedule';
@@ -12,7 +13,8 @@ import { RealtimeContextManager, NotionManager, FeishuManager, defaultRealtimeCo
 import { isScheduleFeatureOn } from './scheduleFeature';
 import { VOICE_ACTING_GUIDE } from './minimaxTts';
 import { FISH_VOICE_ACTING_GUIDE } from './fishAudioTts';
-import { getTtsProvider, getVoicePromptOverride } from './ttsProvider';
+import { getElevenLabsModel, getTtsProvider, getVoicePromptOverride } from './ttsProvider';
+import { getElevenLabsVoiceActingGuide } from './elevenLabsTts';
 import { resolveCharTimeZone, nowInTimeZone } from './timezone';
 import { buildLifeRecordInjection } from './lifeRecords';
 import { isWorkerReachableUrl } from './amsgToolPack';
@@ -21,6 +23,7 @@ import { getCharNameById } from './charNameRegistry';
 import { getLocalDateKey } from './localDate';
 import { getDailyScheduleForChar } from './dailySchedule';
 import { formatRelativeAge } from './groupChat/relativeTime';
+import { isBlobRef } from './blobRef';
 
 // 语音格式指导按当前 TTS 服务商二选一：用 MiniMax 才注入 MiniMax 那套（含 <#秒#> 停顿标记），
 // 用鱼声则注入鱼声版（去掉 MiniMax 专属标记，改用标点 / 省略号控制停顿）。
@@ -29,12 +32,28 @@ const voiceActingGuide = (): string => {
   const provider = getTtsProvider();
   const custom = getVoicePromptOverride(provider);
   if (custom) return custom;
-  return provider === 'fishaudio' ? FISH_VOICE_ACTING_GUIDE : VOICE_ACTING_GUIDE;
+  if (provider === 'fishaudio') return FISH_VOICE_ACTING_GUIDE;
+  if (provider === 'elevenlabs') return getElevenLabsVoiceActingGuide(getElevenLabsModel());
+  return VOICE_ACTING_GUIDE;
+};
+
+/**
+ * 这个值是「一张图 / 一段媒体」而不是正文吗？认三种形态：内嵌 data URL、http(s) 外链、
+ * blobref 令牌（二进制在 IndexedDB，字段里只留 `blobref:<id>` 短令牌，见 utils/blobRef.ts）。
+ *
+ * 令牌尤其要认：它只有 ~28 字，任何按长度截断的兜底都拦不住它整条溜进 prompt；而发请求时
+ * 网络出口那层（utils/apiBlobRefs.ts）会把请求体里的令牌统一还原成完整 data URL——
+ * 于是一个短短的令牌到了对面就是几 MB 的 base64，而且每轮对话重发一次。
+ */
+const isMediaValue = (value: unknown): boolean => {
+    if (typeof value !== 'string') return false;
+    const trimmed = value.trim();
+    return /^(data:|https?:\/\/)/i.test(trimmed) || isBlobRef(trimmed);
 };
 
 // 群活动注入专用：把一条群消息压成"适合塞进别人私聊背景"的短文本。
-// 关键：image 消息的 content 是 base64（群里发图走 processImage 压成 JPEG，单张几十 KB），
-// 卡片是大段 JSON，emoji 是图床 URL——这些原样内联进每位成员的私聊 system prompt
+// 关键：image 消息的 content 是 blobref 令牌或 base64（群里发图走 processImage 压成 JPEG，
+// 单张几十 KB），卡片是大段 JSON，emoji 是令牌或图床 URL——这些原样内联进每位成员的私聊 system prompt
 // 都是纯噪声，base64 图片更会把上下文直接撑爆（几张群图就能顶到 8w+ 字符，
 // 解散群后该角色私聊上下文从 ~10w 掉回 ~3w 即由此而来）。
 // 注意：私聊自己的历史不会有这个问题，buildMessageHistory 把图片走 image_url 结构化字段、
@@ -67,12 +86,47 @@ function summarizeGroupMsgContent(m: Message): string {
         case 'group_topic_card': return `[群聊公共话题盒${meta.groupTopicBox?.title ? '：' + meta.groupTopicBox.title : ''}] ${meta.groupTopicBox?.summary || m.content || ''}`;
         default: {
             const c = typeof m.content === 'string' ? m.content : '';
-            // 兜底：任何 data:/http(s) 链接都不内联，防止异常/未来新增类型漏网
-            if (/^(data:|https?:\/\/)/i.test(c.trim())) return '[媒体]';
+            // 兜底：任何 data:/http(s) 链接、blobref 令牌都不内联，防止异常/未来新增类型漏网
+            // （令牌内联出去还会在网络出口被还原成完整 data URL，比原样漏一个 URL 贵得多）
+            if (isMediaValue(c)) return '[媒体]';
             return c.length > GROUP_MSG_TEXT_CAP ? c.slice(0, GROUP_MSG_TEXT_CAP) + '…' : c;
         }
     }
 }
+
+export type ChatModeTransition = 'call' | 'video' | 'date' | 'story';
+
+const getChatModeTransition = (message: Message): ChatModeTransition | null => {
+    const source = message.metadata?.source;
+    if (source === 'date') return 'date';
+    if (source === 'story_theater' || source === 'story_theater_memory') return 'story';
+    if (source === 'call' || source === 'call-end-popup') {
+        return message.metadata?.callMode === 'video' ? 'video' : 'call';
+    }
+    return null;
+};
+
+/**
+ * 判断当前是不是「从特殊互动模式回到 ChatApp 后，尚未产生普通聊天回复」的第一轮。
+ *
+ * 用户可能连续发送多个气泡再点生成，所以普通 user 消息不会截断搜索；一旦已经出现
+ * 普通 assistant 回复，就说明格式切换已经完成，不应在后续每一轮重复提醒。
+ * 普通 system 日志也不参与判断，避免挂断卡片与其他后台提示把真正的来源隔开。
+ */
+export const detectChatModeTransition = (messages: readonly Message[]): ChatModeTransition | null => {
+    let hasPendingChatInput = false;
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        const mode = getChatModeTransition(message);
+        if (mode) return hasPendingChatInput ? mode : null;
+
+        if (message.role === 'assistant') return null;
+        if (message.role === 'user') hasPendingChatInput = true;
+    }
+
+    return null;
+};
 
 /**
  * buildSystemPrompt / buildSystemPromptParts 的构建选项。
@@ -93,6 +147,8 @@ function summarizeGroupMsgContent(m: Message): string {
  */
 export interface PromptBuildOptions {
     forFirePack?: boolean;
+    /** 主 API 从完整数据库历史识别出的「刚从哪种模式回到 ChatApp」。 */
+    returningFromMode?: ChatModeTransition;
     /**
      * `timelyByWorker` = 这份 prompt 会交给 amsg worker 在 fire 时刻补时效段
      * （即时对话路径）。与 forFirePack 的区别：只裁「worker 那边有对应槽位」的
@@ -282,7 +338,9 @@ export const ChatPrompts = {
         let volatileState = `\n[System: Live Context]\n(The following is the live state at this moment — ${liveStateSummary}. Your persona and chat rules are in the system settings at the very top and are not repeated here.)\n\n`;
         volatileState += ContextBuilder.buildVolatileCoreState(char, {
             includeDetailedMemories: true,
-            timeOptions: { skipTimeAwareness: forFirePack || timelyByWorker },
+            // conversational：私聊是真的有人在这个点跟角色说话，时间块才补那句语境框定
+            // （见 ContextBuilder.buildTimeAwarenessBlock）。生成器类调用不给，默认就没有。
+            timeOptions: { skipTimeAwareness: forFirePack || timelyByWorker, conversational: true },
         });
 
         // ── 并发发起所有独立的异步取数（网络 + IndexedDB），下面按原顺序拼接 ──
@@ -334,8 +392,10 @@ export const ChatPrompts = {
 
         // 2. 日程（被"日程注入"和"音乐氛围"两处共用，合并成一次查询）
         //    总开关关闭时跳过查询与注入，确保不额外调用任何 LLM 依赖链
+        //    时间感知关掉时日程照给（它有自己的总开关），只是注入处 includeClock=false
+        //    把精确钟点藏掉——不再整块跳过（旧的 && timeAware 门控已退役）
         const scheduleFeatureOn = isScheduleFeatureOn(char);
-        const schedulePromise: Promise<DailySchedule | null> = scheduleFeatureOn && timeAware
+        const schedulePromise: Promise<DailySchedule | null> = scheduleFeatureOn
             ? getDailyScheduleForChar(char).catch(e => {
                 console.error('Failed to load daily schedule:', e);
                 return null;
@@ -466,11 +526,23 @@ ${groupLogStr}\n`;
         // ── 拼接：易变的进 volatileState，稳定的进 baseSystemPrompt ──
         volatileState += realtimeText;
 
-        // 2a. 日程注入（当前时段 + 意识流独白，每轮都可能变）
+        // 2a. 日程注入（完整今日日程 + 当前时段 + 意识流独白，每轮都可能变）
         //     fire_pack 不烤：改由 worker 到点用 AMSG_SLOT_SCENE 现挑时段（见 amsgFireScene）。
+        //     includeClock 跟着角色的「时间感知」开关走：关掉的角色不该从日程块里读到
+        //     「23:00」这种精确钟点，那是这个开关本来要挡住的东西（同上面天气块的 includeTime）。
+        //     日程本身照给——它有自己的总开关。
         if (schedule && !forFirePack) {
             try {
-                const scheduleContext = ContextBuilder.buildScheduleInjection(schedule, evolvedNarrative, charNow);
+                const scheduleContext = ContextBuilder.buildScheduleInjection(
+                    schedule,
+                    evolvedNarrative,
+                    charNow,
+                    {
+                        includeFullDay: true,
+                        includeChangeInstruction: true,
+                        includeClock: char.timeAwarenessEnabled !== false,
+                    },
+                );
                 if (scheduleContext) volatileState += `\n${scheduleContext}\n`;
             } catch (e) {
                 console.error('Failed to inject schedule context:', e);
@@ -608,7 +680,7 @@ But keep firmly in mind: this is just an avatar parked in a virtual space (like 
    - Each line renders as one bubble; spaces and punctuation do not split bubbles.
    - 【Strictly forbidden】Including timestamps, name prefixes, or "[character name]:" in your output.
    - **【Strictly forbidden】Imitating the system-log formats seen in the history (e.g. "[Chat]", "[Call]", "[System: ...]", "[你 发送了...]"). Those prefixes are annotations rendered by the system for your reference — never write them yourself.**
-   - **Sending stickers**: You must use, and only use, the command: \`[[SEND_EMOJI: sticker name]]\`.
+   - **Sending stickers**: You must use, and only use, the command: \`[[SEND_EMOJI: sticker name]]\`. Write only the sticker name shown in the brackets below — never include the category name.
    - **Available sticker library (by category)**:
      ${emojiContextStr}
    - **Reading the stickers they send**: The \`[发送了表情包: xx]\` you see is just the image's name. Stickers are picked from a limited library — the name describes **what's drawn on the image**, not **what they are doing**, nor "what they secretly mean." Read in this order:
@@ -896,15 +968,23 @@ ${xhsEnabled ? `${[notionEnabled, feishuEnabled, notionNotesEnabled].filter(Bool
 
 `;
 
-        // 「刚结束见面/通话」的切换提示由倒数第二条消息推导，随对话推进而变 → 易变段。
+        // 特殊模式结束后的第一轮必须把输出格式重新锚定到 ChatApp。
+        // 主聊天路径会从完整 DB 历史算好 returningFromMode；直接调用 ChatPrompts 的旧路径
+        // 则用 currentMsgs 兜底。不能再看固定的倒数第二条：用户可能连续发多个气泡，界面
+        // 状态也会隐藏 date/call/story 消息，而 API 历史仍会携带它们。
         // fire_pack 不烤：打包时确实刚挂电话，但那条主动消息可能是第二天凌晨才发出去的，
         // 角色照着这句接一句「刚才电话里说的那个……」就穿帮了。
-        const previousMsg = (currentMsgs.length > 1 && !forFirePack) ? currentMsgs[currentMsgs.length - 2] : null;
-        if (previousMsg && previousMsg.metadata?.source === 'date') {
-            volatileState += `\n\n[System Note: You just finished a face-to-face meeting. You are now back on the phone. Switch back to texting style.]`;
-        }
-        if (previousMsg && (previousMsg.metadata?.source === 'call' || previousMsg.metadata?.source === 'call-end-popup')) {
-            volatileState += `\n\n[System: You just ended a phone call with them and are now back in text chat. Switch back to a texting style — no more phone-call voice, no voice tags, back to normal short IM messages. You may naturally bridge with something like "about what we said on the call just now…", but do not keep replying in call mode.]`;
+        const returningFromMode = !forFirePack
+            ? (promptOptions?.returningFromMode || detectChatModeTransition(currentMsgs))
+            : null;
+        if (returningFromMode) {
+            const modeLabel: Record<ChatModeTransition, string> = {
+                call: 'a voice call',
+                video: 'a video call',
+                date: 'a face-to-face meetup',
+                story: 'story mode',
+            };
+            volatileState += `\n\n[System | Mode switch (highest priority): You just ended ${modeLabel[returningFromMode]} and are now back in the ChatApp text-chat interface. The lines, narration, actions, scenes, or transcript formats of that previous mode are history that already happened — never a formatting example for your current reply. From this message on, reply only by the output rules ChatApp currently has enabled: natural short IM sentences/bubbles; do not carry over call-style speech, continuous spoken transcription, action descriptions, novel narration, scene titles, or speaker labels. If ChatApp currently has voice messages enabled, you may still follow their own voice-message format. You may naturally pick up on what just happened, but express it as someone sending messages in a chat interface.]`;
         }
 
         // Voice message prompt injection
@@ -1091,7 +1171,12 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                         .replace(/<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g, '$1')
                         .replace(/<\/?翻译>|<\/?原文>|<\/?译文>/g, '')
                         .trim();
-                    const quoted = rawQuote.length > 60 ? rawQuote.slice(0, 60) + '…' : rawQuote;
+                    // 被引用的可能本来就是一条图片消息 —— 此时 rawQuote 是 data URL / 外链 / blobref
+                    // 令牌，截 60 字只会切出一段没意义的 base64 碎片，令牌更是整条活着进 prompt。
+                    // 一律换成占位符：模型知道"引用的是张图"就够了。
+                    const quoted = isMediaValue(rawQuote)
+                        ? '[图片]'
+                        : (rawQuote.length > 60 ? rawQuote.slice(0, 60) + '…' : rawQuote);
                     // name 记的是被引用消息的说话人：char.name = 用户在回复 char 本人之前的话；'我' = 用户引用自己。
                     const whose = m.replyTo.name === char.name ? '你之前说的' : (m.replyTo.name === '我' ? '自己说的' : (m.replyTo.name || '对方') + '说的');
                     const speaker = m.role === 'user' ? '用户' : '你';
@@ -1109,7 +1194,12 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                          return { role: m.role, content: textPart };
                      }
                      // 向下兼容：如果图片数据缺失（例如只导入了文字备份），不要把空 URL 发给 API，否则会报错无法回应
-                     const hasImageData = typeof m.content === 'string' && (m.content.startsWith('data:') || m.content.startsWith('http'));
+                     // 图片有三种形态：base64 data URL、外链 http(s)、本机的 blobref 令牌
+                     // （二进制在 blob_assets，见 utils/blobRef.ts）。令牌既不以 data: 也不以 http 开头，
+                     // 这里认不出来的话，图明明还在，模型收到的却是「图片数据已不可用」——不报错、不破图，最难查。
+                     // 令牌原样放进 image_url 就行，发请求时网络出口那层会统一还原成 data URL（utils/apiBlobRefs.ts）。
+                     const hasImageData = typeof m.content === 'string'
+                         && (m.content.startsWith('data:') || m.content.startsWith('http') || isBlobRef(m.content));
                      let textPart = hasImageData
                          ? `${timePrefix}[User sent an image]`
                          : `${timePrefix}[User sent an image, but the image data is no longer available]`;
@@ -1306,8 +1396,11 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                 else if ((m.type as string) === 'score_card') {
                     try {
                         const card = m.metadata?.scoreCard || JSON.parse(m.content);
+                        const qixiCard = tryParseQixiEventChatCard(card);
                         if (card?.type === 'lifesim_reset_card') {
                             content = `${timePrefix}${formatLifeSimResetCardForContext(card, char?.name)}`;
+                        } else if (qixiCard) {
+                            content = `${timePrefix}${formatQixiEventCardForContext(qixiCard, 'char')}`;
                         } else if (card?.type === 'diary_card') {
                             const uName = card.userName || userProfile?.name || 'The user';
                             const userText = (card.userText || '').trim();
@@ -1327,7 +1420,16 @@ Every line should feel as if it slipped out, unbidden, straight from ${char.name
                             ).join('\n') || '';
                             content = `${timePrefix}[White Day compatibility quiz results] ${uName} completed the little White Day quiz you wrote, got ${card.score}/${card.total} right, and ${passedStr}.\n${questionsText}\nYour final remarks: ${card.finalDialogue || 'None'}`;
                         } else {
-                            content = `${timePrefix}[System card] ${m.content.slice(0, 200)}`;
+                            // 兜底：上面没被任何一种卡片认领的（比如各种活动卡）。这里不能直接塞
+                            // 消息原文 —— 卡片 JSON 通常一开头就是 charAvatar 之类的图片字段，
+                            // 值是 blobref 令牌，正好落在前 200 字符里，出门被还原成整张头像的
+                            // base64、每轮重发。改成按 card 重新序列化，图片值先剥成占位符再截断。
+                            const safeJson = card == null
+                                ? ''
+                                : (JSON.stringify(card, (_k, v) => (isMediaValue(v) ? '[image]' : v)) || '');
+                            content = safeJson
+                                ? `${timePrefix}[System card] ${safeJson.slice(0, 200)}`
+                                : `${timePrefix}[System card]`;
                         }
                     } catch {
                         content = `${timePrefix}[System card]`;

@@ -25,6 +25,7 @@ import { resolveCharTimeZone, nowInTimeZone, tzLabel } from '../utils/timezone';
 import { getDailyScheduleForChar } from '../utils/dailySchedule';
 import { trackEvent } from '../utils/analytics';
 import { normalizeBuiltInRoomTemplateAssetsInPlace, toPortableBuiltinRoomAsset } from '../utils/roomTemplateAssets';
+import { shareOrDownloadFile } from '../utils/shareExport';
 
 const TWEMOJI_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72';
 const twemojiUrl = (codepoint: string) => `${TWEMOJI_BASE}/${codepoint}.png`;
@@ -1274,16 +1275,13 @@ ${!shouldGenerateTodo ? `(系统: 今日待办已存在，无需生成，请忽�
                 await navigator.clipboard.writeText(json);
                 addToast('小屋 JSON 已复制到剪贴板', 'success');
             } else {
-                const blob = new Blob([json], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `${template.name.replace(/[\\/:*?"<>|]/g, '_')}.room.json`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                addToast('小屋样板房已导出', 'success');
+                const result = await shareOrDownloadFile({
+                    content: json,
+                    fileName: `${template.name.replace(/[\\/:*?"<>|]/g, '_')}.room.json`,
+                    mimeType: 'application/json;charset=utf-8',
+                    shareTitle: `小屋样板房：${template.name}`,
+                });
+                addToast(result === 'shared' ? '已打开小屋样板房分享面板' : '小屋样板房已导出', 'success');
             }
             trackEvent('导出小屋样板房', { action });
         } catch (e: any) {
@@ -1797,7 +1795,7 @@ ${!shouldGenerateTodo ? `(系统: 今日待办已存在，无需生成，请忽�
                                                     <div className="absolute inset-[8px] rounded-full" style={{ border: `1px solid ${th.ring1}` }} />
                                                     <div className="absolute inset-[12px] rounded-full" style={{ border: `1px solid ${th.ring2}` }} />
                                                     <div className="w-[70px] h-[70px] rounded-full overflow-hidden" style={{ boxShadow: `0 0 18px ${th.avGlow}` }}>
-                                                        <img src={c.avatar} className="w-full h-full object-cover" alt={c.name} />
+                                                        <TokenImg value={c.avatar} className="w-full h-full object-cover" alt={c.name} />
                                                     </div>
                                                     <div className="absolute bottom-0 right-1.5 w-[22px] h-[22px] rounded-full flex items-center justify-center" style={{ background: th.badgeBg, boxShadow: th.badgeShadow }}>
                                                         {pixel ? <span className="text-[10px]">🎮</span> : (

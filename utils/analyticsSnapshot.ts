@@ -28,7 +28,8 @@
 
 import type { APIConfig, CloudBackupConfig, CharacterProfile, OSTheme, RealtimeConfig } from '../types';
 import { PRESET_THEMES } from '../components/chat/ChatConstants';
-import { anyCharToggle, bucketFewCount, presetOrCustom, readStorageBytes, tweakedOrDefault } from './analytics';
+import { anyCharToggle, bucketFewCount, presetOrCustom, tweakedOrDefault } from './analytics';
+import { readStorageOverview } from './storageStats';
 import { BUILTIN_SOUNDS } from './whiteboxSound';
 import { DB } from './db';
 import { isStandaloneDisplayMode } from './iosStandalone';
@@ -56,18 +57,24 @@ export async function collectDataScale(characters: CharacterProfile[]): Promise<
     maxMemoryCount: number;
     maxMessageCount: number;
     storageBytes: number | null;
+    storageQuotaBytes: number | null;
+    persistedStorage: boolean | null;
     standalone: boolean;
 }> {
     const messageCounts = await Promise.all(
         characters.map(c => DB.countMessagesByCharId(c.id).catch(() => 0)),
     );
     const memoryCounts = characters.map(c => c.memories?.length ?? 0);
+    // 用量和持久化许可一次取回：两者都出自同一个 StorageManager，分两次问纯属浪费。
+    const storage = await readStorageOverview();
     return {
         characterCount: characters.length,
         memoryCount: memoryCounts.reduce((a, b) => a + b, 0),
         maxMemoryCount: Math.max(0, ...memoryCounts),
         maxMessageCount: Math.max(0, ...messageCounts),
-        storageBytes: await readStorageBytes(),
+        storageBytes: storage.usageBytes,
+        storageQuotaBytes: storage.quotaBytes,
+        persistedStorage: storage.persisted,
         // 用通用的「装成 PWA 独立窗口」判定，不只认 iOS——配合 umami 自带的
         // 系统字段，查询时就能分出 iOS 全屏、安卓全屏还是桌面装机。
         standalone: isStandaloneDisplayMode(),
@@ -308,7 +315,7 @@ export function amsg2Stage(
 const BACKUP_PROVIDERS = ['webdav', 'github'] as const;
 
 /** 语音合成服务商白名单。 */
-const TTS_PROVIDERS = ['minimax', 'fishaudio'] as const;
+const TTS_PROVIDERS = ['minimax', 'fishaudio', 'elevenlabs'] as const;
 
 /** 命中白名单就报那个值，否则报 custom；空值报 fallback。 */
 function enumOrCustom(
@@ -440,7 +447,7 @@ export function collectFeatureFlags(src: FeatureSources): Record<string, string>
 
         // ── 模型线路 ──
         // 服务商是枚举，可以报；baseUrl / key / 模型名一律不报。
-        语音合成: src.apiConfig.apiKey || src.apiConfig.minimaxApiKey || src.apiConfig.fishAudioApiKey
+        语音合成: src.apiConfig.apiKey || src.apiConfig.minimaxApiKey || src.apiConfig.fishAudioApiKey || src.apiConfig.elevenLabsApiKey
             ? enumOrCustom(src.apiConfig.ttsProvider, TTS_PROVIDERS, 'minimax')
             : '没配',
         API线路预设数: bucketFewCount(src.apiPresetCount),

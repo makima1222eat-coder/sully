@@ -12,6 +12,7 @@
 // 后者的 meta 通过下面 safeFetchJson 的第 5 个参数挂到 __sullyMeta 上传出去。
 import { appendDevDebugApiLog, makeDebugLogger } from './devDebug';
 import { getApiCallAmbientContext, recordApiCall, type ApiCallMeta } from './apiCallLog';
+import { resolveBlobRefsInRequestBody } from './apiBlobRefs';
 
 const log = makeDebugLogger('api', 'SafeAPI');
 
@@ -108,6 +109,8 @@ export function parseSseToCompletion(raw: string): any | null {
 interface SseFeedDelta {
     content: string;
     reasoning: string;
+    /** The provider has explicitly finished this completion. */
+    done: boolean;
 }
 
 class SseAssembler {
@@ -132,11 +135,12 @@ class SseAssembler {
 
     /** 喂一行 SSE 文本，分别返回正文与思考增量（没有则为空串）。 */
     feedLine(line: string): SseFeedDelta {
-        if (!line.startsWith('data:')) return { content: '', reasoning: '' };
+        if (!line.startsWith('data:')) return { content: '', reasoning: '', done: false };
         const payload = line.slice(5).trim();
-        if (!payload || payload === '[DONE]') return { content: '', reasoning: '' };
+        if (!payload) return { content: '', reasoning: '', done: false };
+        if (payload === '[DONE]') return { content: '', reasoning: '', done: true };
         let chunk: any;
-        try { chunk = JSON.parse(payload); } catch { return { content: '', reasoning: '' }; }
+        try { chunk = JSON.parse(payload); } catch { return { content: '', reasoning: '', done: false }; }
         return this.feedChunk(chunk);
     }
 
@@ -147,7 +151,7 @@ class SseAssembler {
         // 始终取最后一个非空的 usage，兼容各家代理。
         if (chunk.usage) this.usage = chunk.usage;
         const choice = chunk.choices?.[0];
-        if (!choice) return { content: '', reasoning: '' };
+        if (!choice) return { content: '', reasoning: '', done: false };
         let delta = '';
         let reasoningDelta = '';
         // delta 路径（OpenAI 流式常见）
@@ -201,7 +205,7 @@ class SseAssembler {
             if (Array.isArray(choice.message.tool_calls)) this.toolCalls.push(...choice.message.tool_calls);
         }
         if (choice.finish_reason) this.finishReason = choice.finish_reason;
-        return { content: delta, reasoning: reasoningDelta };
+        return { content: delta, reasoning: reasoningDelta, done: Boolean(choice.finish_reason) };
     }
 
     get reasoningContent(): string {
@@ -271,9 +275,11 @@ async function readBodyWithStreaming(
     let pending = '';       // SSE 模式下未消费完的半行缓冲
     let mode: 'undecided' | 'sse' | 'raw' = 'undecided';
     let sawFirstDelta = false;
+    let sawTerminalEvent = false;
     const contentType = response.headers.get('content-type');
 
     const emit = (delta: SseFeedDelta) => {
+        if (delta.done) sawTerminalEvent = true;
         if (delta.content) {
             if (!sawFirstDelta) {
                 sawFirstDelta = true;
@@ -317,6 +323,13 @@ async function readBodyWithStreaming(
             pending += textChunk;
         }
         if (mode === 'sse') consumeLines();
+        if (sawTerminalEvent) {
+            // A few OpenAI-compatible Claude proxies send [DONE]/finish_reason but
+            // keep the HTTP socket alive. The completion is already whole; waiting
+            // for reader.done would leave the Qixi loader spinning forever.
+            try { await reader.cancel(); } catch { /* completion is already assembled */ }
+            break;
+        }
     }
     const tail = decoder.decode();
     if (tail) {
@@ -367,13 +380,21 @@ export async function safeFetchJson(
     const metaOptions: RequestInit = meta ? { ...options, __sullyMeta: meta } as RequestInit : options;
     const logMeta = meta || getApiCallAmbientContext();
 
+    // 图片在本机存成 `blobref:` 令牌，发出去对面读不懂——在这里统一还原成 data URL。
+    // 各处构造请求的地方就不用各记一遍这件事了（详见 utils/apiBlobRefs.ts）。
+    // 循环外做一次：重试用的是同一份 body。
+    const resolvedBody = await resolveBlobRefsInRequestBody(metaOptions.body);
+    const sendOptions: RequestInit = resolvedBody === metaOptions.body
+        ? metaOptions
+        : { ...metaOptions, body: resolvedBody as BodyInit };
+
     for (let attempt = 0; attempt <= automaticRetryLimit; attempt++) {
         // 全局 fetch 拦截器和这里的“已解析响应兜底”共享 ID。前者覆盖裸 fetch，
         // 后者不依赖 Response.clone()，避免部分 iOS/WebView 克隆流不结束时漏记。
         const requestId = `api-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
         // 每次 attempt 建一个独立的 AbortController（仅用于 timeout）
         // 调用方自己的 options.signal 仍然有效，两者任一触发就 abort
-        let attemptOptions = { ...metaOptions, __sullyApiCallId: requestId } as RequestInit;
+        let attemptOptions = { ...sendOptions, __sullyApiCallId: requestId } as RequestInit;
         let timeoutHandle: any = null;
         if (timeoutMs > 0) {
             const ac = new AbortController();

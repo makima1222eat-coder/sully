@@ -103,8 +103,8 @@ describe('forFirePack —— 打包时刻的状态一律不烤进模板', () => 
             );
             return parts.volatileState;
         };
-        expect(await withMsgs(false)).toContain('You just ended a phone call');
-        expect(await withMsgs(true)).not.toContain('You just ended a phone call');
+        expect(await withMsgs(false)).toContain('You just ended a voice call');
+        expect(await withMsgs(true)).not.toContain('System | Mode switch');
     });
 
     it('生活记录：摘要数据留着，代记工具说明不进', async () => {
