@@ -78,6 +78,8 @@ interface ChatModalsProps {
     onConfirmEditMessage: () => void;
     onDeleteMessage: () => void;
     onCopyMessage: () => void;
+    /** 在所选消息之后插入一条自定义消息（role 决定气泡挂在「我」还是角色名下） */
+    onInsertMessage?: (role: 'user' | 'assistant', content: string) => void;
     onDeleteEmoji: () => void;
     onDeleteCategory: () => void;
     // Category Visibility
@@ -243,7 +245,7 @@ const ChatModals: React.FC<ChatModalsProps> = ({
     onTransfer, onImportEmoji, onSaveSettings,
     onBgUpload, onRemoveBg, onClearHistory,
     onArchive, onCreatePrompt, onEditPrompt, onSavePrompt, onDeletePrompt,
-    onSetHistoryStart, onRestoreAdaptiveContext, onJumpToMessageInChat, onEnterSelectionMode, onReplyMessage, onEditMessageStart, onConfirmEditMessage, onDeleteMessage, onCopyMessage, onDeleteEmoji, onDeleteCategory,
+    onSetHistoryStart, onRestoreAdaptiveContext, onJumpToMessageInChat, onEnterSelectionMode, onReplyMessage, onEditMessageStart, onConfirmEditMessage, onDeleteMessage, onCopyMessage, onInsertMessage, onDeleteEmoji, onDeleteCategory,
     allCharacters = [], onSaveCategoryVisibility,
     translationEnabled, onToggleTranslation, translateSourceLang, translateTargetLang, onSetTranslateSourceLang, onSetTranslateLang,
     xhsEnabled, onToggleXhs,
@@ -261,6 +263,9 @@ const ChatModals: React.FC<ChatModalsProps> = ({
     const [visibilitySelection, setVisibilitySelection] = useState<Set<string>>(new Set());
     const [historyPage, setHistoryPage] = useState(0);
     const [historySearch, setHistorySearch] = useState('');
+    // 「在下方插入消息」草稿：只在本弹窗内用，确认时整体交给 onInsertMessage
+    const [insertContent, setInsertContent] = useState('');
+    const [insertRole, setInsertRole] = useState<'user' | 'assistant'>('user');
     const longPressTimerRef = useRef<number | null>(null);
     const longPressTriggeredRef = useRef(false);
     const HISTORY_PAGE_SIZE = 50;
@@ -939,6 +944,14 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                             复制文字
                         </button>
                     )}
+                    {onInsertMessage && (
+                        <button
+                            onClick={() => { setInsertContent(''); setInsertRole('user'); setModalType('insert-message'); }}
+                            className="w-full py-3 bg-slate-50 text-slate-700 font-medium rounded-2xl active:bg-slate-100 transition-colors flex items-center justify-center gap-2"
+                        >
+                            在下方插入消息
+                        </button>
+                    )}
                     {voiceAvailable && selectedMessage?.role === 'assistant' && selectedMessage?.type === 'text' && onGenerateVoice && (
                         <button onClick={() => { onGenerateVoice(); setModalType('none'); }} className="w-full py-3 bg-emerald-50 text-emerald-600 font-medium rounded-2xl active:bg-emerald-100 transition-colors flex items-center justify-center gap-2">
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="M19.114 5.636a9 9 0 0 1 0 12.728M16.463 8.288a5.25 5.25 0 0 1 0 7.424M6.75 8.25l4.72-4.72a.75.75 0 0 1 1.28.53v15.88a.75.75 0 0 1-1.28.53l-4.72-4.72H4.51c-.88 0-1.704-.507-1.938-1.354A9.009 9.009 0 0 1 2.25 12c0-.83.112-1.633.322-2.396C2.806 8.756 3.63 8.25 4.51 8.25H6.75Z" /></svg>
@@ -1099,6 +1112,48 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                     onChange={e => setEditContent(e.target.value)}
                     className="w-full h-32 bg-slate-100 rounded-2xl p-4 resize-none focus:ring-1 focus:ring-primary/20 transition-all text-sm leading-relaxed"
                 />
+            </Modal>
+
+            {/* Insert Message Modal — 在所选消息之后插入一条自定义消息 */}
+            <Modal
+                isOpen={modalType === 'insert-message'} title="插入消息" onClose={() => setModalType('none')}
+                footer={<>
+                    <button onClick={() => setModalType('none')} className="flex-1 py-3 bg-slate-100 rounded-2xl">取消</button>
+                    <button
+                        onClick={() => { if (insertContent.trim()) onInsertMessage?.(insertRole, insertContent); }}
+                        disabled={!insertContent.trim()}
+                        className={`flex-1 py-3 font-bold rounded-2xl transition-colors ${insertContent.trim() ? 'bg-primary text-white' : 'bg-slate-100 text-slate-300'}`}
+                    >
+                        插入
+                    </button>
+                </>}
+            >
+                <div className="space-y-3">
+                    <p className="text-xs text-slate-400">新消息会插在所选消息的下方。</p>
+                    <div>
+                        <label className="text-[10px] font-bold text-slate-400 mb-1.5 block">发送者</label>
+                        <div className="flex gap-2">
+                            <button
+                                onClick={() => setInsertRole('user')}
+                                className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all ${insertRole === 'user' ? 'bg-primary text-white' : 'bg-slate-100 text-slate-500'}`}
+                            >
+                                我
+                            </button>
+                            <button
+                                onClick={() => setInsertRole('assistant')}
+                                className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all truncate ${insertRole === 'assistant' ? 'bg-primary text-white' : 'bg-slate-100 text-slate-500'}`}
+                            >
+                                {activeCharacter?.name || '角色'}
+                            </button>
+                        </div>
+                    </div>
+                    <textarea
+                        value={insertContent}
+                        onChange={e => setInsertContent(e.target.value)}
+                        placeholder="输入要插入的消息内容…"
+                        className="w-full h-32 bg-slate-100 rounded-2xl p-4 resize-none focus:ring-1 focus:ring-primary/20 transition-all text-sm leading-relaxed"
+                    />
+                </div>
             </Modal>
 
             {/* Schedule Modal */}

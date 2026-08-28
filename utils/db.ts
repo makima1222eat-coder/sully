@@ -799,6 +799,50 @@ export const DB = {
     });
   },
 
+  /**
+   * 「消息操作 → 插入消息」：把一条新消息插到 afterId 那条消息**之后**。
+   * 消息的显示顺序由自增主键 id 决定（各处读取都是沿索引游标走、同键内按主键升序），
+   * 所以插中间必须显式指定主键：取 afterId 与**全库下一个主键**的中点浮点数——
+   * autoIncrement 表允许显式写浮点键，浮点会精确排在两个整数之间。
+   * 之所以取全库相邻键而不是同会话下一条：自增 id 是所有会话共用的，
+   * 同会话相邻两条消息之间可能夹着别的会话的整数 id，拿那个中点会撞键。
+   * afterId 已是全库最后一条时直接走自增追加（新 id 必然更大，顺序天然正确）。
+   * 注意：这里**不做** saveMessage 的水位线自愈——往记忆宫殿水位线以下插入时
+   * newId < 水位线是有意为之（插进已归档区段），误清水位线会把整段归档历史重新塞回 AI 上下文。
+   */
+  insertMessageAfter: async (afterId: number, msg: Omit<Message, 'id' | 'timestamp'> & { timestamp?: number }): Promise<Message> => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(STORE_MESSAGES, 'readwrite');
+        const store = transaction.objectStore(STORE_MESSAGES);
+        const timestamp = typeof msg.timestamp === 'number' ? msg.timestamp : Date.now();
+        const { timestamp: _ignored, ...payload } = msg;
+        const doAdd = (explicitId?: number) => {
+            const record = explicitId !== undefined ? { ...payload, id: explicitId, timestamp } : { ...payload, timestamp };
+            const addReq = store.add(record);
+            addReq.onsuccess = () => resolve({ ...(record as any), id: addReq.result as number } as Message);
+            addReq.onerror = () => reject(addReq.error);
+        };
+        const cursorReq = store.openCursor(IDBKeyRange.lowerBound(afterId, true));
+        cursorReq.onsuccess = () => {
+            const cursor = cursorReq.result;
+            if (!cursor) {
+                doAdd();
+                return;
+            }
+            const nextKey = cursor.key as number;
+            const mid = (afterId + nextKey) / 2;
+            if (!(mid > afterId && mid < nextKey)) {
+                // 同一条缝隙反复对半插入 ~50 次后浮点精度耗尽，正常使用到不了这里
+                reject(new Error('这两条消息之间插不下更多消息了'));
+                return;
+            }
+            doAdd(mid);
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+    });
+  },
+
   updateMessage: async (id: number, content: string): Promise<void> => {
     const db = await openDB();
     const transaction = db.transaction(STORE_MESSAGES, 'readwrite');

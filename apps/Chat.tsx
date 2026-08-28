@@ -147,7 +147,7 @@ const Chat: React.FC = () => {
     // Reply Logic
     const [replyTarget, setReplyTarget] = useState<Message | null>(null);
 
-    const [modalType, setModalType] = useState<'none' | 'transfer' | 'emoji-import' | 'chat-settings' | 'message-options' | 'edit-message' | 'delete-emoji' | 'delete-category' | 'add-category' | 'history-manager' | 'archive-settings' | 'prompt-editor' | 'category-options' | 'category-visibility' | 'emoji-options' | 'rename-emoji' | 'schedule' | 'chrome-css' | 'chrome-sound' | 'memory-vectorize-confirm' | 'memory-vectorize-result'>('none');
+    const [modalType, setModalType] = useState<'none' | 'transfer' | 'emoji-import' | 'chat-settings' | 'message-options' | 'edit-message' | 'insert-message' | 'delete-emoji' | 'delete-category' | 'add-category' | 'history-manager' | 'archive-settings' | 'prompt-editor' | 'category-options' | 'category-visibility' | 'emoji-options' | 'rename-emoji' | 'schedule' | 'chrome-css' | 'chrome-sound' | 'memory-vectorize-confirm' | 'memory-vectorize-result'>('none');
     // 「聊天装扮」悬浮态：不走全屏 modal——圆气泡挂在聊天上，点开小面板边看真聊天边调。
     const [fineTuneOpen, setFineTuneOpen] = useState(false);          // 圆气泡在场
     const [fineTunePanelOpen, setFineTunePanelOpen] = useState(false); // 小面板展开/收起
@@ -2524,6 +2524,40 @@ const Chat: React.FC = () => {
         trackEvent('编辑一条消息');
     };
 
+    // 「消息操作 → 在下方插入消息」：在所选消息之后插一条自定义 text 消息
+    const handleInsertMessage = async (role: 'user' | 'assistant', content: string) => {
+        if (!selectedMessage) return;
+        const trimmed = content.trim();
+        if (!trimmed) return;
+        const anchor = selectedMessage;
+        // 时间戳取所选消息与下一条的中点，保持时间线不倒流；所选已是最后一条则贴着它 +1ms
+        const idx = messages.findIndex(m => m.id === anchor.id);
+        const next = idx >= 0 ? messages[idx + 1] : undefined;
+        const timestamp = next && next.timestamp > anchor.timestamp
+            ? Math.floor((anchor.timestamp + next.timestamp) / 2)
+            : anchor.timestamp + 1;
+        try {
+            const inserted = await DB.insertMessageAfter(anchor.id, {
+                charId: char.id, role, type: 'text', content: trimmed, timestamp,
+            });
+            // 同 handleDeleteMessage：历史变了要让云端 fire_pack 跟上
+            markAmsgStateDirty({ char, userProfile, groups, realtimeConfig });
+            setMessages(prev => {
+                const i = prev.findIndex(m => m.id === anchor.id);
+                if (i < 0) return [...prev, inserted];
+                return [...prev.slice(0, i + 1), inserted, ...prev.slice(i + 1)];
+            });
+            setTotalMsgCount(prev => prev + 1);
+            setModalType('none');
+            setSelectedMessage(null);
+            addToast('消息已插入', 'success');
+            trackEvent('在消息后插入一条消息', { 身份: role === 'user' ? '我' : '角色' });
+        } catch (e) {
+            console.error('Insert message failed:', e);
+            addToast('插入失败，请重试', 'error');
+        }
+    };
+
     const handleQuickReply = useCallback((message: Message) => {
         setReplyTarget({
             ...message,
@@ -3150,7 +3184,7 @@ const Chat: React.FC = () => {
                 onCreatePrompt={createNewPrompt} onEditPrompt={editSelectedPrompt} onSavePrompt={handleSavePrompt} onDeletePrompt={handleDeletePrompt}
                 onSetHistoryStart={handleSetHistoryStart} onRestoreAdaptiveContext={restoreAdaptiveContext} onJumpToMessageInChat={handleJumpToMessageInChat} onEnterSelectionMode={handleEnterSelectionMode}
                 onReplyMessage={handleReplyMessage} onEditMessageStart={() => { if (selectedMessage) { setEditContent(selectedMessage.content); setModalType('edit-message'); } }}
-                onConfirmEditMessage={confirmEditMessage} onDeleteMessage={handleDeleteMessage} onCopyMessage={handleCopyMessage} onDeleteEmoji={handleDeleteEmoji} onDeleteCategory={handleDeleteCategory}
+                onConfirmEditMessage={confirmEditMessage} onDeleteMessage={handleDeleteMessage} onCopyMessage={handleCopyMessage} onInsertMessage={handleInsertMessage} onDeleteEmoji={handleDeleteEmoji} onDeleteCategory={handleDeleteCategory}
                 allCharacters={characters} onSaveCategoryVisibility={handleSaveCategoryVisibility}
                 translationEnabled={translationEnabled}
                 onToggleTranslation={() => { const next = !translationEnabled; setTranslationEnabled(next); localStorage.setItem(`chat_translate_enabled_${activeCharacterId}`, JSON.stringify(next)); if (next) { trackEvent('开启聊天翻译', { targetLang: isTranslationLangPreset(translateTargetLang) ? translateTargetLang : 'custom' }); } if (!next) { setShowingTargetIds(new Set()); } }}

@@ -408,11 +408,14 @@ const GroupChat: React.FC = () => {
     // UI State — 面板状态对齐私聊 ChatInputArea 的 showPanel 约定
     const [showPanel, setShowPanel] = useState<'none' | 'actions' | 'emojis' | 'chars'>('none');
     const [activeEmojiCategory, setActiveEmojiCategory] = useState('default');
-    const [modalType, setModalType] = useState<'none' | 'create' | 'settings' | 'transfer' | 'member_select' | 'message-options' | 'edit-message' | 'packet-detail' | 'chrome-css' | 'chrome-sound' | 'html-prompt' | 'help'>('none');
+    const [modalType, setModalType] = useState<'none' | 'create' | 'settings' | 'transfer' | 'member_select' | 'message-options' | 'edit-message' | 'insert-message' | 'packet-detail' | 'chrome-css' | 'chrome-sound' | 'html-prompt' | 'help'>('none');
     const [tempHtmlPrompt, setTempHtmlPrompt] = useState('');
     const [selectedMessage, setSelectedMessage] = useState<Message | null>(null);
     const [replyTarget, setReplyTarget] = useState<Message | null>(null);
     const [editContent, setEditContent] = useState('');
+    // 「在下方插入消息」草稿：发送者是 'user' 或某个成员的 charId
+    const [insertContent, setInsertContent] = useState('');
+    const [insertSenderId, setInsertSenderId] = useState('user');
     const [preserveContext, setPreserveContext] = useState(true);
     const [isSummarizing, setIsSummarizing] = useState(false);
     const [summaryProgress, setSummaryProgress] = useState('');
@@ -620,6 +623,47 @@ const GroupChat: React.FC = () => {
         setSelectedMessage(null);
         addToast('消息已修改', 'success');
         trackEvent('编辑一条群消息');
+    };
+
+    // 「消息操作 → 在下方插入消息」：在所选消息之后插一条自定义 text 消息，
+    // 发送者可以是「我」或任一群成员
+    const handleInsertMessage = async () => {
+        if (!activeGroup || !selectedMessage) return;
+        const trimmed = insertContent.trim();
+        if (!trimmed) return;
+        const anchor = selectedMessage;
+        // 时间戳取所选消息与下一条的中点，保持时间线不倒流；所选已是最后一条则贴着它 +1ms
+        const idx = messages.findIndex(m => m.id === anchor.id);
+        const next = idx >= 0 ? messages[idx + 1] : undefined;
+        const timestamp = next && next.timestamp > anchor.timestamp
+            ? Math.floor((anchor.timestamp + next.timestamp) / 2)
+            : anchor.timestamp + 1;
+        const isUser = insertSenderId === 'user';
+        try {
+            const inserted = await DB.insertMessageAfter(anchor.id, {
+                charId: isUser ? 'user' : insertSenderId,
+                groupId: activeGroup.id,
+                role: isUser ? 'user' : 'assistant',
+                type: 'text',
+                content: trimmed,
+                timestamp,
+            });
+            // 群历史变了给成员逐个打脏（同 handleSendMessage），云端 fire_pack 才不会漏这条
+            markGroupMembersDirty(activeGroup.members);
+            setMessages(prev => {
+                const i = prev.findIndex(m => m.id === anchor.id);
+                if (i < 0) return [...prev, inserted];
+                return [...prev.slice(0, i + 1), inserted, ...prev.slice(i + 1)];
+            });
+            setTotalMsgCount(prev => prev + 1);
+            setModalType('none');
+            setSelectedMessage(null);
+            addToast('消息已插入', 'success');
+            trackEvent('在群消息后插入一条消息', { 发送者: isUser ? '我' : '成员' });
+        } catch (e) {
+            console.error('Insert group message failed:', e);
+            addToast('插入失败，请重试', 'error');
+        }
     };
 
     const toggleMessageSelection = useCallback((id: number) => {
@@ -2000,6 +2044,12 @@ ${memberTimeline || '(暂无互动记录)'}
                             修改内容
                         </button>
                     )}
+                    <button
+                        onClick={() => { setInsertContent(''); setInsertSenderId('user'); setModalType('insert-message'); }}
+                        className="w-full py-3 bg-slate-50 text-slate-700 font-medium rounded-2xl active:bg-slate-100 transition-colors flex items-center justify-center gap-2"
+                    >
+                        在下方插入消息
+                    </button>
                     <button onClick={handleDeleteSingleMessage} className="w-full py-3 bg-red-50 text-red-500 font-medium rounded-2xl active:bg-red-100 transition-colors flex items-center justify-center gap-2">
                         删除消息
                     </button>
@@ -2016,6 +2066,55 @@ ${memberTimeline || '(暂无互动记录)'}
                     onChange={e => setEditContent(e.target.value)}
                     className="w-full h-32 bg-slate-100 rounded-2xl p-4 resize-none focus:ring-1 focus:ring-primary/20 transition-all text-sm leading-relaxed"
                 />
+            </Modal>
+
+            {/* Insert Message Modal — 在所选消息之后插入一条自定义消息，发送者可选「我」或任一成员 */}
+            <Modal
+                isOpen={modalType === 'insert-message'} title="插入消息" onClose={() => { setModalType('none'); setSelectedMessage(null); }}
+                footer={<>
+                    <button onClick={() => { setModalType('none'); setSelectedMessage(null); }} className="flex-1 py-3 bg-slate-100 rounded-2xl">取消</button>
+                    <button
+                        onClick={handleInsertMessage}
+                        disabled={!insertContent.trim()}
+                        className={`flex-1 py-3 font-bold rounded-2xl transition-colors ${insertContent.trim() ? 'bg-primary text-white' : 'bg-slate-100 text-slate-300'}`}
+                    >
+                        插入
+                    </button>
+                </>}
+            >
+                <div className="space-y-3">
+                    <p className="text-xs text-slate-400">新消息会插在所选消息的下方。</p>
+                    <div>
+                        <label className="text-[10px] font-bold text-slate-400 mb-1.5 block">发送者</label>
+                        <div className="flex flex-wrap gap-1.5">
+                            <button
+                                onClick={() => setInsertSenderId('user')}
+                                className={`px-3 py-1.5 rounded-full text-[11px] font-bold transition-all ${insertSenderId === 'user' ? 'bg-primary text-white' : 'bg-slate-100 text-slate-500'}`}
+                            >
+                                我
+                            </button>
+                            {(activeGroup?.members || []).map(memberId => {
+                                const member = characters.find(c => c.id === memberId);
+                                if (!member) return null;
+                                return (
+                                    <button
+                                        key={memberId}
+                                        onClick={() => setInsertSenderId(memberId)}
+                                        className={`max-w-[8rem] px-3 py-1.5 rounded-full text-[11px] font-bold transition-all truncate ${insertSenderId === memberId ? 'bg-primary text-white' : 'bg-slate-100 text-slate-500'}`}
+                                    >
+                                        {member.name}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+                    <textarea
+                        value={insertContent}
+                        onChange={e => setInsertContent(e.target.value)}
+                        placeholder="输入要插入的消息内容…"
+                        className="w-full h-32 bg-slate-100 rounded-2xl p-4 resize-none focus:ring-1 focus:ring-primary/20 transition-all text-sm leading-relaxed"
+                    />
+                </div>
             </Modal>
 
             {/* Transfer Modal — 红包 2.0：拼手气 / 专属 */}
