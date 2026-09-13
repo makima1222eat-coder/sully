@@ -656,6 +656,12 @@ const ChatInputArea: React.FC<ChatInputAreaProps> = ({
                                 <span className="text-xs font-bold">转账</span>
                             </button>
                             
+                            {([['silent', '已读不回', '👀'], ['block', '拉黑', '🚫'], ['unblock', '解除拉黑', '🔓'], ['react', '回应消息', '❤️']] as const).map(([action, label, icon]) => (
+                                <button key={action} onClick={() => onPanelAction(action)} className="flex flex-col items-center gap-2 active:scale-95 transition-transform">
+                                    <div className="w-14 h-14 rounded-2xl flex items-center justify-center shadow-sm border bg-white/10 text-2xl">{icon}</div>
+                                    <span className="text-xs font-bold">{label}</span>
+                                </button>
+                            ))}
                             <button onClick={() => onPanelAction('poke')} className={`flex flex-col items-center gap-2 active:scale-95 transition-transform ${acnh ? 'text-[#725d42]' : isDiscordStyle ? 'text-slate-200' : 'text-slate-600'}`}>
                                 {acnh ? <AcnhActionTile kind="poke" /> : (
                                 <div className={`w-14 h-14 rounded-2xl flex items-center justify-center shadow-sm border ${isDiscordStyle ? 'bg-slate-800 border-sky-400/20' : 'bg-sky-50 border-sky-100'}`}><img src="https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/1f449.png" alt="poke" className="w-6 h-6" /></div>)}

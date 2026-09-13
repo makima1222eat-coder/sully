@@ -1,3 +1,4 @@
+import { conversationBlocked, executeConversationActions, isSilent } from '../utils/conversationActions';
 import React, { useState, useEffect, useRef, useLayoutEffect, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useOS } from '../context/OSContext';
@@ -1337,7 +1338,24 @@ const Chat: React.FC = () => {
         noteMessageSent();
         // 借用户"发送"这个手势解锁音频上下文，好让稍后 AI 回复时的白框提示音能顺利播放（移动端自动播放策略）。
         unlockWhiteboxAudio();
-        const text = customContent || input.trim();
+        let text = customContent || input.trim();
+        if (conversationBlocked(await DB.getMessagesByCharId(char.id, true)) && /\[\[ACTION:UNBLOCK\]\]/i.test(text) && !isSilent(text)) {
+            await executeConversationActions('[[ACTION:UNBLOCK]]', char.id, 'user');
+            text = text.replace(/\[\[ACTION:UNBLOCK\]\]/gi, '').trim();
+            await reloadMessages(visibleCountRef.current);
+        }
+        if (conversationBlocked(await DB.getMessagesByCharId(char.id, true))) {
+            addToast('当前聊天已被拉黑，请由拉黑方解除后再发送', 'info');
+            return;
+        }
+        if (!customType || customType === 'text') {
+            text = await executeConversationActions(text, char.id, 'user');
+            if (!text) {
+                setInput(''); localStorage.removeItem(draftKey);
+                await reloadMessages(visibleCountRef.current);
+                return;
+            }
+        }
         const type = customType || 'text';
 
         // 发消息隐含"回到当前聊天"——退出 windowed 旧消息浏览模式
@@ -1694,6 +1712,14 @@ const Chat: React.FC = () => {
             case 'memory-link': setShowPanel('none'); setMemoryRepairOpen(true); break;
             case 'favorites': setShowPanel('none'); setFavoritesOpen(true); break;
             case 'transfer': setModalType('transfer'); break;
+            case 'silent': handleSendText('[[ACTION:SILENT]]'); break;
+            case 'block': handleSendText('[[ACTION:BLOCK]]'); break;
+            case 'unblock': handleSendText('[[ACTION:UNBLOCK]]'); break;
+            case 'react':
+                setInput('[[ACTION:REACT|char|1|❤️]]');
+                setShowPanel('none');
+                addToast('可修改 user/char、消息序号和表情后发送', 'info');
+                break;
             case 'poke': handleSendText('[戳一戳]', 'interaction'); break;
             case 'archive': setModalType('archive-settings'); break;
             case 'settings': setModalType('chat-settings'); break;

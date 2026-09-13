@@ -1,3 +1,4 @@
+import { conversationBlocked, executeConversationActions, isSilent } from './conversationActions';
 /**
  * applyAssistantPostProcessing — 抽自 hooks/useChatAI.ts 的 sendMessage 后处理管线
  *
@@ -566,6 +567,17 @@ export async function applyAssistantPostProcessing(
         reasoningContent: pushReasoningContent,
         messageTimestamp,
     } = ctx;
+    if (conversationBlocked(await DB.getMessagesByCharId(char.id, true))) {
+        if (/\[\[ACTION:UNBLOCK\]\]/i.test(rawAiContent) && !isSilent(rawAiContent)) {
+            await executeConversationActions('[[ACTION:UNBLOCK]]', char.id, 'assistant', messageTimestamp, mcdInheritMeta);
+            rawAiContent = rawAiContent.replace(/\[\[ACTION:UNBLOCK\]\]/gi, '');
+        }
+        if (conversationBlocked(await DB.getMessagesByCharId(char.id, true))) return;
+    }
+    if (isSilent(rawAiContent)) {
+        await executeConversationActions(rawAiContent, char.id, 'assistant', messageTimestamp, mcdInheritMeta);
+        return;
+    }
     const { baseUrl, headers, effectiveApi } = api;
     // 拟人打字延迟：流式预览已实时展示过气泡时（instantRender）跳过，避免二次慢放
     const typingPause = (ms: number): Promise<void> =>

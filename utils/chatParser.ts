@@ -1,3 +1,4 @@
+import { executeConversationActions } from './conversationActions';
 
 import { DB } from './db';
 import { LocalNotifications } from '@capacitor/local-notifications';
@@ -156,7 +157,7 @@ export const ChatParser = {
          */
         frozenMusicSong?: FrozenMusicSong,
     ) => {
-        let content = aiContent;
+        let content = await executeConversationActions(aiContent, charId, 'assistant', messageTimestamp, inheritMeta);
         /** 落库统一走这里，别直接调 DB.saveMessage —— 漏一处就是一条消息两个时间、重试时还认不出来。 */
         const persist = (msg: Parameters<typeof DB.saveMessage>[0]) => DB.saveMessage({
             ...msg,

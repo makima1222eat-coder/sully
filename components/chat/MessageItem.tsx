@@ -1485,7 +1485,7 @@ const MessageItem = React.memo(({
     thinkingChainOptions,
 }: MessageItemProps) => {
     const isUser = m.role === 'user';
-    const isSystem = m.role === 'system';
+    const isSystem = m.role === 'system' || !!m.metadata?.conversationAction;
     const spacingClass = messageSpacing === 'compact' ? (isLastInGroup ? 'mb-3' : 'mb-0.5') : messageSpacing === 'spacious' ? (isLastInGroup ? 'mb-8' : 'mb-2.5') : (isLastInGroup ? 'mb-6' : 'mb-1.5');
     const marginBottom = spacingClass;
     const avatarSizeClass = avatarSize === 'small' ? 'w-7 h-7' : avatarSize === 'large' ? 'w-12 h-12' : 'w-9 h-9';
