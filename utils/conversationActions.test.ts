@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DB } from './db';
-import { conversationBlocked, latestTurnMessage, executeConversationActions } from './conversationActions';
+import { conversationBlocked, latestTurnMessage, executeConversationActions, reactToSelectedMessage } from './conversationActions';
 import { Message } from '../types';
 vi.mock('./db', () => ({ DB: { getMessagesByCharId: vi.fn(), saveMessage: vi.fn() } }));
 const msg = (id: number, role: Message['role'], action?: string): Message => ({ id, role, charId: 'c', type: 'text', content: 'message ' + id, timestamp: id, metadata: action ? { conversationAction: action } : undefined });
@@ -29,5 +29,30 @@ describe('conversation actions', () => {
  it('ignores invalid targets', async () => {
  await executeConversationActions('[[ACTION:REACT|char|9|❤️]]','c','user');
  expect(DB.saveMessage).not.toHaveBeenCalled();
+ });
+});
+
+describe('selected message reactions', () => {
+ it('targets an older message by ID even after newer turns arrive', async () => {
+  vi.mocked(DB.getMessagesByCharId).mockResolvedValue([msg(1,'assistant'),msg(2,'user'),msg(3,'assistant')]);
+  await reactToSelectedMessage('c',1,'❤️😂');
+  expect(DB.saveMessage).toHaveBeenCalledWith(expect.objectContaining({role:'user', replyTo:expect.objectContaining({id:1}), metadata:expect.objectContaining({targetMessageId:1})}));
+ });
+ it('allows reacting to the user own message', async () => {
+  await reactToSelectedMessage('c',1,'👍');
+  expect(DB.saveMessage).toHaveBeenCalledWith(expect.objectContaining({replyTo:expect.objectContaining({id:1,name:'user'})}));
+ });
+ it('rejects deleted targets without redirecting to a newer message', async () => {
+  await expect(reactToSelectedMessage('c',99,'❤️')).rejects.toThrow('不存在');
+  expect(DB.saveMessage).not.toHaveBeenCalled();
+ });
+ it('preserves block restrictions', async () => {
+  vi.mocked(DB.getMessagesByCharId).mockResolvedValue([msg(1,'assistant'),msg(2,'user','block')]);
+  await expect(reactToSelectedMessage('c',1,'❤️')).rejects.toThrow('拉黑');
+  expect(DB.saveMessage).not.toHaveBeenCalled();
+ });
+ it('rejects non-emoji input', async () => {
+  await expect(reactToSelectedMessage('c',1,'hello')).rejects.toThrow('表情');
+  expect(DB.saveMessage).not.toHaveBeenCalled();
  });
 });

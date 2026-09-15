@@ -656,7 +656,7 @@ const ChatInputArea: React.FC<ChatInputAreaProps> = ({
                                 <span className="text-xs font-bold">转账</span>
                             </button>
                             
-                            {([['silent', '已读不回', '👀'], ['block', '拉黑', '🚫'], ['unblock', '解除拉黑', '🔓'], ['react', '回应消息', '❤️']] as const).map(([action, label, icon]) => (
+                            {([['silent', '已读不回', '👀'], ['block', '拉黑', '🚫'], ['unblock', '解除拉黑', '🔓']] as const).map(([action, label, icon]) => (
                                 <button key={action} onClick={() => onPanelAction(action)} className="flex flex-col items-center gap-2 active:scale-95 transition-transform">
                                     <div className="w-14 h-14 rounded-2xl flex items-center justify-center shadow-sm border bg-white/10 text-2xl">{icon}</div>
                                     <span className="text-xs font-bold">{label}</span>

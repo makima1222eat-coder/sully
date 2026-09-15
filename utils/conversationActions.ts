@@ -3,6 +3,26 @@ import { DB } from './db';
 
 export const isSilent = (text: string) => /\[\[ACTION:(?:SILENT|LEAVE_ON_READ)\]\]/i.test(text);
 
+/** User selection uses a stable ID, including messages outside the latest turn. */
+export async function reactToSelectedMessage(charId: string, messageId: number, emojis: string) {
+    const history = await DB.getMessagesByCharId(charId, true);
+    if (conversationBlocked(history)) throw new Error('当前聊天已被拉黑，请由拉黑方解除后再添加反应');
+    const target = history.find(m => m.id === messageId && m.charId === charId && !m.groupId);
+    if (!target || target.role === 'system' || target.metadata?.conversationAction) {
+        throw new Error('这条消息已不存在或不支持添加反应');
+    }
+    const emoji = emojis.trim();
+    if (!emoji || emoji.length > 100 || !/\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u.test(emoji)) {
+        throw new Error('请输入表情符号（最多 100 个字符）');
+    }
+    await DB.saveMessage({
+        charId, role: 'user', type: 'system',
+        content: `[user 对 ${target.role === 'user' ? 'user' : 'char'} 的消息「${target.content.slice(0, 100)}」回应了 ${emoji}]`,
+        metadata: { conversationAction: 'react', targetMessageId: target.id },
+        replyTo: { id: target.id, content: target.content, name: target.role === 'user' ? 'user' : 'char' },
+    });
+}
+
 export function conversationBlocked(messages: Message[]) {
     const state = { user: false, assistant: false };
     for (const m of messages) {

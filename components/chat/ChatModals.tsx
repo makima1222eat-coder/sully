@@ -1,6 +1,7 @@
 
 import React, { useRef, useState } from 'react';
 import Modal from '../os/Modal';
+import MessageReactionPicker from './MessageReactionPicker';
 import TokenImg from '../os/TokenImg';
 import { CharacterProfile, Message, EmojiCategory, DailySchedule, ScheduleSlot, ApiPreset, APIConfig } from '../../types';
 import ScheduleCard from '../schedule/ScheduleCard';
@@ -78,6 +79,7 @@ interface ChatModalsProps {
     onJumpToMessageInChat?: (id: number) => void;
     onEnterSelectionMode: () => void;
     onReplyMessage: () => void;
+    onReactToMessage?: (emojis: string) => Promise<void>;
     onEditMessageStart: () => void;
     onConfirmEditMessage: () => void;
     onDeleteMessage: () => void;
@@ -257,7 +259,7 @@ const ChatModals: React.FC<ChatModalsProps> = ({
     onTransfer, onImportEmoji, onSaveSettings,
     onBgUpload, onRemoveBg, onClearHistory,
     onArchive, onCreatePrompt, onEditPrompt, onSavePrompt, onDeletePrompt,
-    onSetHistoryStart, onRestoreAdaptiveContext, onJumpToMessageInChat, onEnterSelectionMode, onReplyMessage, onEditMessageStart, onConfirmEditMessage, onDeleteMessage, onCopyMessage, onInsertMessage, onToggleMessageFavorite, messageFavorited, onDeleteEmoji, onDeleteCategory,
+    onSetHistoryStart, onRestoreAdaptiveContext, onJumpToMessageInChat, onEnterSelectionMode, onReplyMessage, onReactToMessage, onEditMessageStart, onConfirmEditMessage, onDeleteMessage, onCopyMessage, onInsertMessage, onToggleMessageFavorite, messageFavorited, onDeleteEmoji, onDeleteCategory,
     allCharacters = [], onSaveCategoryVisibility,
     translationEnabled, onToggleTranslation, translationExpanded, onToggleTranslationExpanded, translateSourceLang, translateTargetLang, onSetTranslateSourceLang, onSetTranslateLang,
     xhsEnabled, onToggleXhs,
@@ -984,6 +986,9 @@ const ChatModals: React.FC<ChatModalsProps> = ({
                     <button onClick={onEnterSelectionMode} className="w-full py-3 bg-slate-50 text-slate-700 font-medium rounded-2xl active:bg-slate-100 transition-colors flex items-center justify-center gap-2">
                         多选 / 批量删除
                     </button>
+                    {selectedMessage && selectedMessage.role !== 'system' && !selectedMessage.metadata?.conversationAction && onReactToMessage && modalType === 'message-options' && (
+                        <MessageReactionPicker key={selectedMessage.id} onSubmit={onReactToMessage} />
+                    )}
                     <button onClick={onReplyMessage} className="w-full py-3 bg-slate-50 text-slate-700 font-medium rounded-2xl active:bg-slate-100 transition-colors flex items-center justify-center gap-2">
                         引用 / 回复
                     </button>

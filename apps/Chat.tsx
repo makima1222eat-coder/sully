@@ -1,4 +1,4 @@
-import { conversationBlocked, executeConversationActions, isSilent } from '../utils/conversationActions';
+import { conversationBlocked, executeConversationActions, isSilent, reactToSelectedMessage } from '../utils/conversationActions';
 import React, { useState, useEffect, useRef, useLayoutEffect, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useOS } from '../context/OSContext';
@@ -1715,11 +1715,6 @@ const Chat: React.FC = () => {
             case 'silent': handleSendText('[[ACTION:SILENT]]'); break;
             case 'block': handleSendText('[[ACTION:BLOCK]]'); break;
             case 'unblock': handleSendText('[[ACTION:UNBLOCK]]'); break;
-            case 'react':
-                setInput('[[ACTION:REACT|char|1|❤️]]');
-                setShowPanel('none');
-                addToast('可修改 user/char、消息序号和表情后发送', 'info');
-                break;
             case 'poke': handleSendText('[戳一戳]', 'interaction'); break;
             case 'archive': setModalType('archive-settings'); break;
             case 'settings': setModalType('chat-settings'); break;
@@ -3631,6 +3626,12 @@ const Chat: React.FC = () => {
                 onClearHistory={handleClearHistory} onArchive={handleFullArchive}
                 onCreatePrompt={createNewPrompt} onEditPrompt={editSelectedPrompt} onSavePrompt={handleSavePrompt} onDeletePrompt={handleDeletePrompt}
                 onSetHistoryStart={handleSetHistoryStart} onRestoreAdaptiveContext={restoreAdaptiveContext} onJumpToMessageInChat={handleJumpToMessageInChat} onEnterSelectionMode={handleEnterSelectionMode}
+                onReactToMessage={async (emojis) => {
+                    if (!selectedMessage || !char) return;
+                    await reactToSelectedMessage(char.id, selectedMessage.id, emojis);
+                    await reloadMessages(visibleCountRef.current);
+                    setModalType('none');
+                }}
                 onReplyMessage={handleReplyMessage} onEditMessageStart={() => { if (selectedMessage) { setEditContent(selectedMessage.content); setModalType('edit-message'); } }}
                 onConfirmEditMessage={confirmEditMessage} onDeleteMessage={handleDeleteMessage} onCopyMessage={handleCopyMessage} onInsertMessage={handleInsertMessage}
                 messageFavorited={!!(selectedMessage && contentFavoriteIds.has(contentFavoriteIdForMessage(selectedMessage)))}
