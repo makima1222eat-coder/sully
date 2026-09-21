@@ -1,6 +1,7 @@
 
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { useOS } from '../context/OSContext';
+import ReplySuggestionsApiSettings from '../components/settings/ReplySuggestionsApiSettings';
 import { Capacitor } from '@capacitor/core';
 import { extractContent, safeResponseJson } from '../utils/safeApi';
 import { extractModelIds, normalizeModelIds } from '../utils/modelList';
@@ -2489,6 +2490,8 @@ const Settings: React.FC = () => {
                 )}
             </div>
         </SettingsSection>
+
+        <ReplySuggestionsApiSettings config={apiConfig} onSave={updateApiConfig} />
 
         {/* 独立识图 API：给不支持 image_url 的主模型补视觉能力；可手动从通用模型预设载入。 */}
         <SettingsSection

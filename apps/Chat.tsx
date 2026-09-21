@@ -1,4 +1,5 @@
 import { conversationBlocked, executeConversationActions, isSilent, reactToSelectedMessage } from '../utils/conversationActions';
+import ReplySuggestions from '../components/chat/ReplySuggestions';
 import React, { useState, useEffect, useRef, useLayoutEffect, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { useOS } from '../context/OSContext';
@@ -1332,7 +1333,7 @@ const Chat: React.FC = () => {
 
     // --- Actions ---
 
-    const handleSendText = async (customContent?: string, customType?: MessageType, metadata?: any) => {
+    const handleSendText = async (customContent?: string, customType?: MessageType, metadata?: any, suppressAutoReply = false) => {
         if (!char || (!input.trim() && !customContent)) return;
         // 只累加内存里的计数，这里不发任何请求；页面切走时才按区间报一次。见 utils/analytics.ts
         noteMessageSent();
@@ -1596,7 +1597,7 @@ const Chat: React.FC = () => {
         // autoTriggerOnSend gate：instant ready 也只在用户显式开启"发送后自动触发"时才自动回复，
         // 否则保留手动 ⚡（避免"启用 instant = 自动回复"的反直觉强绑定）。
         const instantCfg = loadInstantConfig();
-        if (type === 'text' && isInstantConfigReady(instantCfg) && instantCfg.autoTriggerOnSend) {
+        if (!suppressAutoReply && type === 'text' && isInstantConfigReady(instantCfg) && instantCfg.autoTriggerOnSend) {
             // 上一轮还在跑时直接跳过：triggerAI 内部会因 isTyping=true 静默 reject，
             // 提前 guard 避免点亮"准备中"指示灯后没人来清，UI 灯被卡住。
             if (isTyping) return;
@@ -4190,6 +4191,12 @@ const Chat: React.FC = () => {
 
                 {/* 开关写着「已开启」、这一轮却在本地生成时，把原因说给用户听 */}
                 <InstantChatRouteNotice charId={activeCharacterId} />
+
+                {char && !selectionMode && <ReplySuggestions
+                    key={`${char.id}:${messages.at(-1)?.id ?? ''}`} config={apiConfig} user={userProfile} characters={[char]} disabled={isTyping}
+                    loadHistory={() => DB.getRecentMessagesByCharId(char.id, 40)}
+                    onSend={text => handleSendText(text, 'text', undefined, true)}
+                />}
 
                 <ChatInputArea
                     input={input} setInput={handleInputChange}

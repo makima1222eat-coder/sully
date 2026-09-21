@@ -260,6 +260,8 @@ export interface VisionApiConfig {
 }
 
 export interface APIConfig {
+  /** 备选回复独立 API；关闭时跟随主 API。 */
+  replySuggestionsApi?: { enabled: boolean; baseUrl: string; apiKey: string; model: string };
   baseUrl: string;
   apiKey: string;
   // 可选识图中转：给不支持 image_url 的主模型补视觉能力。

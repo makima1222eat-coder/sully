@@ -1,6 +1,7 @@
 
 import React, { useState, useEffect, useRef, useLayoutEffect, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
+import ReplySuggestions from '../components/chat/ReplySuggestions';
 import { useOS } from '../context/OSContext';
 import { DB } from '../utils/db';
 import { Message, GroupProfile, CharacterProfile, MessageType, ChatTheme, BubbleStyle, EmojiCategory } from '../types';
@@ -1933,6 +1934,13 @@ ${memberTimeline || '(暂无互动记录)'}
 
             {/* 输入区 — 复用私聊 ChatInputArea（输入/表情面板/多选删除随 OS 外观设置），
                 actions 面板整体替换为群聊自己的 4 格 */}
+            {activeGroup && !selectionMode && <ReplySuggestions
+                key={`${activeGroup.id}:${messages.at(-1)?.id ?? ''}`} config={apiConfig} user={userProfile}
+                characters={characters.filter(c => activeGroup.members.includes(c.id))}
+                groupName={activeGroup.name} disabled={isTyping}
+                loadHistory={async () => (await DB.getRecentGroupMessagesWithCount(activeGroup.id, 40)).messages}
+                onSend={text => handleSendMessage(text)}
+            />}
             <ChatInputArea
                 input={input}
                 setInput={setInput}
