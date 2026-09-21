@@ -168,6 +168,7 @@ const Chat: React.FC = () => {
     const [newEmojiName, setNewEmojiName] = useState(''); // 表情包重命名输入框
 
     const scrollRef = useRef<HTMLDivElement>(null);
+    const [replyOptionsTarget, setReplyOptionsTarget] = useState<HTMLDivElement | null>(null);
     const lastMsgIdRef = useRef<number | null>(null);
     // 最新图片在移动端异步解码后会把消息列表继续向下撑开。记录这一条，等真实高度
     // 确定后再补一次贴底；用户一旦主动向上翻，就清掉它，绝不抢滚动位置。
@@ -1333,7 +1334,7 @@ const Chat: React.FC = () => {
 
     // --- Actions ---
 
-    const handleSendText = async (customContent?: string, customType?: MessageType, metadata?: any, suppressAutoReply = false) => {
+    const handleSendText = async (customContent?: string, customType?: MessageType, metadata?: any, suppressAutoReply = false, skipReplyTarget = false) => {
         if (!char || (!input.trim() && !customContent)) return;
         // 只累加内存里的计数，这里不发任何请求；页面切走时才按区间报一次。见 utils/analytics.ts
         noteMessageSent();
@@ -1422,7 +1423,7 @@ const Chat: React.FC = () => {
 
         const msgPayload: any = { charId: char.id, role: 'user', type, content: storedContent, metadata };
         
-        if (replyTarget) {
+        if (replyTarget && !skipReplyTarget) {
             msgPayload.replyTo = {
                 // 引用图片 / 表情时快照存 '[图片]' 之类的占位符，不把令牌原样带进这条消息
                 // （跟角色侧的引用快照同一个函数，口径一致）
@@ -4134,6 +4135,7 @@ const Chat: React.FC = () => {
                         </div>
                     </div>
                 )}
+                <div ref={setReplyOptionsTarget} />
             </div>
 
             <div className="relative z-40">
@@ -4193,9 +4195,10 @@ const Chat: React.FC = () => {
                 <InstantChatRouteNotice charId={activeCharacterId} />
 
                 {char && !selectionMode && <ReplySuggestions
-                    key={`${char.id}:${messages.at(-1)?.id ?? ''}`} config={apiConfig} user={userProfile} characters={[char]} disabled={isTyping}
+                    key={char.id} config={apiConfig} user={userProfile} characters={[char]} disabled={isTyping}
+                    optionsTarget={replyOptionsTarget} historyRevision={messages.at(-1)?.id}
                     loadHistory={() => DB.getRecentMessagesByCharId(char.id, 40)}
-                    onSend={text => handleSendText(text, 'text', undefined, true)}
+                    onSend={(text, bubbleIndex) => handleSendText(text, 'text', undefined, true, bubbleIndex > 0)}
                 />}
 
                 <ChatInputArea

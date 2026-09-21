@@ -573,6 +573,7 @@ const GroupChat: React.FC = () => {
     
     // Refs
     const scrollRef = useRef<HTMLDivElement>(null);
+    const [replyOptionsTarget, setReplyOptionsTarget] = useState<HTMLDivElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const groupAvatarInputRef = useRef<HTMLInputElement>(null);
     // 生成中的取消句柄：非空 = 正在生成，再点触发按钮 = 停止
@@ -937,7 +938,7 @@ const GroupChat: React.FC = () => {
 
     // --- Logic: Messaging ---
 
-    const handleSendMessage = async (content: string, type: MessageType = 'text', metadata?: any) => {
+    const handleSendMessage = async (content: string, type: MessageType = 'text', metadata?: any, suggestionBubbleIndex?: number) => {
         if (!activeGroup) return;
         if (type === 'text' && !content.trim()) return;
         // 借用户"发送"手势解锁音频上下文（移动端自动播放策略），稍后 AI 回复时提示音才响得了
@@ -954,7 +955,7 @@ const GroupChat: React.FC = () => {
 
         // 引用回复：落快照（对齐私聊 Chat.tsx 的做法），发完清空。
         // 图片 / 表情走占位符，不把 blobref 令牌原样存进快照。
-        if (replyTarget) {
+        if (replyTarget && (suggestionBubbleIndex === undefined || suggestionBubbleIndex === 0)) {
             newMessage.replyTo = {
                 id: replyTarget.id,
                 content: buildReplySnapshotContent(replyTarget),
@@ -973,7 +974,7 @@ const GroupChat: React.FC = () => {
         if (type !== 'text') {
             setShowPanel('none');
         }
-        setInput('');
+        if (suggestionBubbleIndex === undefined) setInput('');
 
         // NOTE: No auto-trigger. User must click lightning button.
     };
@@ -1920,6 +1921,7 @@ ${memberTimeline || '(暂无互动记录)'}
                         <span className="text-xs text-slate-400 font-medium">{mcpStatus || '成员正在输入...'}</span>
                     </div>
                 )}
+                <div ref={setReplyOptionsTarget} />
             </div>
 
             {/* Redesigned Input Area (WeChat/iOS Style) */}
@@ -1935,11 +1937,12 @@ ${memberTimeline || '(暂无互动记录)'}
             {/* 输入区 — 复用私聊 ChatInputArea（输入/表情面板/多选删除随 OS 外观设置），
                 actions 面板整体替换为群聊自己的 4 格 */}
             {activeGroup && !selectionMode && <ReplySuggestions
-                key={`${activeGroup.id}:${messages.at(-1)?.id ?? ''}`} config={apiConfig} user={userProfile}
+                key={activeGroup.id} config={apiConfig} user={userProfile}
+                optionsTarget={replyOptionsTarget} historyRevision={messages.at(-1)?.id}
                 characters={characters.filter(c => activeGroup.members.includes(c.id))}
                 groupName={activeGroup.name} disabled={isTyping}
                 loadHistory={async () => (await DB.getRecentGroupMessagesWithCount(activeGroup.id, 40)).messages}
-                onSend={text => handleSendMessage(text)}
+                onSend={(text, bubbleIndex) => handleSendMessage(text, 'text', undefined, bubbleIndex)}
             />}
             <ChatInputArea
                 input={input}

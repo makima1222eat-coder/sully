@@ -5,7 +5,7 @@ import type { APIConfig, CharacterProfile, Message } from '../types';
 
 vi.mock('./safeApi', () => ({ safeFetchJson: vi.fn(), extractContent: (data: any) => data.choices[0].message.content }));
 const user = { name: '小林', bio: '内向，喜欢简短表达和音乐', avatar: '' };
-const replies = ['听起来不错', '你当时是怎么想的？', '对了，最近听到一首歌'];
+const replies = [['听起来不错', '我也想试试'], ['你当时是怎么想的？'], ['对了', '最近听到一首歌']];
 const config = { baseUrl: 'https://main.test/v1', apiKey: 'main', model: 'main-model' } as APIConfig;
 
 describe('用户备选回复', () => {
@@ -23,9 +23,13 @@ describe('用户备选回复', () => {
     });
     it('严格要求三个不同的纯文本回复', () => {
         expect(parseReplySuggestions('```json\n' + JSON.stringify({ replies }) + '\n```')).toEqual(replies);
-        for (const bad of [[], ['a', 'b'], ['a', 'a', 'b'], ['a', '', 'b'], ['a', '[[ACTION:BLOCK]]', 'b']]) {
+        for (const bad of [[], ['a', 'b'], ['a', 'a', 'b'], ['a', '', 'b'], ['a', '[[ACTION:BLOCK]]', 'b'], [[], ['b'], ['c']], [['a', 1], ['b'], ['c']], [Array(7).fill('a'), ['b'], ['c']]]) {
             expect(() => parseReplySuggestions(JSON.stringify({ replies: bad }))).toThrow();
         }
+    });
+    it('兼容单条文本和换行分气泡，不按标点或空格拆分', () => {
+        expect(parseReplySuggestions(JSON.stringify({ replies: ['你好，今天好吗？', '嗯\n我想听听你的看法', ['换个话题', '听歌吧']] })))
+            .toEqual([['你好，今天好吗？'], ['嗯', '我想听听你的看法'], ['换个话题', '听歌吧']]);
     });
     it('独立配置使用自己的地址、密钥和模型，关闭后回到主 API', async () => {
         vi.mocked(safeFetchJson).mockResolvedValue({ choices: [{ message: { content: JSON.stringify({ replies }) } }] });

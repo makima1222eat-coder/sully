@@ -3789,7 +3789,7 @@ const Settings: React.FC = () => {
       </Modal>
 
       {/* 模型选择 Modal */}
-      <Modal isOpen={showModelModal} title="选择模型" onClose={() => setShowModelModal(false)}>
+      <Modal keyboardAware isOpen={showModelModal} title="选择模型" onClose={() => setShowModelModal(false)}>
         {(() => {
             const { filtered, commonPrefix } = modelPickerView;
             return (
@@ -3800,7 +3800,7 @@ const Settings: React.FC = () => {
                             value={localModel}
                             onChange={(e) => setLocalModel(e.target.value)}
                             placeholder="手动输入模型名称..."
-                            className="flex-1 bg-white/50 border border-slate-200/60 rounded-xl px-4 py-2.5 text-sm font-mono focus:outline-primary focus:bg-white transition-all"
+                            className="min-w-0 flex-1 bg-white/50 border border-slate-200/60 rounded-xl px-4 py-2.5 text-base font-mono focus:outline-primary focus:bg-white transition-all"
                         />
                         <button
                             onClick={() => setShowModelModal(false)}
@@ -3816,7 +3816,7 @@ const Settings: React.FC = () => {
                                 value={modelFilter}
                                 onChange={(e) => setModelFilter(e.target.value)}
                                 placeholder={`🔍 搜索 ${availableModels.length} 个模型...`}
-                                className="w-full bg-slate-50 border border-slate-200/60 rounded-xl px-4 py-2 text-xs focus:outline-primary focus:bg-white transition-all"
+                                className="w-full bg-slate-50 border border-slate-200/60 rounded-xl px-4 py-2 text-base focus:outline-primary focus:bg-white transition-all"
                             />
                             {modelFilter && (
                                 <button
@@ -3869,7 +3869,7 @@ const Settings: React.FC = () => {
       </Modal>
 
       {/* 识图 API 使用独立模型列表，避免覆盖主 API 的模型选择。 */}
-      <Modal isOpen={showVisionModelModal} title="选择识图模型" onClose={() => setShowVisionModelModal(false)}>
+      <Modal keyboardAware isOpen={showVisionModelModal} title="选择识图模型" onClose={() => setShowVisionModelModal(false)}>
         {(() => {
             const { filtered, commonPrefix } = visionModelPickerView;
             return (
