@@ -21,8 +21,8 @@ export default function InnerVoiceBubble({ voice, onSave }: { voice: string; onS
     return <div className="sully-inner-voice-row px-3 mb-3 flex justify-start" onClick={e => e.stopPropagation()}>
         <button type="button" aria-label="编辑心声" disabled={!onSave} onClick={open}
             onContextMenu={e => { e.preventDefault(); open(); }}
-            className="ml-12 max-w-[72%] text-left rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm focus-visible:ring-2 focus-visible:ring-primary">
-            <span className="block text-xs font-bold text-slate-500 mb-1">💭 心声{onSave ? ' · 点击编辑' : ''}</span>
+            className="ml-12 max-w-[72%] text-left rounded-2xl border border-slate-200 bg-transparent px-3 py-2 shadow-sm focus-visible:ring-2 focus-visible:ring-primary">
+            <span className="block text-xs font-bold text-slate-500 mb-1">💭 心声</span>
             <span className="block text-sm text-slate-700 whitespace-pre-wrap break-words">{voice}</span>
         </button>
         <Modal keyboardAware isOpen={editing} title="编辑心声" onClose={() => { if (!saving) setEditing(false); }} footer={
