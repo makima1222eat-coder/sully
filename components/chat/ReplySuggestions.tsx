@@ -81,10 +81,10 @@ export default function ReplySuggestions({ config, user, characters, groupName, 
     };
     const options = replies.length > 0 && <div ref={optionsRef} className="px-4 py-3 space-y-3" aria-label="备选回复选项">
         <p className="text-xs text-slate-500 text-right">{selected === null ? '选择一组发送，不会立即触发对方回复' : busy ? '已选择 · 正在发送这一组' : '已选择 · 点击重试剩余消息'}</p>
-        {replies.map((bubbles, i) => (selected === null || selected === i) && <button type="button" key={i} disabled={busy || disabled} onClick={() => send(i)} className="block w-full rounded-2xl border border-primary/20 p-3 text-right disabled:opacity-70">
+        {replies.map((bubbles, i) => (selected === null || selected === i) && <button type="button" key={i} disabled={busy || disabled} onClick={() => send(i)} style={{ opacity: 1 }} className="block w-full rounded-2xl border border-primary/20 bg-white p-3 text-right disabled:cursor-wait">
             <span className="block text-xs font-bold text-primary mb-2">{i + 1}. {REPLY_LABELS[i]}{selected === i ? ' · 已选择' : ''}</span>
             <span className="flex flex-col items-end gap-2">
-                {bubbles.slice(selected === i ? sentCount : 0).map((text, bubbleIndex) => <span key={bubbleIndex} className="max-w-[90%] rounded-2xl rounded-tr-sm bg-primary/10 px-3 py-2 text-left text-sm whitespace-pre-wrap break-words text-slate-700">{text}</span>)}
+                {bubbles.slice(selected === i ? sentCount : 0).map((text, bubbleIndex) => <span key={bubbleIndex} style={{ opacity: 1, color: '#334155' }} className="max-w-[90%] rounded-2xl rounded-tr-sm bg-slate-100 px-3 py-2 text-left text-sm whitespace-pre-wrap break-words">{text}</span>)}
             </span>
         </button>)}
     </div>;

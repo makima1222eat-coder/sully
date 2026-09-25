@@ -2918,6 +2918,13 @@ const Chat: React.FC = () => {
         trackEvent('删除一条消息');
     };
 
+    const saveInnerVoice = useCallback(async (id: number, voice: string) => {
+        await DB.updateMessageMetadata(id, prev => ({ ...(prev || {}), innerVoice: voice }));
+        setMessages(prev => prev.map(message => message.id === id
+            ? { ...message, metadata: { ...(message.metadata || {}), innerVoice: voice } }
+            : message));
+    }, []);
+
     const confirmEditMessage = async () => {
         if (!selectedMessage) return;
         const contentChanged = editContent !== selectedMessage.content;
@@ -3965,6 +3972,7 @@ const Chat: React.FC = () => {
                             onToggleSelect={toggleMessageSelection}
                             isThinkingSelected={selectedThinkingMsgIds.has(m.id)}
                             onToggleThinkingSelect={toggleThinkingSelection}
+                            onSaveInnerVoice={saveInnerVoice}
                             translationEnabled={translationEnabled && m.type === 'text' && m.role === 'assistant'}
                             translationExpanded={translationExpanded}
                             isShowingTarget={showingTargetIds.has(m.id)}

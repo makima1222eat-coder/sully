@@ -29,11 +29,14 @@ it('三个选项出现在聊天区，选择后只保留所选组，依次发送�
         expect(onSend).not.toHaveBeenCalled();
         expect(container.textContent).not.toContain('深度交流');
         expect(target.querySelectorAll('button')).toHaveLength(3);
+        expect(target.querySelector('button')!.style.opacity).toBe('1');
+        expect(target.querySelector('span[style]')?.getAttribute('style')).toContain('opacity: 1');
         const choice = Array.from(target.querySelectorAll('button')).find(button => button.textContent?.includes('具体怎么想的'))!;
         await act(async () => { choice.click(); choice.click(); });
         expect(onSend).toHaveBeenCalledTimes(1);
         expect(onSend).toHaveBeenCalledWith('具体怎么想的？', 0);
         expect(target.querySelectorAll('button')).toHaveLength(1);
+        expect(target.querySelector('button')!.style.opacity).toBe('1');
         expect(target.textContent).not.toContain('聊聊音乐吧');
         await act(async () => finish());
         expect(onSend).toHaveBeenNthCalledWith(2, '我想听听你的看法', 1);

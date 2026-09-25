@@ -3,6 +3,7 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { Message, ChatTheme } from '../../types';
+import InnerVoiceBubble from './InnerVoiceBubble';
 import { phoneFieldToText } from '../../utils/phoneEvidence';
 import { tryParseLifeSimResetCard } from '../../utils/lifeSimChatCard';
 import { VALID_INTERJECTION_TAGS, cleanVoiceMarkupForDisplay } from '../../utils/minimaxTts';
@@ -1398,6 +1399,7 @@ interface MessageItemProps {
     /** 思维链卡片在多选模式下有独立勾选框，与 isSelected 分开。 */
     isThinkingSelected?: boolean;
     onToggleThinkingSelect?: (id: number) => void;
+    onSaveInnerVoice?: (id: number, voice: string) => Promise<void>;
     // Translation (AI messages only, bilingual content parsed from %%BILINGUAL%%)
     translationEnabled?: boolean;
     translationExpanded?: boolean;
@@ -1458,6 +1460,7 @@ const MessageItem = React.memo(({
     onToggleSelect,
     isThinkingSelected,
     onToggleThinkingSelect,
+    onSaveInnerVoice,
     translationEnabled,
     translationExpanded,
     isShowingTarget,
@@ -1937,6 +1940,10 @@ const MessageItem = React.memo(({
     ) : null;
     const commonLayout = (content: React.ReactNode) => (
         <>
+            {!isUser && m.metadata?.innerVoice && <InnerVoiceBubble
+                voice={String(m.metadata.innerVoice)}
+                onSave={onSaveInnerVoice ? voice => onSaveInnerVoice(m.id, voice) : undefined}
+            />}
             {centerModules && thinkingChainNode && (
                 <div className="px-3 flex justify-center">
                     <div className="w-[72%] max-w-[72%]">{thinkingChainNode}</div>
@@ -2023,7 +2030,6 @@ const MessageItem = React.memo(({
                         {...interactionProps}
                     >
                     {!centerModules && thinkingChainNode}
-                    {!isUser && m.metadata?.innerVoice ? <InnerVoiceBlock voice={String(m.metadata.innerVoice)} /> : null}
                     <div className={selectionMode ? 'pointer-events-none' : ''}>
                         {content}
                     </div>
@@ -3795,6 +3801,8 @@ const MessageItem = React.memo(({
            prev.msg.metadata?.reviewStatus === next.msg.metadata?.reviewStatus &&
            prev.msg.metadata?.status === next.msg.metadata?.status &&
            prev.msg.metadata?.receipt === next.msg.metadata?.receipt &&
+           prev.msg.metadata?.innerVoice === next.msg.metadata?.innerVoice &&
+           prev.onSaveInnerVoice === next.onSaveInnerVoice &&
            prev.isFirstInGroup === next.isFirstInGroup &&
            prev.isLastInGroup === next.isLastInGroup &&
            prev.activeTheme === next.activeTheme &&
