@@ -27,6 +27,34 @@ describe('用户备选回复', () => {
             expect(() => parseReplySuggestions(JSON.stringify({ replies: bad }))).toThrow();
         }
     });
+    it('保留星号聊天提示及连续气泡，不执行为工具命令', () => {
+        const options = [['*语音消息*', '我刚才还没说完'], ['*发来一张困猫的照片*', '它又睡着了'], ['对了，周末有空吗？']];
+        expect(parseReplySuggestions(JSON.stringify({ replies: options }))).toEqual(options);
+    });
+    it('标明用户末尾连续气泡的续写起点，系统记录不打断用户回合', () => {
+        const history = [
+            { role: 'assistant', type: 'text', content: '你觉得怎么样？' },
+            { role: 'user', type: 'text', content: '我有两个想法' },
+            { role: 'system', type: 'text', content: '时间提示' },
+            { role: 'user', type: 'text', content: '首先是配色' },
+        ] as Message[];
+        const context = JSON.parse(buildReplySuggestionMessages(user, [], history)[1].content);
+        expect(context.generation).toEqual({ mode: 'continue_user_turn', continuationStartIndex: 1 });
+        expect(context.history.slice(context.generation.continuationStartIndex)).toEqual([
+            { role: 'user', speaker: user.name, content: '我有两个想法' },
+            { role: 'user', speaker: user.name, content: '首先是配色' },
+        ]);
+        const answered = JSON.parse(buildReplySuggestionMessages(user, [], [...history, { role: 'assistant', type: 'text', content: '配色怎么了？' } as Message])[1].content);
+        expect(answered.generation).toEqual({ mode: 'reply_to_other' });
+        expect(JSON.parse(buildReplySuggestionMessages(user, [], [])[1].content).generation).toEqual({ mode: 'start_conversation' });
+    });
+    it('续写位置以实际发送的最近 40 条历史为准', () => {
+        const history = Array.from({ length: 45 }, (_, i) => ({ role: i < 43 ? 'assistant' : 'user', type: 'text', content: String(i) })) as Message[];
+        const context = JSON.parse(buildReplySuggestionMessages(user, [], history)[1].content);
+        expect(context.history).toHaveLength(40);
+        expect(context.generation).toEqual({ mode: 'continue_user_turn', continuationStartIndex: 38 });
+        expect(context.history[38].content).toBe('43');
+    });
     it('兼容单条文本和换行分气泡，不按标点或空格拆分', () => {
         expect(parseReplySuggestions(JSON.stringify({ replies: ['你好，今天好吗？', '嗯\n我想听听你的看法', ['换个话题', '听歌吧']] })))
             .toEqual([['你好，今天好吗？'], ['嗯', '我想听听你的看法'], ['换个话题', '听歌吧']]);
