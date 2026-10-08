@@ -75,6 +75,8 @@ export async function expandAndFormat(
     userName?: string,
     /** 注入上限。rerank 启用时传 15 + topN，让 rerank 额外召回的不被切。 */
     maxOutputItems: number = DEFAULT_MAX_OUTPUT_ITEMS,
+    /** 本次实际输出的节点；不依赖持久化回执，供调用方精确强化。 */
+    onFormattedIds?: (ids: string[]) => void,
 ): Promise<string> {
     const MAX_OUTPUT_ITEMS = maxOutputItems;
     // 0. 加载便利贴置顶记忆（pinnedUntil > now，不占 15 条名额）
@@ -145,10 +147,11 @@ export async function expandAndFormat(
     // ── 召回回执：把这次实际注入 prompt 的 memoryId 落到 localStorage ──
     // 用途见 ./recallReceipts.ts。便利贴也算注入（用户对某条便利贴可能纠正）。
     // 截断/过期记忆不计入（cut 部分没进 prompt，pinnedIds 已经过 archived 过滤）。
+    const injectedIds = [...new Set([
+        ...finalItems.flatMap(it => it.sourceIds),
+        ...pinnedIds,
+    ])];
     try {
-        const injectedIds: string[] = [];
-        for (const it of finalItems) injectedIds.push(...it.sourceIds);
-        for (const id of pinnedIds) injectedIds.push(id);
         recordRecallReceipt(charId, injectedIds);
     } catch (e) {
         // 回执只是 extraction 阶段的辅助，写失败不影响本次召回输出
@@ -267,6 +270,7 @@ export async function expandAndFormat(
 
     const trimmed = output.trim();
     console.log(`🏰 [MemoryPalace] 本次召回 ${finalItems.length} 条 (${boxHits.size} 个 box + ${standaloneItems.length} 条独立)，${trimmed.length} 字`);
+    onFormattedIds?.(injectedIds);
     return trimmed;
 }
 

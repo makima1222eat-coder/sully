@@ -68,7 +68,8 @@ import type { RelatedMemoryRef, PinnedMemoryRef } from './extraction';
 import { fetchRelatedMemoriesForExtraction, sampleSnippetsFromMessages, splitMessagesToSpikes } from './relatedMemories';
 import { getReceiptIdsInRange } from './recallReceipts';
 import { vectorizeAndStore, checkModelConsistency, rebuildAllVectors } from './vectorStore';
-import { buildLinks, strengthenCoActivated } from './links';
+import { buildLinks } from './links';
+import { reinforceFormattedMemories } from './reinforcement';
 import { hybridSearch } from './hybridSearch';
 import { getEmbeddings } from './embedding';
 import { isRemoteSearchBroken } from './vectorSearch';
@@ -973,6 +974,9 @@ export async function retrieveMemories(
             return '';
         }
 
+        // 仅直接命中可强化；扩散、反刍和盒子附带展开不自动算作有效回忆。
+        const directHitIds = new Set(results.map(r => r.node.id));
+
         // 3. 扩散激活
         const beforeActivation = results.length;
         results = await tRetrieve('spreadActivation', 'IDB', spreadActivation(results, charId, personalityStyle));
@@ -1018,15 +1022,6 @@ export async function retrieveMemories(
             });
         }
 
-        // 6+7. 更新访问记录 + 共同激活加强（并发写 IDB）
-        const writeT0 = performance.now();
-        const retrievedIds = results.map(r => r.node.id);
-        await Promise.all([
-            ...retrievedIds.map(id => MemoryNodeDB.touchAccess(id)),
-            retrievedIds.length >= 2 ? strengthenCoActivated(retrievedIds.slice(0, 5)) : Promise.resolve(),
-        ]);
-        retrieveTimings.push({ label: `idbWrites(${retrievedIds.length})`, kind: 'IDB', ms: Math.round(performance.now() - writeT0) });
-
         // 8. Rerank 通道（独立检索 + cross-encoder 二次排序，可选）
         //
         //   Rerank 的 pool hybridSearch 和 rerankDocuments 已经在前面跟主路
@@ -1069,8 +1064,8 @@ export async function retrieveMemories(
                 }
                 console.groupEnd();
 
-                // touch 一下让 rerank 选中的也走 accessCount / lastAccessedAt 更新（并发）
-                await Promise.all(rerankPicks.map(p => MemoryNodeDB.touchAccess(p.sm.node.id)));
+                // rerank 也是直接命中，但仍须通过最终格式化筛选才能强化。
+                rerankPicks.forEach(p => directHitIds.add(p.sm.node.id));
 
                 // 追加到 results；formatter 的 MAX_OUTPUT_ITEMS 上调到 15 + N
                 // 不改 finalScore：保留 rerank pick 自己 hybridSearch 里的原始分，
@@ -1080,7 +1075,7 @@ export async function retrieveMemories(
                     formatterCap = Math.max(formatterCap, 15 + rerankPicks.length);
                 }
             }
-            // rerank_tail = 等 rerankApiPromise 落地 + dedup + touch，理想值接近 0
+            // rerank_tail = 等 rerankApiPromise 落地 + dedup，理想值接近 0
             retrieveTimings.push({ label: 'rerank_tail', kind: 'NET', ms: Math.round(performance.now() - rerankTailT0) });
         }
 
@@ -1088,7 +1083,16 @@ export async function retrieveMemories(
         const anticipations = await tRetrieve('AnticipationDB.getByCharId', 'IDB', AnticipationDB.getByCharId(charId));
 
         // 10. 格式化
-        const formatted = await tRetrieve('expandAndFormat', 'IDB', expandAndFormat(results, charId, anticipations, userName, formatterCap));
+        let formattedIds: string[] = [];
+        const formatted = await tRetrieve('expandAndFormat', 'IDB', expandAndFormat(
+            results, charId, anticipations, userName, formatterCap,
+            ids => { formattedIds = ids; },
+        ));
+        // 格式化成功后，只强化直接命中与实际输出的交集；写入失败不丢弃召回正文。
+        if (formatted) {
+            await tRetrieve('reinforceFormattedMemories', 'IDB',
+                reinforceFormattedMemories(directHitIds, formattedIds));
+        }
 
         // ── 汇总打印 ──
         const perfTotal = Math.round(performance.now() - perfRetrieveT0);
