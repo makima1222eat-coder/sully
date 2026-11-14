@@ -15,14 +15,7 @@
           - 'utils/activeMsg*'
           - 'components/chat/ActiveMsg*'
           - 'components/settings/ActiveMsg*'
-
-'scope: instant-push':
-  - changed-files:
-      - any-glob-to-any-file:
-          - 'worker/instant-push/**'
-          - 'worker/proactive-push/**'
-          - 'utils/instant*'
-          - 'utils/proactive*'
+          - 'utils/instantTraceLog*'
 
 'scope: pushSubscription':
   - changed-files:

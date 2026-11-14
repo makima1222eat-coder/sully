@@ -1,3 +1,5 @@
+import MeetingAppearanceControl from '../MeetingAppearanceControl';
+import {meetingAppearance, MEETING_READING_CSS, meetingCustomCss} from '../../../utils/meetingAppearance';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Moon, Palette, Sparkle, SquaresFour, Sun, X } from '@phosphor-icons/react';
@@ -124,11 +126,35 @@ const STORY_THEME_CSS = `
 .story-theme-dark .bg-rose-50\\/70 { background-color: rgba(78, 35, 55, .72) !important; }
 .story-theme-dark .text-rose-800, .story-theme-dark .text-rose-700, .story-theme-dark .text-rose-600, .story-theme-dark .text-rose-500 { color: #f4a8bd !important; }
 .story-theme-dark .border-rose-200, .story-theme-dark .border-rose-200\\/70 { border-color: rgba(244, 168, 189, .28) !important; }
+.story-theme-dark .bg-amber-50, .story-theme-dark .bg-amber-100 { background-color: rgba(82, 54, 18, .55) !important; }
+.story-theme-dark .text-amber-800, .story-theme-dark .text-amber-700, .story-theme-dark .text-amber-600 { color: #fcd38d !important; }
+.story-theme-dark .border-amber-200, .story-theme-dark .border-amber-100 { border-color: rgba(252, 211, 141, .28) !important; }
+.story-theme :is(input, textarea, select) { color: var(--story-ink); }
+.story-theme :is(input, textarea)::placeholder { color: var(--story-muted); opacity: 1; }
+.story-theme-dark select option { background-color: var(--story-raised); color: var(--story-ink); }
 .story-theme .story-safe-header { padding-top: max(1.25rem, var(--safe-top)); }
 .story-theme .story-safe-footer { padding-bottom: calc(var(--safe-bottom) + 12px); }
 .story-theme .story-safe-sheet { padding-bottom: calc(var(--safe-bottom) + 18px); }
 .story-theme .story-quick-preset { bottom: calc(var(--safe-bottom) + 112px); }
-.story-theme .story-page-scroll { overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch; }
+.story-theme .story-page-scroll {
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: var(--story-line) transparent;
+}
+.story-theme .story-page-scroll:hover,
+.story-theme .story-page-scroll:focus-within { scrollbar-color: var(--story-faint) transparent; }
+/* WebKit styling also removes the Windows arrow buttons and opaque track. */
+@supports selector(::-webkit-scrollbar) {
+  .story-theme .story-page-scroll { scrollbar-width: auto; scrollbar-color: auto; }
+  .story-theme .story-page-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+  .story-theme .story-page-scroll::-webkit-scrollbar-track,
+  .story-theme .story-page-scroll::-webkit-scrollbar-corner { background: transparent; }
+  .story-theme .story-page-scroll::-webkit-scrollbar-thumb { background: var(--story-line); border-radius: 999px; }
+  .story-theme .story-page-scroll:hover::-webkit-scrollbar-thumb,
+  .story-theme .story-page-scroll:focus-within::-webkit-scrollbar-thumb { background: var(--story-faint); }
+  .story-theme .story-page-scroll::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+}
 .story-theme.story-decor-plain .shadow-sm { box-shadow: none !important; }
 .story-theme.story-decor-cinema .story-cinema-rule { position: relative; }
 .story-theme.story-decor-cinema .story-cinema-rule::after {
@@ -152,6 +178,9 @@ body.ios-keyboard-open .story-theme .story-quick-preset { bottom: 112px !importa
 
 export const StoryTheaterThemeProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
     const [appearance, setAppearance] = useState<StoryAppearance>(readAppearance);
+    const {theme} = useOS();
+    const reading = meetingAppearance(theme.storyAppearance);
+    const color = reading.id === 'none' ? appearance.color : reading.id === 'night' ? 'dark' : 'light';
 
     useEffect(() => {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(appearance));
@@ -164,8 +193,8 @@ export const StoryTheaterThemeProvider: React.FC<React.PropsWithChildren> = ({ c
     }), [appearance]);
 
     return <StoryThemeContext.Provider value={value}>
-        <div className={`story-theme story-theme-${appearance.color} story-decor-${appearance.decor} h-full w-full min-h-0`}>
-            <style>{STORY_THEME_CSS}</style>
+        <div className={`story-theme story-theme-${color} story-decor-${appearance.decor} h-full w-full min-h-0 ${reading.id!=='none'?'meeting-reading':''}`} data-reading-preset={reading.id}>
+            <style>{STORY_THEME_CSS + MEETING_READING_CSS + '\n' + meetingCustomCss(theme.storyAppearance)}</style>
             {children}
         </div>
     </StoryThemeContext.Provider>;
@@ -173,7 +202,7 @@ export const StoryTheaterThemeProvider: React.FC<React.PropsWithChildren> = ({ c
 
 export const StoryAppearanceButton: React.FC<{ className?: string }> = ({ className = '' }) => {
     const context = useContext(StoryThemeContext);
-    const { registerBackHandler } = useOS();
+    const { registerBackHandler, theme } = useOS();
     const [open, setOpen] = useState(false);
     const closePanel = useCallback(() => {
         setOpen(false);
@@ -212,13 +241,15 @@ export const StoryAppearanceButton: React.FC<{ className?: string }> = ({ classN
     }, [closePanel, open, registerBackHandler]);
     if (!context) return null;
     const { appearance, setColor, setDecor } = context;
+    const reading = meetingAppearance(theme.storyAppearance);
+    const effectiveColor: StoryColorMode = reading.id === 'none' ? appearance.color : reading.id === 'night' ? 'dark' : 'light';
 
     return <>
         <button type='button' onClick={() => setOpen(true)} className={`w-9 h-9 rounded-full grid place-items-center ${className}`} title='剧情外观' aria-label='剧情外观'>
             <Palette size={18} weight={appearance.decor === 'cinema' ? 'fill' : 'regular'} />
         </button>
         {open && createPortal(<div
-            className={`story-theme story-theme-${appearance.color} story-decor-${appearance.decor} fixed inset-0 z-[90] flex items-end sm:items-center justify-center overflow-y-auto overscroll-contain`}
+            className={`story-theme story-theme-${effectiveColor} story-decor-${appearance.decor} fixed inset-0 z-[90] flex items-end sm:items-center justify-center overflow-y-auto overscroll-contain`}
             style={{ position: 'fixed', paddingTop: 'max(12px, var(--safe-top))', paddingBottom: 'max(0px, var(--safe-bottom))', backgroundColor: 'rgba(2, 6, 23, .35)' }}
             onClick={closePanel}
             role='presentation'
@@ -234,10 +265,10 @@ export const StoryAppearanceButton: React.FC<{ className?: string }> = ({ classN
                     <div className='min-w-0 flex-1'><div className='text-[9px] tracking-[.22em] uppercase font-bold text-violet-500'>Story appearance</div><h2 id='story-appearance-title' className='mt-1 text-lg font-semibold'>剧情放映厅外观</h2><p className='mt-1 text-[10px] leading-5 text-slate-500'>只影响剧情模式，普通聊天与记忆宫殿保持原样。</p></div>
                     <button type='button' onClick={closePanel} className='w-10 h-10 shrink-0 rounded-full bg-white border border-slate-200 grid place-items-center' aria-label='关闭剧情外观'><X size={17} /></button>
                 </div>
-                <div className='mt-5 min-h-0 overflow-y-auto overscroll-contain border-t border-slate-200'>
+                <div className='mt-5 min-h-0 overflow-y-auto overscroll-contain border-t border-slate-200'><MeetingAppearanceControl surface='story' /><div hidden={meetingAppearance(theme.storyAppearance).id !== 'none'}>
                     <div className='py-4 flex items-center gap-3'><span className='text-xs font-semibold w-16'>明暗</span><div className='min-w-0 flex-1 grid grid-cols-2 p-1 rounded-xl bg-slate-200'><button onClick={() => setColor('light')} className={`py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 ${appearance.color === 'light' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Sun size={14} />浅色</button><button onClick={() => setColor('dark')} className={`py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 ${appearance.color === 'dark' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Moon size={14} />深色</button></div></div>
                     <div className='py-4 border-t border-slate-200 flex items-center gap-3'><span className='text-xs font-semibold w-16'>装饰</span><div className='min-w-0 flex-1 grid grid-cols-2 p-1 rounded-xl bg-slate-200'><button onClick={() => setDecor('plain')} className={`py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 ${appearance.decor === 'plain' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><SquaresFour size={14} />素雅</button><button onClick={() => setDecor('cinema')} className={`py-2 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 ${appearance.decor === 'cinema' ? 'bg-white text-violet-700 shadow-sm' : 'text-slate-500'}`}><Sparkle size={14} />花里胡哨</button></div></div>
-                </div>
+                </div></div>
             </div>
         </div>, document.body)}
     </>;

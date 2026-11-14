@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useOS } from '../context/OSContext';
 import { DB } from '../utils/db';
 import { CharacterProfile, PhoneEvidence, PhoneCustomApp, PhoneContact, PhoneSimLog, ConvTopic, AiSession, AiServiceKind, TavernCard, APIConfig } from '../types';
@@ -11,13 +12,15 @@ import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
 import {
     runRealConversation, runNpcConversation, upsertContact, matchRealChar,
     clampAffinity, normName, flipTranscript, parseTranscript, serializeTurns, appendLearned,
-    topicText, summarizeConversation,
+    topicText, summarizeConversation, applyRealConversationToPhoneState,
 } from '../utils/relationshipChat';
 import PersonaSim, { LifeLog, generatePersonaScript } from './PersonaSim';
 import { usePersonaSim, personaSimStore } from '../utils/personaSimStore';
+import { createPersonaSimLog, getPersonaSimBeatIndex } from '../utils/personaSimLog';
 import { getLastInnerState } from '../utils/emotionApply';
 import { trackEvent } from '../utils/analytics';
 import { normalizePhoneEvidence, phoneFieldToText } from '../utils/phoneEvidence';
+import { normalizePhoneAiSession } from '../utils/phoneTranscript';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
 import { getCheckPhoneApi, resolveCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
 import {
@@ -277,6 +280,9 @@ const CheckPhone: React.FC = () => {
     const [selectedChatRecord, setSelectedChatRecord] = useState<PhoneEvidence | null>(null);
     const [selectedEvidenceRecord, setSelectedEvidenceRecord] = useState<PhoneEvidence | null>(null);
     const [evidenceBackAppId, setEvidenceBackAppId] = useState<string>('home');
+    const [evidenceMenu, setEvidenceMenu] = useState<{ record: PhoneEvidence; backAppId: string } | null>(null);
+    const [evidenceSyncBusy, setEvidenceSyncBusy] = useState(false);
+    const evidenceSyncLock = useRef(false);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const contactEndRef = useRef<HTMLDivElement>(null);
 
@@ -309,6 +315,7 @@ const CheckPhone: React.FC = () => {
 
     // Custom App Creation State
     const [showCreateModal, setShowCreateModal] = useState(false);
+    const [editingAppId, setEditingAppId] = useState<string | null>(null);
     const [newAppName, setNewAppName] = useState('');
     const [newAppIcon, setNewAppIcon] = useState('✨');
     const [newAppColor, setNewAppColor] = useState('#8b9cff');
@@ -378,7 +385,8 @@ const CheckPhone: React.FC = () => {
         ))?.detail
         : undefined;
     // 智能体 App：偷看到的 AI 会话 / 角色卡
-    const aiSessions = targetChar?.phoneState?.aiAgent?.sessions || [];
+    const rawAiSessions = targetChar?.phoneState?.aiAgent?.sessions;
+    const aiSessions = useMemo(() => (rawAiSessions || []).map(normalizePhoneAiSession), [rawAiSessions]);
     const aiCards = targetChar?.phoneState?.aiAgent?.cards || [];
     // 详情页会话从 sessions 实时取（互动续写后自动跟随最新状态）
     const selectedAiSession = aiSessions.find(s => s.id === selectedAiSessionId) || null;
@@ -463,6 +471,11 @@ const CheckPhone: React.FC = () => {
         setEvidenceBackAppId('home');
         setPage(0);
     };
+    useAppShortcut(ShortcutAppID.CheckPhone, intent => {
+        const target = characters.find(c => c.id === intent.characterId);
+        if (!target) { setView('select'); return; }
+        handleSelectChar(target); setActiveAppId(intent.entryId || 'home');
+    });
 
     const apiHost = (url?: string) => {
         try { return url ? new URL(url).host : '未配置'; }
@@ -502,7 +515,8 @@ const CheckPhone: React.FC = () => {
                     max_tokens: 5,
                     stream: false,
                 }),
-            });
+                __sullyMeta: { appId: 'checkphone', appName: '查手机', purpose: '测试连接' },
+            } as RequestInit);
             if (!response.ok) {
                 const detail = await response.text().catch(() => '');
                 setPhoneApiTestResult(`HTTP ${response.status}${detail ? `：${detail.slice(0, 80)}` : ''}`);
@@ -554,10 +568,14 @@ const CheckPhone: React.FC = () => {
     };
 
     const evidenceEntryProps = (record: PhoneEvidence, backAppId: string) => ({
+        ...longPress(() => setEvidenceMenu({ record, backAppId })),
         role: 'button' as const,
         tabIndex: 0,
-        'aria-label': `查看${record.title}详情`,
-        onClick: () => openEvidenceRecord(record, backAppId),
+        'aria-label': `查看${record.title}详情，长按可同步到私聊`,
+        onClick: () => {
+            if (lpFired.current) { lpFired.current = false; return; }
+            openEvidenceRecord(record, backAppId);
+        },
         onKeyDown: (e: React.KeyboardEvent<HTMLElement>) => {
             if (e.key === 'Enter' || e.key === ' ') {
                 e.preventDefault();
@@ -661,34 +679,49 @@ const CheckPhone: React.FC = () => {
         addToast('App 已卸载', 'success');
     };
 
+    const openCustomAppEditor = (app?: PhoneCustomApp) => {
+        setEditingAppId(app?.id || null);
+        setNewAppName(app?.name || '');
+        setNewAppIcon(app?.icon || '✨');
+        setNewAppColor(app?.color || '#8b9cff');
+        setNewAppPrompt(app?.prompt || '');
+        setNewAppLayout(app?.layout || 'generic');
+        setShowCreateModal(true);
+    };
+
     const handleCreateCustomApp = () => {
-        if (!targetChar || !newAppName || !newAppPrompt) return;
+        if (!targetChar || !newAppName.trim() || !newAppPrompt.trim()) return;
 
         const newApp: PhoneCustomApp = {
-            id: `app-${Date.now()}`,
-            name: newAppName,
+            id: editingAppId || `app-${Date.now()}`,
+            name: newAppName.trim(),
             icon: newAppIcon,
             color: newAppColor,
             prompt: newAppPrompt,
             layout: newAppLayout
         };
 
-        const currentApps = targetChar.phoneState?.customApps || [];
-        updateCharacter(targetChar.id, {
-            phoneState: { records: targetChar.phoneState?.records || [], ...targetChar.phoneState, customApps: [...currentApps, newApp] }
-        });
+        updateCharacter(targetChar.id, previous => ({
+            phoneState: {
+                records: [], ...previous.phoneState,
+                customApps: editingAppId
+                    ? (previous.phoneState?.customApps || []).map(app => app.id === editingAppId ? { ...app, ...newApp } : app)
+                    : [...(previous.phoneState?.customApps || []), newApp],
+            },
+        }));
 
         setShowCreateModal(false);
         setNewAppName('');
         setNewAppPrompt('');
         setNewAppLayout('generic');
         setPage(1);
-        addToast(`已安装 ${newAppName}`, 'success');
-        trackEvent('安装自定义 App', { layout: newAppLayout });
+        addToast(`已${editingAppId ? '保存' : '安装'} ${newAppName}`, 'success');
+        if (!editingAppId) trackEvent('安装自定义 App', { layout: newAppLayout });
     };
 
     // --- Core Generation Logic ---
     const handleGenerate = async (type: string, customPrompt?: string, layout?: LayoutId) => {
+
         if (!targetChar || !effectiveApiConfig.apiKey) {
             addToast('配置错误', 'error');
             return;
@@ -701,20 +734,14 @@ const CheckPhone: React.FC = () => {
 
         try {
             await injectMemoryPalace(targetChar);
-            const msgs = await DB.getMessagesByCharId(targetChar.id);
+            const msgs = await loadCharacterContextMessages(targetChar);
             const lastMsg = msgs[msgs.length - 1];
 
             // 「距离上次联系多久」交给 buildCoreContext 统一注入（受时间感知开关管控、口径与聊天/见面一致）
-            const context = ContextBuilder.buildCoreContext(
-                targetChar, userProfile, true, undefined, undefined,
-                { lastInteractionTs: lastMsg?.timestamp },
-            );
+            const characterContextInput = { char: targetChar, user: userProfile, includeDetailedMemories: true, timeOptions: { lastInteractionTs: lastMsg?.timestamp } };
 
-            // 聊天/通讯录类按 chatapp 的上下文设置（默认 500）取，其它 App 维持轻量 50 条
-            const recentWindow = (type === 'chat' || type === 'contacts')
-                ? (targetChar.contextLimit && targetChar.contextLimit > 0 ? targetChar.contextLimit : 500)
-                : 50;
-            const recentMsgs = msgs.slice(-recentWindow).map(m => {
+
+            const recentMsgs = msgs.map(m => {
                 const roleName = m.role === 'user' ? userProfile.name : targetChar.name;
                 const content = m.type === 'text' ? m.content : `[${m.type}]`;
                 return `${roleName}: ${content}`;
@@ -814,17 +841,35 @@ ${realCharRule}
 - **绝不是用户「${userProfile.name}」的社交关系**：不要生成用户的人脉圈，也不要从用户的角度/口吻写备注。
 - 用户「${userProfile.name}」只是在偷看你的手机，TA **不是**你的联系人、**不进**你的通讯录（下面「和用户的最近聊天」只是背景参考，不是要生成的对象，也别把用户的熟人搬进来）。`;
 
-            const fullPrompt = `${context}\n\n### [你和用户「${userProfile.name}」的最近聊天（仅背景参考）]\n${recentMsgs}\n\n${perspectiveLock}\n\n### [Task]\n${promptInstruction}\n请结合上面的「当前时间 / 距离上次联系」和人设调整生成内容的时间戳和情绪。如果很久没联系，记录可能是近期的独处状态；如果刚聊过，记录可能与聊天内容相关。`;
+            const fullPrompt = `\n\n### [你和用户「${userProfile.name}」的最近聊天（仅背景参考）]\n${recentMsgs}\n\n${perspectiveLock}\n\n### [Task]\n${promptInstruction}\n请结合上面的「当前时间 / 距离上次联系」和人设调整生成内容的时间戳和情绪。如果很久没联系，记录可能是近期的独处状态；如果刚聊过，记录可能与聊天内容相关。`;
+
+            const purposeLabel = customPrompt
+                ? `生成自定义应用·${logPrefix || type}`
+                : ({
+                    chat: '生成聊天记录',
+                    contacts: '扫描通讯录联系人',
+                    call: '生成通话记录',
+                    order: '生成购物订单',
+                    delivery: '生成外卖记录',
+                    social: '生成朋友圈动态',
+                } as Record<string, string>)[type] || '生成手机应用数据';
 
             const response = await fetch(`${effectiveApiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: effectiveApiConfig.model,
-                    messages: [{ role: "user", content: fullPrompt }],
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: fullPrompt }])),
                     temperature: 0.8
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'checkphone',
+                    appName: '查手机',
+                    charId: targetChar.id,
+                    charName: targetChar.name,
+                    purpose: purposeLabel,
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error('API Error');
             const data = await safeResponseJson(response);
@@ -834,9 +879,6 @@ ${realCharRule}
             const json = extractJson(content) || [];
 
             const newRecordsToAdd: PhoneEvidence[] = [];
-
-            // 是否把查手机内容同步到私聊（默认开），关闭则只存本地、不进聊天/上下文
-            const pushToChat = targetChar.phoneState?.sendToChat !== false;
 
             // 人际关系：累积本轮甄别出的联系人（chat / contacts 两种生成都会喂这里）
             let contactsAcc: PhoneContact[] = [...(targetChar.phoneState?.contacts || [])];
@@ -889,24 +931,6 @@ ${realCharRule}
                         continue;
                     }
 
-                    let savedMsgId: number | undefined;
-                    if (pushToChat) {
-                        // 包装成上下文可读的漂亮卡片（phone_card），不再是古早的 [系统:...] 纯文本
-                        // 进角色上下文的措辞：第二人称讲「你自己手机里有啥」，不暗示用户在偷看
-                        const cardContent = type === 'chat'
-                            ? `[你手机的聊天软件] 你和「${recordTitle}」的对话：${recordDetail.replace(/\n/g, ' ')}`
-                            : `[你手机的${logPrefix}] ${recordTitle}${recordValue ? ` · ${recordValue}` : ''} — ${recordDetail}`;
-                        await DB.saveMessage({
-                            charId: targetChar.id,
-                            role: 'assistant',
-                            type: 'phone_card',
-                            content: cardContent,
-                            metadata: { phoneCard: { app: logPrefix, kind: type, title: recordTitle, detail: recordDetail, value: recordValue || undefined } },
-                        } as any);
-                        const currentMsgs = await DB.getMessagesByCharId(targetChar.id);
-                        savedMsgId = currentMsgs[currentMsgs.length - 1]?.id;
-                    }
-
                     newRecordsToAdd.push({
                         id: `rec-${Date.now()}-${Math.random()}`,
                         type: type,
@@ -914,7 +938,6 @@ ${realCharRule}
                         detail: recordDetail,
                         value: recordValue || undefined,
                         timestamp: Date.now(),
-                        systemMessageId: savedMsgId,
                         contactId,
                     });
 
@@ -922,15 +945,11 @@ ${realCharRule}
                 }
             }
 
-            // 基于最新状态合并：生成是异步的，期间若有演出落库 simLogs，
-            // 用过期的 targetChar 快照覆盖会把 simLogs 等字段抹掉。
-            updateCharacter(targetChar.id, (cur) => ({
-                phoneState: {
-                    ...cur.phoneState,
-                    records: [...(cur.phoneState?.records || []), ...newRecordsToAdd],
-                    ...(isContactBearing ? { contacts: contactsAcc } : {}),
-                }
-            }));
+            // Phone records and their chat cards commit together, even after this page unmounts.
+            await DB.savePhoneGeneration(targetChar.id, {
+                records: newRecordsToAdd,
+                ...(isContactBearing ? { contacts: contactsAcc, baseContacts: targetChar.phoneState?.contacts || [] } : {}),
+            }, logPrefix);
 
             if (type === 'contacts') {
                 addToast(`已扫描 ${contactsAcc.length} 位联系人`, 'success');
@@ -940,7 +959,7 @@ ${realCharRule}
 
         } catch (e: any) {
             console.error(e);
-            addToast('解析失败，请重试', 'error');
+            addToast(e?.message || '生成或保存失败，请重试', 'error');
         } finally {
             setIsLoading(false);
         }
@@ -954,12 +973,22 @@ ${realCharRule}
     // ============================================================
 
     // 裸 LLM 调用（智能体生成 / 互动续写共用）
-    const callLLM = async (prompt: string, temperature = 0.85): Promise<string> => {
+    const callLLM = async (prompt: string, temperature = 0.85, withCharacter = true, purpose = '查手机AI生成'): Promise<string> => {
+        const recent = withCharacter && targetChar ? await loadCharacterContextMessages(targetChar) : [];
+        const messages = withCharacter && targetChar ? (await ContextBuilder.buildCharacterRequest({
+            char: targetChar, user: userProfile, timeOptions: { lastInteractionTs: recent[recent.length - 1]?.timestamp },
+        }, [{ role: 'user', content: prompt }])) : [{ role: 'user', content: prompt }];
         const response = await fetch(`${effectiveApiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApiConfig.apiKey}` },
-            body: JSON.stringify({ model: effectiveApiConfig.model, messages: [{ role: 'user', content: prompt }], temperature }),
-        });
+            body: JSON.stringify({ model: effectiveApiConfig.model, messages, temperature }),
+            __sullyMeta: {
+                appId: 'checkphone',
+                appName: '查手机',
+                ...(targetChar ? { charId: targetChar.id, charName: targetChar.name } : {}),
+                purpose,
+            },
+        } as RequestInit);
         if (!response.ok) throw new Error('API Error');
         const data = await safeResponseJson(response);
         // 用 extractContent 而非裸读 message.content：兼容 Claude/思考类模型把正文放在
@@ -970,25 +999,23 @@ ${realCharRule}
     // 组 context：跟 handleGenerate 一致（含记忆宫殿 + 时间感知 + 最近聊天），让偷看到的 AI 记录贴合真实近况
     const buildAiContext = async (char: CharacterProfile) => {
         await injectMemoryPalace(char);
-        const msgs = await DB.getMessagesByCharId(char.id);
-        const lastMsg = msgs[msgs.length - 1];
-        const context = ContextBuilder.buildCoreContext(
-            char, userProfile, true, undefined, undefined, { lastInteractionTs: lastMsg?.timestamp },
-        );
-        const recentMsgs = msgs.slice(-50).map(m => {
+        const msgs = await loadCharacterContextMessages(char);
+
+        const recentMsgs = msgs.map(m => {
             const roleName = m.role === 'user' ? userProfile.name : char.name;
             return `${roleName}: ${m.type === 'text' ? m.content : `[${m.type}]`}`;
         }).join('\n');
-        return { context, recentMsgs };
+        return { recentMsgs };
     };
 
     // 生成：偷看机主在某个 AI 服务里的使用记录
     const handleGenerateAiAgent = async (service: AiServiceKind) => {
+
         if (!targetChar || !effectiveApiConfig.apiKey) { addToast('配置错误', 'error'); return; }
         setIsLoading(true);
         trackEvent('偷看 AI 助手使用记录', { service });
         try {
-            const { context, recentMsgs } = await buildAiContext(targetChar);
+            const { recentMsgs } = await buildAiContext(targetChar);
             const userName = userProfile?.name || '用户';
             const pushToChat = targetChar.phoneState?.sendToChat !== false;
             const svcName = AI_SERVICES.find(s => s.id === service)?.name || 'AI';
@@ -1043,9 +1070,9 @@ ${AI_VENDOR_LORE}
 要点：扮演内容（剧情里）暴露你的幻想 / 渴望 / 不敢实现的关系。酒馆是 TA 卸下防备的安全屋，扮演里可以流露平时藏起来的反差面（暴戾者忽然温柔、温柔者露出掌控/施虐欲、疏离者变黏人），但**底色始终是「爱」**，不刻意过火。`;
             }
 
-            const fullPrompt = `${context}\n\n### [Recent Chat Context]\n${recentMsgs}\n\n### [Task]\n${task}\n请结合「当前时间 / 距离上次联系」和人设，让内容贴合你近期的真实状态。只输出 JSON，不要解释。`;
+            const fullPrompt = `\n\n### [Recent Chat Context]\n${recentMsgs}\n\n### [Task]\n${task}\n请结合「当前时间 / 距离上次联系」和人设，让内容贴合你近期的真实状态。只输出 JSON，不要解释。`;
 
-            const content = await callLLM(fullPrompt);
+            const content = await callLLM(fullPrompt, 0.85, true, '生成TA的AI会话');
             const now = Date.now();
             const rid = () => Math.random().toString(36).slice(2, 8);
             const newSessions: AiSession[] = [];
@@ -1066,20 +1093,20 @@ ${AI_VENDOR_LORE}
                 }
                 for (const sess of (obj.sessions || [])) {
                     if (!sess?.transcript) continue;
-                    newSessions.push({
+                    newSessions.push(normalizePhoneAiSession({
                         id: `ai-${now}-${rid()}`, service, serviceName: sess.serviceName || sess.cardName || '酒馆',
                         title: sess.title || '一段扮演', transcript: sess.transcript, cardId: nameToId[normName(sess.cardName || '')], updatedAt: now,
-                    });
+                    }));
                 }
             } else {
                 const parsed = extractJson(content);
                 const arr: any[] = Array.isArray(parsed) ? parsed : [];
                 for (const sess of arr) {
                     if (!sess?.transcript) continue;
-                    newSessions.push({
+                    newSessions.push(normalizePhoneAiSession({
                         id: `ai-${now}-${rid()}`, service, serviceName: sess.serviceName || (service === 'claude' ? 'Claude' : 'AI 助手'),
                         title: sess.title || '一段对话', transcript: sess.transcript, updatedAt: now,
-                    });
+                    }));
                 }
             }
 
@@ -1133,7 +1160,7 @@ ${AI_VENDOR_LORE}
                 ...cur.phoneState, records: cur.phoneState?.records || [],
                 aiAgent: {
                     cards: cur.phoneState?.aiAgent?.cards || [],
-                    sessions: (cur.phoneState?.aiAgent?.sessions || []).map(s => s.id === sessionId ? patch(s) : s),
+                    sessions: (cur.phoneState?.aiAgent?.sessions || []).map(s => s.id === sessionId ? patch(normalizePhoneAiSession(s)) : s),
                 },
             },
         }));
@@ -1176,7 +1203,7 @@ ${prevRecap ? `\n【已有前情（仅供衔接，别重复）】\n${prevRecap}\
 ${olderText}
 
 要求：第三人称，含起因→经过→结果，重点写人物关系/情绪的变化与暴露的心事，200~350 字，文笔流畅，不要分点、不要"总结如下"开场白。直接输出正文：`;
-            let summaryText = (await callLLM(prompt, 0.7)).trim();
+            let summaryText = (await callLLM(prompt, 0.7, false, 'AI会话摘要')).trim();
             if (!summaryText) summaryText = '（这段剧情继续推进了）';
             const now = Date.now();
             patchAiSession(sessionId, (s) => ({
@@ -1191,6 +1218,7 @@ ${olderText}
 
     // 互动续写：assistant/claude = 你替机主问、AI 答；tavern = 你以卡片身份回、机主本色反应
     const handleAiSend = async () => {
+
         const session = selectedAiSession;
         const text = aiInput.trim();
         if (!session || !text || !targetChar || !effectiveApiConfig.apiKey) return;
@@ -1209,8 +1237,8 @@ ${olderText}
             let prompt = '';
             if (isTavern) {
                 const card = aiCards.find(c => c.id === session.cardId);
-                const { context } = await buildAiContext(targetChar);
-                prompt = `${context}\n\n你正在玩"酒馆"沉浸式长剧情角色扮演（像和 AI 合写小说）。你是玩家 ${charName}，对面是 AI 扮演的角色「${card?.name || session.serviceName}」${card?.persona ? `（人设：${card.persona}）` : ''}${card?.scenario ? `（背景：${card.scenario}）` : ''}${card?.basedOn ? `（这角色是照着你在意的「${card.basedOn}」捏的）` : ''}。
+                await buildAiContext(targetChar);
+                prompt = `\n\n你正在玩"酒馆"沉浸式长剧情角色扮演（像和 AI 合写小说）。你是玩家 ${charName}，对面是 AI 扮演的角色「${card?.name || session.serviceName}」${card?.persona ? `（人设：${card.persona}）` : ''}${card?.scenario ? `（背景：${card.scenario}）` : ''}${card?.basedOn ? `（这角色是照着你在意的「${card.basedOn}」捏的）` : ''}。
 下面是对戏记录（"我:"=你/玩家，"对方:"=AI 扮的角色）。对方刚回了最新一段。
 **最关键的前提：你非常清楚「对方」只是一个 AI 在扮演「${card?.name || session.serviceName}」这个角色——不是真人。** 正因为它是 AI、是你召来陪你玩的工具，你**握着绝对主导权**：可以随意对它下指令、调教它、OOC 它、让它重演、改设定。你绝不会把它错当成真人去迁就讨好。
 **同时你是个有独立人格和意志的人**：有自己的脾气、立场、节奏和底线，该怼就怼、该愣就愣、不爽就不配合。对方写得好你才会被带动、真情流露（甚至流露平时藏起来的反差面：暴戾者忽然温柔、温柔者露出掌控欲 / 施虐欲、疏离者变黏人，底色是「爱」、不刻意过火）；写得烂或不对胃口，你完全可以不接、嫌弃、跳出来调教它。
@@ -1223,14 +1251,14 @@ ${olderText}
 只输出你这层楼真正发出去的字，不要 "我:" 前缀、不要解释。${recap}\n\n${transcript}`;
             } else {
                 // 潜入：你扮 AI（刚由你写完"对方:"那句），LLM 演 char 本人对这句的真实反应
-                const { context } = await buildAiContext(targetChar);
+                await buildAiContext(targetChar);
                 const aiDesc = session.service === 'claude'
                     ? `一个像 Claude 那样的深度对话 AI「${session.serviceName}」（你的树洞，你会对它说当面对人说不出口的真心话）`
                     : `AI 助手「${session.serviceName}」（你拿它查东西 / 出主意 / 排解，它只是个工具）`;
-                prompt = `${context}\n\n你（${charName}）正在用手机和 ${aiDesc} 聊天。下面是对话（"我:"=你本人，"对方:"=那个 AI）。AI 刚回了最新一段，请以你的本色人设续写 "我:" 的下一句——你对它这句话的真实反应 / 追问 / 倾诉，贴合你的处境与心事。可以满意、可以失望、可以怼它答非所问、可以顺着深聊，别一味客气。别太长。只输出正文，不要前缀、不要解释。${recap}\n\n${transcript}`;
+                prompt = `\n\n你（${charName}）正在用手机和 ${aiDesc} 聊天。下面是对话（"我:"=你本人，"对方:"=那个 AI）。AI 刚回了最新一段，请以你的本色人设续写 "我:" 的下一句——你对它这句话的真实反应 / 追问 / 倾诉，贴合你的处境与心事。可以满意、可以失望、可以怼它答非所问、可以顺着深聊，别一味客气。别太长。只输出正文，不要前缀、不要解释。${recap}\n\n${transcript}`;
             }
 
-            let reply = (await callLLM(prompt)).trim();
+            let reply = (await callLLM(prompt, 0.85, true, 'TA的AI助手回复')).trim();
             reply = reply.replace(/^(我|对方|Me|Them|AI|助手)\s*[:：]\s*/i, '').trim();
             if (!reply) { addToast('对方没说话，再试一次', 'error'); return; }
             const full = `${transcript}\n${replyPrefix}: ${reply}`;
@@ -1249,6 +1277,7 @@ ${olderText}
 
     // 自然推进：不用 user 开口，让 LLM 接着剧情自己往下写一轮（双方都由 AI 演）
     const handleAiAutoContinue = async () => {
+
         const session = selectedAiSession;
         if (!session || !targetChar || !effectiveApiConfig.apiKey || aiSending) return;
         const isTavern = session.service === 'tavern';
@@ -1259,8 +1288,8 @@ ${olderText}
             let prompt = '';
             if (isTavern) {
                 const card = aiCards.find(c => c.id === session.cardId);
-                const { context } = await buildAiContext(targetChar);
-                prompt = `${context}\n\n你在还原一段"酒馆"沉浸式长剧情角色扮演（像小说）。玩家是 ${charName}(本色人设)，AI 扮演角色「${card?.name || session.serviceName}」${card?.persona ? `（人设：${card.persona}）` : ''}${card?.scenario ? `（背景：${card.scenario}）` : ''}${card?.basedOn ? `（这角色照着 TA 在意的「${card.basedOn}」捏的，扮演里那份在意会渗出来）` : ''}。
+                await buildAiContext(targetChar);
+                prompt = `\n\n你在还原一段"酒馆"沉浸式长剧情角色扮演（像小说）。玩家是 ${charName}(本色人设)，AI 扮演角色「${card?.name || session.serviceName}」${card?.persona ? `（人设：${card.persona}）` : ''}${card?.scenario ? `（背景：${card.scenario}）` : ''}${card?.basedOn ? `（这角色照着 TA 在意的「${card.basedOn}」捏的，扮演里那份在意会渗出来）` : ''}。
 **这是"替玩家跑一个完整回合"——所以要写"一来一回"两层楼**：先 AI 扮的角色「${card?.name || session.serviceName}」回应一段（"对方:"），再玩家 ${charName} 续一段（"我:"），承接最后一段（最后通常是"我:"，那就先"对方:"答、再"我:"续）。各 3-5 句小说体，*星号*包动作神态心理。**整段必须以 "我:"(玩家)收尾**（停在等对方处，方便随时接着玩）。
 **"我:"是玩家敲进输入框的 RP——只写故事场景里所扮角色的动作/对白**，括号外绝不要写玩家现实里的身体反应（盯屏幕、扔手机、吃东西、后背发凉等，那不会被敲进输入框）；**（全角括号内）= 越过角色直接跟皮下 AI 本体说话**（骂它 / OOC 提醒 / 指导怎么演 / 指出哪段不对）。玩家保有独立人格、清楚对面只是 AI。
 **两段都要带 "对方:" / "我:" 前缀，各自成行。** 不要解释。${recap}\n\n${session.transcript}`;
@@ -1271,7 +1300,7 @@ ${olderText}
                 prompt = `你在还原「${charName}」和 AI「${session.serviceName}」的对话（"我:"=用户 ${charName}，"对方:"=AI）。${persona}
 **替玩家跑一个完整回合（一来一回）**：承接最后一段——最后通常是"我:"(${charName} 刚发出、还没被回)，那就先"对方:"按那家口吻作答、再"我:"追问 / 倾诉一句（暴露 TA 的处境或心事）。**整段必须以 "我:"(${charName})收尾**（停在等 AI 回的地方）。**每行带 "我:"/"对方:" 前缀**，不要解释。${recap}\n\n${session.transcript}`;
             }
-            let out = (await callLLM(prompt)).trim().replace(/```/g, '').trim();
+            let out = (await callLLM(prompt, 0.85, true, 'TA的AI会话续写')).trim().replace(/```/g, '').trim();
             if (!/^(我|对方|Me|Them)\s*[:：]/m.test(out)) out = `${lastIsMe ? '对方' : '我'}: ${out}`;
             if (!out.trim()) { addToast('没续出内容，再试一次', 'error'); return; }
             const transcript = `${session.transcript}\n${out}`;
@@ -1388,25 +1417,26 @@ ${olderText}
 
     // 用指定的卡开一局：生成一段以这张卡为对手的酒馆剧情（卡片本身不新增、不顶掉）
     const handlePlayCard = async (card: TavernCard) => {
+
         if (!targetChar || !effectiveApiConfig.apiKey) { addToast('配置错误', 'error'); return; }
         setIsLoading(true);
         trackEvent('用角色卡开一局');
         try {
-            const { context, recentMsgs } = await buildAiContext(targetChar);
+            const { recentMsgs } = await buildAiContext(targetChar);
             const task = `你（${charName}）在玩"酒馆"AI 角色扮演（沉浸式长剧情、像和 AI 合写小说）。这次的对手是你的角色卡「${card.name}」${card.kind === 'world' ? '（大型世界卡）' : ''}：
 人设/设定：${card.persona || '（自行发挥，贴合卡名）'}${card.scenario ? `\n初始场景：${card.scenario}` : ''}
 请生成 1 段你和这张卡的扮演记录。
 **transcript 写法**：长剧情小说体，第三人称叙事 + 引号对白，动作/神态/心理用 *星号*；"我:" = 你(玩家 ${charName}) 敲进输入框的 RP，"对方:" = AI 扮的「${card.name}」，交替推进，4-6 轮，首轮"对方:"当开场白、**整段以 "我:"(玩家)收尾**（停在等对方回应处）。**"我:"括号外只写故事里所扮角色的动作/对白，不要写你现实里的身体反应（盯屏幕/扔手机/吃东西等）；（全角括号内）= 越过角色直接跟皮下 AI 本体说话（骂它/OOC 提醒/指导怎么演/指出哪段不对）。**
 返回 JSON：{ "title": "剧情标题(12字内)", "transcript": "我: ...\\n对方: ..." }`;
-            const fullPrompt = `${context}\n\n### [Recent Chat Context]\n${recentMsgs}\n\n### [Task]\n${task}\n只输出 JSON，不要解释。`;
-            const content = await callLLM(fullPrompt);
+            const fullPrompt = `\n\n### [Recent Chat Context]\n${recentMsgs}\n\n### [Task]\n${task}\n只输出 JSON，不要解释。`;
+            const content = await callLLM(fullPrompt, 0.85, true, '酒馆角色卡开场');
             const obj: any = extractJson(content) || {};
             if (!obj.transcript) { addToast('没生成出来，再试一次', 'error'); return; }
             const now = Date.now();
-            const sess: AiSession = {
+            const sess: AiSession = normalizePhoneAiSession({
                 id: `ai-${now}-${Math.random().toString(36).slice(2, 6)}`, service: 'tavern',
                 serviceName: card.name, title: obj.title || `与${card.name}的一局`, transcript: obj.transcript, cardId: card.id, updatedAt: now,
-            };
+            });
             updateCharacter(targetChar.id, (cur) => ({
                 phoneState: {
                     ...cur.phoneState, records: cur.phoneState?.records || [],
@@ -1666,32 +1696,14 @@ ${olderText}
         owner: CharacterProfile, partnerName: string, partnerCharId: string,
         detail: string, delta: number, partnerNote?: string, learnedNew?: string, seedIdentity?: string,
     ) => {
-        // 对方在我方通讯录里是否已存在——决定是否要「先建联系人」并给个起始备注名
-        const hadContact = (owner.phoneState?.contacts || []).some(
-            c => c.linkedCharId === partnerCharId || normName(c.name) === normName(partnerName),
-        );
-        // upsert 指向对方的真实联系人（不存在则在这里先建好，名字/头像/备注名都补上，再挂消息）
-        let contacts = upsertContact(owner.phoneState?.contacts || [], {
-            name: partnerName, kind: 'real', linkedCharId: partnerCharId, lastInteraction: Date.now(),
-            note: partnerNote,
-            // 仅新建时给个起始备注名（多数关系标签是对称的：网友↔网友、前任↔前任），已有则不动
-            identity: hadContact ? undefined : seedIdentity,
-        });
-        const cid = contacts.find(c => c.linkedCharId === partnerCharId || normName(c.name) === normName(partnerName))?.id;
-        // 好感增减 + 自动加删友 + 累积「了解」
-        let broadcast = '';
-        contacts = contacts.map(c => {
-            if (c.id !== cid) return c;
-            const newAff = clampAffinity(c.affinity + delta);
-            let status = c.status;
-            if (newAff <= -60 && c.status === 'friend') { status = 'deleted'; broadcast = `（我把 ${c.name} 删了，懒得再联系。）`; }
-            else if (newAff >= 60 && c.status !== 'friend' && c.status !== 'blocked') { status = 'friend'; broadcast = `（我又把 ${c.name} 加回来了。）`; }
-            const learned = learnedNew ? appendLearned(c.learned, learnedNew) : c.learned;
-            return { ...c, affinity: newAff, status, learned, lastInteraction: Date.now() };
-        });
-        // chat 记录（按联系人 upsert）
-        const recs = owner.phoneState?.records || [];
-        const existing = recs.find(r => r.type === 'chat' && (r.contactId === cid || (!r.contactId && normName(r.title) === normName(partnerName))));
+        const timestamp = Date.now();
+        const result = {
+            partnerName, partnerCharId, detail, delta, partnerNote, learnedNew, seedIdentity,
+            timestamp, recordId: `rec-${timestamp}-${Math.random()}`,
+        };
+        const contact = owner.phoneState?.contacts?.find(c => c.linkedCharId === partnerCharId || normName(c.name) === normName(partnerName));
+        const existing = owner.phoneState?.records?.find(r => r.type === 'chat'
+            && ((contact && r.contactId === contact.id) || (!r.contactId && normName(r.title) === normName(partnerName))));
         const ownerSendToChat = owner.phoneState?.sendToChat !== false;
         let msgId: number | undefined;
         if (ownerSendToChat) {
@@ -1703,15 +1715,14 @@ ${olderText}
                 metadata: { phoneCard: { app: '聊天软件', kind: 'chat', title: partnerName, detail } },
             } as any);
         }
-        const now = Date.now();
-        const nextRecs = existing
-            ? recs.map(r => r.id === existing.id ? { ...r, detail, timestamp: now, contactId: cid, systemMessageId: msgId ?? r.systemMessageId } : r)
-            : [...recs, { id: `rec-${now}-${Math.random()}`, type: 'chat', title: partnerName, detail, timestamp: now, contactId: cid, systemMessageId: msgId }];
         // 自动加删友播报：进机主与用户的私聊（同样受 sendToChat 控制）
+        const { broadcast } = applyRealConversationToPhoneState(owner.phoneState, result);
         if (broadcast && ownerSendToChat) {
             await DB.saveMessage({ charId: owner.id, role: 'assistant', type: 'text', content: broadcast } as any);
         }
-        updateCharacter(owner.id, (cur) => ({ phoneState: { ...cur.phoneState, contacts, records: nextRecs } }));
+        updateCharacter(owner.id, (cur) => ({
+            phoneState: applyRealConversationToPhoneState(cur.phoneState, { ...result, systemMessageId: msgId }).phoneState,
+        }));
     };
 
     // 聊满 100 条触发总结：把待归档的每 100 条原文，A/B 各自第一人称浓缩成一条话题盒记忆，推进水位线。
@@ -1728,8 +1739,8 @@ ${olderText}
             const aChunk = serializeTurns(aLines.slice(mark, mark + ARCHIVE_EVERY));
             const bChunk = flipTranscript(aChunk);
             const [aSum, bSum] = await Promise.all([
-                summarizeConversation({ api: effectiveApiConfig as any, speakerName: targetChar.name, otherName: b.name, transcript: aChunk }),
-                summarizeConversation({ api: effectiveApiConfig as any, speakerName: b.name, otherName: targetChar.name, transcript: bChunk }),
+                summarizeConversation({ api: effectiveApiConfig as any, speakerId: targetChar.id, speakerName: targetChar.name, otherName: b.name, transcript: aChunk }),
+                summarizeConversation({ api: effectiveApiConfig as any, speakerId: b.id, speakerName: b.name, otherName: targetChar.name, transcript: bChunk }),
             ]);
             const ts = Date.now();
             const mk = () => `tp-${ts}-${Math.random().toString(36).slice(2, 7)}`;
@@ -1965,7 +1976,14 @@ ${olderText}
             const generated = await generatePersonaScript({
                 char: targetChar, userProfile, apiConfig: effectiveApiConfig as any, mode: m, theme: t, userPresence: presence, tone,
             });
-            personaSimStore.set({ status: 'ready', mode: m, theme: t, script: generated, charId: cid, charName: cname });
+            const log = createPersonaSimLog(generated, m, t);
+            updateCharacter(cid, cur => ({
+                phoneState: {
+                    ...cur.phoneState, records: cur.phoneState?.records || [],
+                    simLogs: [log, ...(cur.phoneState?.simLogs || [])],
+                },
+            }));
+            personaSimStore.set({ status: 'ready', mode: m, theme: t, script: generated, logId: log.id, charId: cid, charName: cname });
             addToast('演出已就绪', 'success');
         } catch (e) {
             console.error(e);
@@ -2030,6 +2048,24 @@ ${olderText}
             case 'social': return '朋友圈';
             case 'call': return '通话';
             default: return customApps.find(a => a.id === type)?.name || 'App';
+        }
+    };
+
+    const syncEvidenceRecordToChat = async (record: PhoneEvidence) => {
+        if (!targetChar || evidenceSyncLock.current) return;
+        evidenceSyncLock.current = true;
+        setEvidenceSyncBusy(true);
+        try {
+            const app = record.type === 'chat' ? '聊天软件' : appLabel(record.type);
+            const { inserted } = await DB.syncPhoneEvidenceToChat(targetChar.id, record.id, app);
+            setEvidenceMenu(current => current?.record === record ? null : current);
+            addToast(inserted ? '已把这条查手机记录同步到私聊' : '私聊中已有这条记录，无需重复同步', inserted ? 'success' : 'info');
+            if (inserted) trackEvent('事后同步查手机记录到私聊', { kind: record.type });
+        } catch (error: any) {
+            addToast(error?.message || '同步失败，请重试', 'error');
+        } finally {
+            evidenceSyncLock.current = false;
+            setEvidenceSyncBusy(false);
         }
     };
 
@@ -2115,7 +2151,11 @@ ${olderText}
                         const last = segs.length ? segs[segs.length - 1].text : '...';
                         const av = contactOfRecord(r) ? contactAvatar(contactOfRecord(r)!) : undefined;
                         return (
-                            <div key={r.id} onClick={() => { setSelectedChatRecord(r); setTranscriptExpanded(false); setActiveAppId('chat_detail'); }}
+                            <div key={r.id} {...longPress(() => setEvidenceMenu({ record: r, backAppId: 'chat' }))}
+                                onClick={() => {
+                                    if (lpFired.current) { lpFired.current = false; return; }
+                                    setSelectedChatRecord(r); setTranscriptExpanded(false); setActiveAppId('chat_detail');
+                                }}
                                 className="group relative flex items-center gap-3.5 rounded-2xl p-3.5 bg-white/[0.035] border border-white/[0.06] active:scale-[0.99] transition cursor-pointer animate-fade-in">
                                 {av ? (
                                     <TokenImg value={av} alt="" className="w-12 h-12 rounded-2xl object-cover shrink-0" />
@@ -2313,6 +2353,11 @@ ${olderText}
                         <div className="flex justify-between gap-4"><dt className="text-white/30">记录编号</dt><dd className="text-white/40 text-right font-mono">#{r.id.slice(-8).toUpperCase()}</dd></div>
                     </dl>
 
+                    <button onClick={() => void syncEvidenceRecordToChat(r)} disabled={evidenceSyncBusy}
+                        className="w-full mt-2 py-3 rounded-2xl text-[12px] font-semibold text-sky-100 bg-sky-400/10 border border-sky-300/20 active:scale-[0.99] transition flex items-center justify-center gap-2 disabled:text-white/30 disabled:bg-white/[0.03] disabled:border-white/[0.06]">
+                        <PaperPlaneTilt size={15} weight="bold" /> {evidenceSyncBusy ? '同步中…' : r.systemMessageId ? '检查并补同步到私聊' : '同步这条到私聊'}
+                    </button>
+                    <p className="mt-2 text-center text-[10px] text-white/40">私聊卡片已删除时可补发，仍在时不会重复发送。</p>
                     <button onClick={() => askConfirm({
                         title: '删除这条记录？', desc: '删除「' + r.title + '」后无法恢复。', confirmLabel: '删除', danger: true,
                         onConfirm: () => handleDeleteRecord(r),
@@ -3288,7 +3333,7 @@ ${olderText}
         return (
             <SubAppShell>
                 <TermHeader title={app.name} sub={layoutMeta?.name || 'custom app'} accent={accent} onBack={() => setActiveAppId('home')}
-                    right={<span className="text-lg">{app.icon}</span>} />
+                    right={<button onClick={() => openCustomAppEditor(app)} className="px-3 py-2 text-xs" aria-label={`编辑${app.name}`}>编辑</button>} />
                 <div className="flex-1 overflow-y-auto px-4 pt-2 no-scrollbar pb-28 overscroll-contain space-y-3">
                     {list.length === 0 && <EmptyState text="暂无数据" />}
                     {list.map((r, idx) => renderCustomItem(r, idx, list.length, accent, layout, app))}
@@ -3381,7 +3426,7 @@ ${olderText}
 
             {/* Add app + my apps row */}
             <div className="grid grid-cols-2 gap-3.5 mb-7">
-                <button onClick={() => setShowCreateModal(true)}
+                <button onClick={() => openCustomAppEditor()}
                     className={`${customApps.length ? '' : 'col-span-2'} rounded-[20px] p-4 border border-dashed border-white/15 bg-white/[0.02] flex flex-col items-center justify-center gap-2 active:scale-[0.98] transition min-h-[90px]`}>
                     <Plus size={22} weight="light" className="text-white/60" />
                     <span className="text-[11px] tracking-[0.25em] uppercase text-white/50">Add App</span>
@@ -3474,7 +3519,7 @@ ${olderText}
                         </div>
                     );
                 })}
-                <button onClick={() => setShowCreateModal(true)}
+                <button onClick={() => openCustomAppEditor()}
                     className="rounded-[24px] p-4 border border-dashed border-white/15 bg-white/[0.02] flex flex-col items-center justify-center gap-2 active:scale-[0.98] transition min-h-[130px]">
                     <Plus size={24} weight="light" className="text-white/60" />
                     <span className="text-[11px] tracking-[0.2em] uppercase text-white/50">Add App</span>
@@ -3711,16 +3756,16 @@ ${olderText}
                     {activeAppId === 'aiagent' && renderAiAgent()}
                     {activeAppId === 'ai_session' && renderAiSession()}
                     {activeAppId === 'persona' && targetChar && (
-                        <PersonaSim targetChar={targetChar} onExit={() => setActiveAppId('home')} openLifeLog={() => setActiveAppId('lifelog')}
-                            sim={sim} onStart={runSim} onConsumed={() => personaSimStore.reset()} />
+                        <PersonaSim key={targetChar.id} targetChar={targetChar} onExit={() => setActiveAppId('home')} openLifeLog={() => setActiveAppId('lifelog')}
+                            sim={sim.charId === targetChar.id ? sim : { status: 'idle' }} onStart={runSim} onConsumed={() => personaSimStore.reset()} />
                     )}
                     {activeAppId === 'lifelog' && targetChar && (
                         <LifeLog targetChar={targetChar} onBack={() => setActiveAppId('home')}
                             onRequestDelete={requestDeleteSimLog}
-                            onReplay={(log) => {
+                            onReplay={(log, action) => {
                                 if (!log.script) return;
                                 // 用存下来的脚本快照原样回放——直接喂给全局 store 的 ready 态
-                                personaSimStore.set({ status: 'ready', mode: log.mode, theme: log.theme, script: log.script, replay: true, charId: targetChar.id, charName: targetChar.name });
+                                personaSimStore.set({ status: 'ready', mode: log.mode, theme: log.theme, script: log.script, logId: log.id, startIndex: action === 'resume' ? getPersonaSimBeatIndex(log) : 0, charId: targetChar.id, charName: targetChar.name });
                                 setActiveAppId('persona');
                             }} />
                     )}
@@ -3755,6 +3800,30 @@ ${olderText}
                                 className="w-full py-3.5 rounded-2xl text-white font-bold active:scale-[0.99] transition"
                                 style={{ background: '#5f82ef' }}>关闭</button>
                         </div>
+                    </div>
+                </div>
+            )}
+
+            {/* 查手机记录 · 长按后可事后补同步到私聊 */}
+            {evidenceMenu && (
+                <div className="fixed inset-0 z-[120] flex items-end justify-center animate-fade-in" onClick={() => setEvidenceMenu(null)}>
+                    <div className="absolute inset-0 bg-black/50" />
+                    <div className="relative w-full max-w-sm m-3 mb-6 space-y-2" onClick={event => event.stopPropagation()}>
+                        <div className="rounded-2xl overflow-hidden bg-[#1c1d22] border border-white/10">
+                            <div className="px-4 py-2.5 text-[12px] text-white/50 border-b border-white/10 truncate">查手机记录：{evidenceMenu.record.title}</div>
+                            <button
+                                onClick={() => void syncEvidenceRecordToChat(evidenceMenu.record)}
+                                disabled={evidenceSyncBusy}
+                                className="w-full px-4 py-3.5 text-left text-[14px] text-sky-300 active:bg-white/5 transition flex items-center gap-3 disabled:text-white/30"
+                            ><PaperPlaneTilt size={17} /> {evidenceSyncBusy ? '同步中…' : evidenceMenu.record.systemMessageId ? '检查并补同步到私聊' : '同步到私聊'}</button>
+                            <p className="px-4 pb-3 text-[11px] text-white/40">卡片删掉后可补发；私聊里仍有卡片时不会重复发送。</p>
+                            <button onClick={() => {
+                                const record = evidenceMenu.record;
+                                setEvidenceMenu(null);
+                                askConfirm({ title: '删除这条记录？', desc: `删除「${record.title}」后无法恢复。`, confirmLabel: '删除', danger: true, onConfirm: () => handleDeleteRecord(record) });
+                            }} className="w-full px-4 py-3.5 text-left text-[14px] text-rose-400 active:bg-white/5 transition flex items-center gap-3 border-t border-white/10"><Trash size={17} /> 删除记录</button>
+                        </div>
+                        <button onClick={() => setEvidenceMenu(null)} className="w-full rounded-2xl bg-[#1c1d22] border border-white/10 py-3.5 text-[14px] font-semibold text-white/80">取消</button>
                     </div>
                 </div>
             )}
@@ -3891,8 +3960,8 @@ ${olderText}
             })()}
 
             {/* Create App Modal */}
-            <Modal isOpen={showCreateModal} title="安装自定义 App" onClose={() => setShowCreateModal(false)}
-                footer={<button onClick={handleCreateCustomApp} className="w-full py-3 bg-violet-500 text-white font-bold rounded-2xl">安装到桌面</button>}>
+            <Modal isOpen={showCreateModal} title={editingAppId ? '编辑自定义 App' : '安装自定义 App'} onClose={() => setShowCreateModal(false)}
+                footer={<button onClick={handleCreateCustomApp} disabled={!newAppName.trim() || !newAppPrompt.trim()} className="w-full py-3 bg-violet-500 text-white font-bold rounded-2xl disabled:opacity-40">{editingAppId ? '保存修改' : '安装到桌面'}</button>}>
                 <div className="space-y-4">
                     <div className="flex gap-4">
                         <div className="w-16 h-16 rounded-2xl flex items-center justify-center text-3xl shadow-md border border-white/10 shrink-0"
@@ -4069,3 +4138,5 @@ ${olderText}
 };
 
 export default CheckPhone;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

@@ -18,6 +18,7 @@ import {
     HandbookPage, HandbookFragment, HandbookLayout, LayoutPlacement, LayoutRole,
 } from '../types';
 import { DB } from './db';
+import { loadCharacterContextMessages } from './chatContextRange';
 import { safeResponseJson, extractJson } from './safeApi';
 import { ContextBuilder } from './context';
 import { getLocalDayRange } from './localDate';
@@ -455,6 +456,9 @@ ${transcriptParts.join('\n\n')}
 
 直接输出 JSON 数组。`;
 
+    const activeChars = perChar.filter(p => p.totalLines > 0);
+    const soleChar = activeChars.length === 1 ? activeChars[0] : undefined;
+
     try {
         const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
             method: 'POST',
@@ -465,7 +469,13 @@ ${transcriptParts.join('\n\n')}
                 temperature: 0.8,
                 max_tokens: 12000,
             }),
-        });
+            __sullyMeta: {
+                appId: 'handbook',
+                appName: '手账',
+                ...(soleChar ? { charId: soleChar.charId, charName: soleChar.charName } : {}),
+                purpose: '日记手账生成',
+            },
+        } as RequestInit);
         if (!response.ok) {
             console.error('[Handbook/UserDiary] API error:', response.status);
             return { page: null, placements: [], totalUserMsgs, perChar };
@@ -532,6 +542,7 @@ export async function generateLifestreamPage(
     maxPageInUse: number = 0,
     canvasPixelHint?: { width: number; height: number },
 ): Promise<LifestreamGenResult> {
+
     if (fragmentBudget !== undefined && fragmentBudget <= 0) return { page: null, placements: [] };
     // (取消 lifestyle gate: 只要 user 把 ta 选进来,就让 ta 在这页留一笔。
     //  scheduleStyle 仍用于决定是否注入 schedule 骨架。)
@@ -543,13 +554,14 @@ export async function generateLifestreamPage(
     //   /user profile/impression(完整含 likes/triggers/comfort/changes)
     //   /refinedMemories/activeMemoryMonths 详细日志/memoryPalace/buff
     //   是聊天系统在用的 source of truth,改它会自动跟进
-    const coreContext = ContextBuilder.buildCoreContext(char, userProfile, true);
+    const characterContextInput = { char, user: userProfile, includeDetailedMemories: true };
+
 
     // ─── 1b. ta 实际怎么说话 — buildCoreContext 没的,得自己补 ──
     // 这是"像不像 ta"最关键的输入: prompt 描述规则,样本展示语气
     let speechSamples: string[] = [];
     try {
-        const all = await DB.getMessagesByCharId(char.id, true);
+        const all = await loadCharacterContextMessages(char);
         const charMsgs = all.filter(m =>
             m.role === 'assistant'
             && typeof m.content === 'string'
@@ -557,7 +569,7 @@ export async function generateLifestreamPage(
             && m.content.length < 600
             && !(m.content.trim().startsWith('{') && m.content.trim().endsWith('}'))
         );
-        // 跨时间均匀抽 30 条,避免全是最近一段对话
+        // 在可见范围内均匀抽 30 条语气样本
         if (charMsgs.length <= 30) {
             speechSamples = charMsgs.map(m => m.content.slice(0, 200));
         } else {
@@ -616,7 +628,7 @@ export async function generateLifestreamPage(
     const prompt = `今天是 ${date}（星期${dayOfWeek}）。${userName} 已经在 ${W}x${H}px 的瘦长手账纸上写下了 ta 今天的碎片。请你 (角色「${char.name}」) **在纸上的空白处, 也写一组自己的今日碎片**——不是日记,是 ta 散落的瞬间,各自独立又拼出 ta 的一天。**写什么 + 写在哪都你定**。
 
 【角色完整档案】
-${coreContext}
+
 ${speechBlock}${scheduleBlock}
 
 ${occupiedBlock}
@@ -703,11 +715,18 @@ text 里允许少量 markdown 语法,渲染时会变成对应的视觉效果:
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
             body: JSON.stringify({
                 model: apiConfig.model,
-                messages: [{ role: 'user', content: prompt }],
+                messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'user', content: prompt }])),
                 temperature: 0.85,
                 max_tokens: 12000,
             }),
-        });
+            __sullyMeta: {
+                appId: 'handbook',
+                appName: '手账',
+                charId: char.id,
+                charName: char.name,
+                purpose: '生活流手账生成',
+            },
+        } as RequestInit);
         if (!response.ok) {
             console.error('[Handbook/Lifestream] API error:', response.status, char.name);
             return { page: null, placements: [] };

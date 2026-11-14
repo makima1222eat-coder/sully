@@ -370,7 +370,7 @@ export interface MiniMaxTtsPayloadOptions {
   voiceId?: string;
   model?: string;
   groupId?: string;
-  /** 电话的经典模式历史上固定请求 URL 和 32k/128k 单声道，必须继续保留。 */
+  /** 电话经典模式保留 32k/128k 单声道音频设置。传输格式统一使用 HEX。 */
   legacyTransport?: 'shared' | 'call';
   /** 电话先处理整段再切块；切块后不能二次插入停顿。 */
   textAlreadyPrepared?: boolean;
@@ -388,7 +388,10 @@ export const buildMiniMaxTtsPayload = (
   const payload: any = {
     model: options.model || vp?.model || DEFAULT_MODEL,
     text: payloadText,
-    ...(paramVersion === 'natural-v2' || isLegacyCall ? { stream: false, output_format: 'url' } : {}),
+    // Inline audio avoids a second, CORS-protected GET to MiniMax's regional OSS.
+    // Transport format does not change the voice/acoustic settings or cache key.
+    stream: false,
+    output_format: 'hex',
     voice_setting: {
       voice_id: options.voiceId ?? vp?.voiceId ?? '',
       ...buildVoiceSettings(vp, options.emotion, paramVersion),
@@ -399,7 +402,9 @@ export const buildMiniMaxTtsPayload = (
     ...buildTtsExtras(vp, paramVersion),
   };
 
-  const languageBoost = paramVersion === 'natural-v2'
+  // 旧版参数路径继续保留原始 ISO 短码，唯独粤语必须发送 MiniMax 官方枚举
+  // `Chinese,Yue`；`yue` 本身不是 language_boost 的合法值。
+  const languageBoost = paramVersion === 'natural-v2' || options.languageBoost?.trim().toLowerCase() === 'yue'
     ? normalizeMiniMaxLanguageBoost(options.languageBoost)
     : options.languageBoost || undefined;
   if (languageBoost) payload.language_boost = languageBoost;
@@ -437,14 +442,20 @@ export const convertHexAudioToBlob = (hexAudio: string, mimeType = 'audio/mpeg')
 
 /** Fetch remote audio URL and return as Blob */
 export const fetchRemoteAudioBlob = async (sourceUrl: string): Promise<Blob> => {
-  const cacheBustedUrl = sourceUrl.includes('?')
-    ? `${sourceUrl}&_ts=${Date.now()}`
-    : `${sourceUrl}?_ts=${Date.now()}`;
-  const response = await fetch(cacheBustedUrl, { cache: 'no-store' });
-  if (!response.ok) throw new Error(`音频下载失败（HTTP ${response.status}）`);
-  const blob = await response.blob();
-  if (!blob.size) throw new Error('音频下载为空文件');
-  return blob;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    // Preserve signed URLs exactly; their signature/cache identity belongs to the upstream.
+    const response = await fetch(sourceUrl, { cache: 'no-store', signal: controller.signal });
+    if (!response.ok) throw new Error(`音频下载失败（HTTP ${response.status}）`);
+    const type = response.headers.get('content-type') || '';
+    if (/text\/html|application\/(?:json|xml)/i.test(type)) throw new Error('音频地址返回了错误页面');
+    const blob = await response.blob();
+    if (!blob.size) throw new Error('音频下载为空文件');
+    return blob;
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 export interface TtsResult {
@@ -509,7 +520,7 @@ export async function synthesizeSpeechDetailed(
   }
 
   const audio = data?.data?.audio;
-  if (!audio) {
+  if (typeof audio !== 'string' || !audio.trim()) {
     // Log full response for debugging
     console.error('[TTS] No audio in response:', JSON.stringify(data).slice(0, 500));
     throw new Error('TTS 返回无音频数据');

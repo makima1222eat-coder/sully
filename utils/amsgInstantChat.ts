@@ -1,3 +1,8 @@
+import { stageStoppedReplyReceipt } from './amsgStoppedReplyClient';
+import { listUserSpaces } from './userSpaces';
+import { amsgStateNamespace } from './amsgFirePack';
+import { stoppedReplyKey } from './amsgStoppedReply';
+import { getReplyDisplayIds, isReplyStopped, markReplyStopped, replyAbortError } from './chatReplyCancellation';
 /**
  * 即时对话（instant chat）的客户端这一半。
  *
@@ -21,13 +26,20 @@
 
 import { ActiveMsg2InboxMessage, CharacterProfile, GroupProfile, RealtimeConfig, UserProfile } from '../types';
 import { ActiveMsgClient, type AmsgOutboxEntry, type InstantChatProbeOutcome } from './activeMsgClient';
-import { ActiveMsgStore } from './activeMsgStore';
+import { ActiveMsgStore, isInstantChatSwitchedOn } from './activeMsgStore';
 import { trackEvent } from './analytics';
-import { cloudApiCallLogId, recordCloudApiCall, settleCloudApiCall } from './apiCallLog';
+import {
+  cloudApiCallLogId,
+  cloudEmotionApiCallLogId,
+  recordCloudApiCall,
+  settleCloudApiCall,
+} from './apiCallLog';
 import { announceEmotionDone } from './chatGenEvents';
 import { dispatchAmsgResult } from './amsgResults';
 import { DB } from './db';
 import type { AmsgEmotionEvalSpec } from '../worker/amsg/src/emotionEval';
+import { AMSG_BUNDLE_VERSION, compareBundleVersions } from './amsgBundleVersion';
+import type { AmsgSarModuleSnapshot } from './vrWorld/sarEnvelopeCore';
 
 const HEADER = '[AmsgInstantChat]';
 
@@ -36,6 +48,43 @@ export const INSTANT_CHAT_STATUS_CHECK_INTERVAL_MS = 60_000;
 
 /** 待收记录的落盘位置。存 localStorage 而不是内存：重启后指示灯要还在。 */
 export const AMSG_INSTANT_CHAT_PENDING_LS_KEY = 'amsg2_instant_chat_pending';
+
+/** 随即时对话一并起跑了云端情绪评估的轮次 uuid（收尾时据此结清对应的情绪评估调用记录）。 */
+export const AMSG_INSTANT_EMOTION_INFLIGHT_LS_KEY = 'amsg2_instant_emotion_inflight_v1';
+const MAX_EMOTION_INFLIGHT_TRACKED = 32;
+
+const readEmotionEvalInFlight = (): string[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(AMSG_INSTANT_EMOTION_INFLIGHT_LS_KEY) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((id): id is string => typeof id === 'string' && !!id);
+  } catch {
+    return [];
+  }
+};
+
+const writeEmotionEvalInFlight = (ids: string[]) => {
+  try {
+    if (ids.length === 0) localStorage.removeItem(AMSG_INSTANT_EMOTION_INFLIGHT_LS_KEY);
+    else localStorage.setItem(AMSG_INSTANT_EMOTION_INFLIGHT_LS_KEY, JSON.stringify(ids.slice(-MAX_EMOTION_INFLIGHT_TRACKED)));
+  } catch { /* 写不进去只影响这一笔记录的云端状态收尾 */ }
+};
+
+const markEmotionEvalInFlight = (uuid: string): void => {
+  if (!uuid) return;
+  const list = readEmotionEvalInFlight().filter((id) => id !== uuid);
+  list.push(uuid);
+  writeEmotionEvalInFlight(list);
+};
+
+const consumeEmotionEvalInFlight = (uuid: string | null | undefined): boolean => {
+  if (!uuid) return false;
+  const list = readEmotionEvalInFlight();
+  const next = list.filter((id) => id !== uuid);
+  if (next.length === list.length) return false;
+  writeEmotionEvalInFlight(next);
+  return true;
+};
 
 /** 待收记录变动时广播；Chat 界面据此点亮/熄灭「正在输入…」。detail 只带 charId。 */
 export const AMSG_INSTANT_CHAT_PENDING_EVENT = 'amsg-instant-chat-pending';
@@ -241,7 +290,32 @@ export type InstantChatReadinessReason =
 export interface InstantChatReadiness {
   ready: boolean;
   reason?: InstantChatReadinessReason;
+  /**
+   * 那台 Worker 贴的 bundle 是否不旧于本 App 认的这一版（存量 workerBundleVersion 等于或
+   * 新于 AMSG_BUNDLE_VERSION；App 还是缓存的旧构建时 Worker 会更新，那也认得新协议）。只在 ready 时给：true / false 是探到过的结论，
+   * undefined = 不知道。不传 ensureBundleVersion 时它就是「还没探过」；传了的话
+   * 存量为空会当场现探一次，那时 undefined 意味着「现探也没问到」。
+   *
+   * 能不能上云不看它——那是 instantChatSupported 的事。它只给「这一轮要用到新协议」
+   * 的调用方做额外否决（SAR 模块生效期的信封回复，旧 bundle 会把信封当正文切碎）。
+   */
+  workerBundleCurrent?: boolean;
 }
+
+/** 存量里那台 Worker 的 bundle 版本是否不旧于当前这一版；没探过（undefined）返回 undefined。 */
+const resolveWorkerBundleCurrent = (
+  config: { workerBundleVersion?: string | null },
+): boolean | undefined => {
+  const deployed = config.workerBundleVersion;
+  if (deployed === undefined) return undefined;
+  if (deployed === null) return false;
+  return deployed === AMSG_BUNDLE_VERSION || (compareBundleVersions(deployed, AMSG_BUNDLE_VERSION) ?? -1) > 0;
+};
+
+/** ready 的那一档带上 bundle 结论；不知道就不带这个键。 */
+const readyWithBundle = (workerBundleCurrent: boolean | undefined): InstantChatReadiness => (
+  workerBundleCurrent === undefined ? { ready: true } : { ready: true, workerBundleCurrent }
+);
 
 // ─── 存量说「跑不动」时的现探 ───
 //
@@ -268,7 +342,10 @@ let reprobeInFlight: Promise<InstantChatProbeOutcome> | null = null;
  * 把冷却清零，让下一条消息立刻重探。
  * 网络刚恢复时调（online 事件），换 Worker / 改配置的地方也可以调。
  */
-export const resetInstantChatReprobeCooldown = (): void => { lastReprobeAt = 0; };
+export const resetInstantChatReprobeCooldown = (): void => {
+  lastReprobeAt = 0;
+  lastBundleProbeAt = 0;
+};
 
 // 切代理节点不会触发 online，所以这个监听只是「便宜的加速」，不是恢复的唯一指望——
 // 真正兜底的是上面那道冷却到期后的现探。
@@ -302,6 +379,50 @@ const reprobeInstantChatSupport = async (): Promise<InstantChatProbeOutcome> => 
   }
 };
 
+// ─── bundle 版本没探过时的现探（ensureBundleVersion）───
+//
+// 存量 workerBundleVersion 只在握手 / 设置页探测时写。老用户刚更新 App、握手那次探测还没
+// 回来就发了一条要信封的消息（SAR 模块生效期），存量是空的——这时放行等于赌那台 Worker
+// 认得信封，赌输了信封整段切碎上屏。所以这类回合当场问一次，问不到就不上云。
+// 跟上面的懒重探一样带超时、冷却、并发合并：只在「存量为空 + 这一轮需要新协议」时付这点延迟，
+// 探到了会存下来，之后的回合一次都不再探。
+
+let lastBundleProbeAt = 0;
+let lastBundleProbeResult: boolean | undefined;
+let bundleProbeInFlight: Promise<boolean | undefined> | null = null;
+
+const probeBundleCurrentNow = async (): Promise<boolean | undefined> => {
+  if (bundleProbeInFlight) return bundleProbeInFlight;
+  if (Date.now() - lastBundleProbeAt < INSTANT_CHAT_REPROBE_COOLDOWN_MS) return lastBundleProbeResult;
+  lastBundleProbeAt = Date.now();
+  const task = (async () => {
+    try {
+      // 问到答案时 probeWorkerVersion 会顺手把版本存进 workerBundleVersion。
+      const { state } = await ActiveMsgClient.probeWorkerVersion({ timeoutMs: INSTANT_CHAT_REPROBE_TIMEOUT_MS });
+      return state === 'current' || state === 'ahead' ? true : state === 'outdated' ? false : undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  bundleProbeInFlight = task;
+  try {
+    lastBundleProbeResult = await task;
+    return lastBundleProbeResult;
+  } finally {
+    bundleProbeInFlight = null;
+  }
+};
+
+/** 存量优先；存量为空且调用方要求时，当场现探一次。 */
+const resolveBundleCurrent = async (
+  config: { workerBundleVersion?: string | null },
+  ensureBundleVersion: boolean,
+): Promise<boolean | undefined> => {
+  const stored = resolveWorkerBundleCurrent(config);
+  if (stored !== undefined || !ensureBundleVersion) return stored;
+  return probeBundleCurrentNow();
+};
+
 /**
  * 即时对话此刻走不走得通，外加「走不通是因为什么」。
  *
@@ -325,10 +446,17 @@ const reprobeInstantChatSupport = async (): Promise<InstantChatProbeOutcome> => 
  * 锁屏，本地 fetch 被系统掐掉，回来时既没有回复也没有报错，设置页还写着「已开启」。
  * 所以这里就地 warn 一声，调用方按这个 reason 单独收场（useChatAI 里这一档会留一条
  * trace，并且明确报错等用户重发，不发起本地生成）。
+ *
+ * ready 时顺带给出 workerBundleCurrent（那台 Worker 是不是当前 bundle，平时读存量，
+ * 不多探一次）。它不参与这里的放行判断，留给「这一轮要用新协议」的调用方自己否决。
+ * 这类调用方传 `ensureBundleVersion: true`：存量为空时当场现探一次（带超时与冷却），
+ * 探不到就给 undefined，由调用方决定怎么处理（useChatAI 里是否决这一轮上云）。
  */
 export const resolveInstantChatReadiness = async (
   char?: Pick<CharacterProfile, 'activeMsg2Config'>,
+  options?: { ensureBundleVersion?: boolean },
 ): Promise<InstantChatReadiness> => {
+  const ensureBundleVersion = !!options?.ensureBundleVersion;
   // 角色自己关了 → 这一轮回到本地前台生成。这是用户的主动选择，跟「全局没开」同一
   // 待遇：静默走本地，不 warn 不留 trace。undefined = 跟随全局默认开，只认显式 false；
   // 全局配置都不用读——读出什么这一轮都不上云。
@@ -342,7 +470,7 @@ export const resolveInstantChatReadiness = async (
     console.warn(`${HEADER} 全局配置读不出来，这一轮判断不了即时对话开没开（按走不通处理，但这不是「没开」）`, error);
     return { ready: false, reason: 'config-unreadable' };
   }
-  if (!config.instantChatEnabled) return { ready: false, reason: 'disabled' };
+  if (!isInstantChatSwitchedOn(config)) return { ready: false, reason: 'disabled' };
   // 地址排在能力前面：没填地址时那份能力位多半是上一台 Worker 留下的存量，
   // 报「Worker 太旧」会把人指去点一个根本没连上的东西。
   if (!config.workerUrl?.trim()) return { ready: false, reason: 'no-worker-url' };
@@ -355,7 +483,10 @@ export const resolveInstantChatReadiness = async (
     const outcome = await reprobeInstantChatSupport();
     if (outcome === 'supported') {
       console.info(`${HEADER} 重探到那台 Worker 现在跑得动即时对话（存量是过期结论），这一轮照常上云`);
-      return { ready: true };
+      // 现探会顺手刷新 bundle 版本的存量，重读一次拿新结论；读不出来就用探测前那份。
+      let refreshed: typeof config = config;
+      try { refreshed = await ActiveMsgStore.getGlobalConfig(); } catch { /* 沿用旧存量 */ }
+      return readyWithBundle(await resolveBundleCurrent(refreshed, ensureBundleVersion));
     }
     // 静默让位正是「静默分流」那个老坑，所以两档都就地 warn 一声，调用方还会额外留一条
     // trace——用户至少查得到「为什么开了却走本地」。两档的去向不同，别混：
@@ -367,7 +498,7 @@ export const resolveInstantChatReadiness = async (
     console.warn(`${HEADER} 开关是开的，但这一刻够不着云端（问不出新结论）：这一轮本地生成，连上了会自己回到云端`);
     return { ready: false, reason: 'worker-unreachable' };
   }
-  return { ready: true };
+  return readyWithBundle(await resolveBundleCurrent(config, ensureBundleVersion));
 };
 
 /** 只关心「走不走得通」的调用点用这个（设置页的互斥门）。要区分原因走上面那个。 */
@@ -385,8 +516,11 @@ export const AMSG_INSTANT_CHAT_ROUTE_EVENT = 'amsg-instant-chat-route';
 
 export interface InstantChatRouteDetail {
   charId: string;
-  /** null = 这一轮走的云端（界面上把提示收起来）；否则是让位给本地生成的原因。 */
-  reason: InstantChatReadinessReason | null;
+  /**
+   * null = 这一轮走的云端（界面上把提示收起来）；否则是让位给本地生成的原因：readiness 的
+   * reason，或 useChatAI 路由段的否决名（如 'sar-module-worker-outdated'）。提示条只认名单里的。
+   */
+  reason: InstantChatReadinessReason | string | null;
 }
 
 export const announceInstantChatRoute = (detail: InstantChatRouteDetail): void => {
@@ -402,7 +536,7 @@ export const announceInstantChatRoute = (detail: InstantChatRouteDetail): void =
 // 那几秒里，别处打脏触发的常规包（没有 chat 段）可能晚于 POST 内部那次 client-state
 // 写入落地，把带 chat 段的包盖掉，worker 到点只会硬失败。所以从按下发送那一刻起就
 // 占位，挡板认「占位或待收」，202 后由待收记录接棒，失败则释放。
-const inFlightSends = new Set<string>();
+const inFlightSends = new Map<string, symbol>();
 
 /** POST /instant-chat 正在飞（还没等到 202/失败）吗。amsgStateSync 的挂起挡板用。 */
 export const isInstantChatSendInFlight = (charId: string): boolean => inFlightSends.has(charId);
@@ -422,8 +556,11 @@ export interface InstantChatSendResult {
  * 一次回复。上一条已经在跑了（取消不掉）也不影响这一条，最多两句相近的回复。
  */
 export const sendInstantChatTurn = async (params: {
+  signal?: AbortSignal;
   char: CharacterProfile;
   chatMessages: Array<{ role: string; content: unknown }>;
+  /** 本地「实时状态」段在 chatMessages 里的下标；-1 / 不传时 worker 把时效块追加到末尾。 */
+  timelyInsertAt?: number;
   /** 本地生成这一轮会用的凭据（effectiveApi），云端必须用同一份。 */
   api: { baseUrl: string; apiKey: string; model: string };
   /** 本地这一轮会发的采样温度；开思考时本地不发温度，这里也就不传。 */
@@ -444,23 +581,52 @@ export const sendInstantChatTurn = async (params: {
    * 不传就是这一轮不评估（角色没开情绪评估 / 本轮跳过）。
    */
   emotionEval?: AmsgEmotionEvalSpec;
+  /**
+   * SAR 临时模块的请求时快照（buildAmsgSarModuleSnapshot 组的那份）。只在角色或用户
+   * 身上有模块时传；worker 拆信封、落库侧收尾都只认它，不在回程时现算。
+   */
+  sarModule?: AmsgSarModuleSnapshot;
 }): Promise<InstantChatSendResult> => {
   const supersedes = getInstantChatPending(params.char.id);
-  inFlightSends.add(params.char.id);
+  const requestedUuid = crypto.randomUUID();
+  const stopSending = () => {
+    markReplyStopped(requestedUuid);
+    const receipt = stageStoppedReplyReceipt(params.char.id, requestedUuid, Promise.resolve(''));
+    void Promise.allSettled([
+      ActiveMsgClient.cancelTask(requestedUuid),
+      receipt.then(text => ActiveMsgClient.writeClientStateValue(amsgStateNamespace(params.char.id),
+        stoppedReplyKey(requestedUuid), JSON.stringify({ text }))),
+    ]);
+  };
+  params.signal?.addEventListener('abort', stopSending, { once: true });
+  const sendToken = Symbol('instant-send');
+  inFlightSends.set(params.char.id, sendToken);
   // 这一轮在「API 调用记录」里的那一笔：本地这条路只经手一个 POST，真正的模型请求
   // 是云端发的，日志的全局拦截器够不着——不在这儿记，用户就会看到聊天从记录里消失。
   // meta 跟本地生成那条路对齐（useChatAI 传给 safeFetchJson 的那份），两条路在列表里
   // 长得一样，只多一个云端标记。
   const logMeta = {
+    appId: 'chat',
     appName: '消息',
     charId: params.char.id,
     charName: params.char.name,
     purpose: '聊天回复',
   };
+  const emotionLogMeta = {
+    appId: 'chat',
+    appName: '消息',
+    charId: params.char.id,
+    charName: params.char.name,
+    purpose: '情绪评估',
+  };
   try {
+    params.signal?.throwIfAborted();
     const { uuid } = await ActiveMsgClient.sendInstantChat({
+      uuid: requestedUuid,
+      signal: params.signal,
       char: params.char,
       chatMessages: params.chatMessages,
+      ...(params.timelyInsertAt !== undefined ? { timelyInsertAt: params.timelyInsertAt } : {}),
       api: params.api,
       ...(typeof params.temperature === 'number' ? { temperature: params.temperature } : {}),
       ...(params.maxTokens ? { maxTokens: params.maxTokens } : {}),
@@ -469,8 +635,15 @@ export const sendInstantChatTurn = async (params: {
       groups: params.groups,
       realtimeConfig: params.realtimeConfig,
       ...(params.emotionEval ? { emotionEval: params.emotionEval } : {}),
+      ...(params.sarModule ? { sarModule: params.sarModule } : {}),
       ...(supersedes ? { supersedesUuid: supersedes.uuid } : {}),
     });
+    // A stop during POST still needs the accepted UUID so the remote task can be cancelled.
+    if (params.signal?.aborted) {
+      markReplyStopped(uuid);
+      await ActiveMsgClient.cancelTask(uuid);
+      throw replyAbortError();
+    }
     // 先记待收再释放占位（finally），挡板的两个信号无缝交接，不留「都不认」的空窗。
     setInstantChatPending(params.char.id, uuid, Date.now(), params.char.name);
     recordCloudApiCall({
@@ -481,14 +654,34 @@ export const sendInstantChatTurn = async (params: {
       messages: params.chatMessages,
       meta: logMeta,
     });
+    if (params.emotionEval) {
+      markEmotionEvalInFlight(uuid);
+      const evalApi = params.emotionEval.api ?? params.api;
+      recordCloudApiCall({
+        id: cloudEmotionApiCallLogId(uuid),
+        route: 'cloud-emotion-eval',
+        baseUrl: evalApi.baseUrl,
+        model: evalApi.model,
+        messages: [...params.chatMessages, { role: 'user', content: params.emotionEval.prompt }],
+        meta: emotionLogMeta,
+      });
+    }
     // 顶掉的那一轮也得收尾：客户端从这一刻起不再等它的回复了（云端把两句合成一次回，
     // 它已经在跑的情况下顶不掉，但那份回复也认不回这条记录）。不收的话它会一直写着
     // 「云端生成中」，直到 5 天后被裁掉。
     if (supersedes) {
       settleCloudApiCall({ id: cloudApiCallLogId(supersedes.uuid), ok: true, superseded: true });
+      if (consumeEmotionEvalInFlight(supersedes.uuid)) {
+        settleCloudApiCall({ id: cloudEmotionApiCallLogId(supersedes.uuid), ok: true, superseded: true });
+      }
     }
     return { ok: true, uuid };
   } catch (error: any) {
+    if (params.signal?.aborted) {
+      // A response can be lost after the task was created. We still know which task to cancel.
+      await ActiveMsgClient.cancelTask(requestedUuid).catch(() => {});
+      throw error;
+    }
     // 只报失败、只有事件名（跟送达端那几条同一条口径）：失败原因里带着 HTTP 状态和
     // 上游报文，不进上报。用户侧同一时刻已经有明确的报错提示，这里只记「发生过」。
     trackEvent('即时对话发送失败');
@@ -503,9 +696,22 @@ export const sendInstantChatTurn = async (params: {
       meta: logMeta,
       sendFailed: true,
     });
+    if (params.emotionEval) {
+      const evalApi = params.emotionEval.api ?? params.api;
+      recordCloudApiCall({
+        id: `cloud-emotion-send-failed-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        route: 'cloud-emotion-eval',
+        baseUrl: evalApi.baseUrl,
+        model: evalApi.model,
+        messages: [...params.chatMessages, { role: 'user', content: params.emotionEval.prompt }],
+        meta: emotionLogMeta,
+        sendFailed: true,
+      });
+    }
     return { ok: false, error: error?.message || String(error) };
   } finally {
-    inFlightSends.delete(params.char.id);
+    params.signal?.removeEventListener('abort', stopSending);
+    if (inFlightSends.get(params.char.id) === sendToken) inFlightSends.delete(params.char.id);
   }
 };
 
@@ -525,13 +731,30 @@ export const settleInstantChatApiLog = (uuid: string, metadata?: Record<string, 
     (typeof value === 'number' && Number.isFinite(value) ? value : undefined);
   const usage = metadata?.amsgUsage;
   const toolTrace = metadata?.amsgToolTrace;
+  const hasToolTrace = Array.isArray(toolTrace) && toolTrace.length > 0;
   settleCloudApiCall({
     id: cloudApiCallLogId(uuid),
-    ok: true,
+    ok: !isReplyStopped(uuid),
     promptTokens: num(usage?.promptTokens),
     completionTokens: num(usage?.completionTokens),
-    tokensPartial: Array.isArray(toolTrace) && toolTrace.length > 0,
+    tokensPartial: metadata?.amsgUsageComplete === true ? false : hasToolTrace,
   });
+  if (metadata?.amsgEmotionPending === true) return;
+  if (consumeEmotionEvalInFlight(uuid)) {
+    const emotionUsage = metadata?.amsgEmotionUsage;
+    settleCloudApiCall({
+      id: cloudEmotionApiCallLogId(uuid),
+      ok: !isReplyStopped(uuid) && !metadata?.amsgEmotionError,
+      promptTokens: num(emotionUsage?.promptTokens),
+      completionTokens: num(emotionUsage?.completionTokens),
+    });
+  }
+};
+
+/** 晚投情绪评估在旁路补落或轮询超时收尾时，结清对应的云端情绪评估记录。 */
+export const settleLateCloudEmotionEvalLog = (uuid: string | null | undefined, ok: boolean): void => {
+  if (!consumeEmotionEvalInFlight(uuid)) return;
+  settleCloudApiCall({ id: cloudEmotionApiCallLogId(uuid!), ok: ok && !isReplyStopped(uuid) });
 };
 
 // ─── 推送丢了的兜底：拉服务端消息账本 ───
@@ -583,23 +806,6 @@ export const outboxPushToInbox = (
   };
 };
 
-/**
- * 补收的时效窗口：比这更早落账的条目不再往聊天流里放，直接销账。
- *
- * 两个理由。一是**噪音**：隔太久才补上来的「早上好」既尴尬又打断当下的对话，
- * 而这条路本来是为「推送刚刚丢了」准备的，正常补收都在几十秒到几分钟内完成。
- * 二是**接上账本这一刻的存量**：账本从建表起就在攒行，而客户端是这一版才开始销账的，
- * 头一次拉会把历史积压一次性倒出来——不掐时效的话，那些早就落过库的老消息会因为
- * 超出近史去重的查询窗口而重新上屏。
- *
- * 定在两天而不是一天：真实场景里用户是「周五晚上丢了一条，周日才想起来打开」，
- * 一天的窗口连隔夜加一个白天都盖不住，人还没意识到丢了消息，唯一的副本就已经在
- * 上一次开 App 时被销掉了。两天能盖住「隔一夜 + 第二天想起来」这个最常见的节奏。
- *
- * 超窗的那些不会无声无息地消失，见 OutboxDrainResult.staleDropped。
- */
-export const OUTBOX_BACKFILL_MAX_AGE_MS = 48 * 60 * 60 * 1000;
-
 export interface OutboxDrainResult {
   /** 写进收件箱、等着冲刷落库的条数。 */
   written: number;
@@ -611,126 +817,21 @@ export interface OutboxDrainResult {
    * 名单对一次，光看 written 会把被拦下的也算成补回来了。
    */
   writtenIds: string[];
-  /** 不走聊天流、当场就能销账的 messageId（太老的、不进聊天流的那几类）。 */
+  /** 已在本地持久化，或不进入聊天流、可以当场销账的 messageId。 */
   ackNow: string[];
   /** 这一趟从账本上读到的全部条目。调用方按轮次下结论时要看它。 */
   entries: AmsgOutboxEntry[];
-  /**
-   * 这一趟里**因为超出时效窗口**被销掉的聊天内容条数。
-   *
-   * 单独数出来，是因为这一档跟 ackNow 里其它几类的性质完全不同：思维链、工具请求
-   * 那些本来就不该进聊天流，销掉不损失任何东西；而这一档是**用户本该收到、现在
-   * 永久拿不回来的消息**。混在一起的话，「开一次 App 就把唯一的副本销掉了」这件事
-   * 从头到尾没有任何一处说得出口——用户后来去点「找回没收到的消息」，只会看到
-   * 一句「账本上没有漏收的消息，这条链路是通的」。
-   */
+  /** 保留调用方的返回结构；补收不再按年龄丢弃正文，恒为 0。 */
   staleDropped: number;
 }
 
-/**
- * 「这台设备已经接上服务端账本」的标记。
- *
- * 账本是服务端从建表那一刻起就在攒的，而销账是客户端这一版才有的能力。所以**第一次**
- * 拉账本时上面躺着的并不是「我丢了的消息」，而是这套机制生效之前积累下来的存量——
- * 当成补收放进聊天流的话，用户会被自己这段时间收过的消息重放一遍（定时问候、多段
- * 回复全部再来一次）。时效窗口挡不住这一档：存量的年龄本来就在窗口之内。
- *
- * 所以首次接管那一趟只做一件事：**存量整批销账，一条都不往聊天流里放**。销干净了才
- * 记这个标记，下一趟起才按正常补收处理。
- */
+/** 旧版的接管标记只保留作升级记录，不再决定消息是否补收。 */
 export const AMSG_OUTBOX_ADOPTED_LS_KEY = 'amsg2_outbox_adopted_v1';
-
-const hasAdoptedOutbox = (): boolean => {
-  try {
-    return !!localStorage.getItem(AMSG_OUTBOX_ADOPTED_LS_KEY);
-  } catch {
-    // 存储读不出来（隐私模式 / 存储关停）时按**已接管**处理：这一档下标记永远也写不
-    // 进去，当成未接管的话每一趟都会把当趟条目整批销掉，补收就永久失效了——推送真丢
-    // 的时候一条都补不回来，比偶尔多倒一次存量严重得多。
-    return true;
-  }
-};
 
 const markOutboxAdopted = (): void => {
   try {
     localStorage.setItem(AMSG_OUTBOX_ADOPTED_LS_KEY, JSON.stringify({ at: Date.now() }));
-  } catch { /* 写不进去就下次再接管一遍，反正存量已经销掉了 */ }
-};
-
-/**
- * 首次接管：账本上的存量整批销账、不进聊天流。
- *
- * 两类例外照常走补收：
- *   - 用户**此刻正等着的那几轮**（taskUuid 跟待收记录对得上）：那是刚刚发生的事，不是
- *     历史积压——否则第一次接管恰好赶上用户发消息时，那一轮的回复会被当存量销掉，用户
- *     等来的是一句「回复没能取回」。
- *   - **后台任务的结果**（`messageKind: 'result'`）：它们本来就是靠补收到达的（不弹通知
- *     的结果上游只落账本、不发推送），跟存量一起销掉的话，云端跑完的门牌整理会一声不响
- *     地蒸发。而且它们不进聊天流，没有「重放一遍」这回事——首次接管要防的是刷屏，不是
- *     数据落地。换设备 / 重装 PWA / 清过 localStorage 的用户走的正是这条路。
- *
- * 销账成功才记标记。没销干净就这一趟什么都不做、也不记标记：没销掉的条目下次还会
- * 拉回来，那时仍按接管处理。反过来（先记标记再销账）一旦销账失败，剩下的存量下一趟
- * 就会被当成补收倒进聊天流，正是这里要防的那件事。
- */
-const adoptOutboxBacklog = async (entries: AmsgOutboxEntry[]): Promise<OutboxDrainResult> => {
-  const awaitedUuids = new Set(listInstantChatPendings().map((pending) => pending.uuid));
-  const isAwaited = (entry: AmsgOutboxEntry) => !!entry.taskUuid && awaitedUuids.has(entry.taskUuid);
-  const isResult = (entry: AmsgOutboxEntry) => entry.push?.messageKind === 'result';
-  const keep = (entry: AmsgOutboxEntry) => isAwaited(entry) || isResult(entry);
-  const backlogIds = entries.filter((entry) => !keep(entry)).map((entry) => entry.messageId);
-
-  if (backlogIds.length > 0) {
-    try {
-      await ActiveMsgClient.ackOutboxMessages(backlogIds);
-    } catch (error) {
-      console.warn(`${HEADER} 账本存量没销干净，这一趟先不接管（下次重来）`, error);
-      return { written: 0, writtenIds: [], ackNow: [], entries, staleDropped: 0 };
-    }
-  }
-  markOutboxAdopted();
-  console.log(`${HEADER} 第一次接上云端账本：存量 ${backlogIds.length} 条直接销账，不往聊天流里放`);
-
-  // 上面整批销掉的存量走的是 ackOutboxMessages，不经过 backfillOutboxEntries，所以
-  // 不会计进 staleDropped——那批是「这台设备接上账本之前的历史」，不是「本该收到却
-  // 过期了」，报给用户只会让人以为刚丢了一堆消息。
-  return { ...await backfillOutboxEntries(entries.filter(keep)), entries };
-};
-
-/**
- * 这条账本行对应的消息，本地聊天记录里是不是已经有了。
- *
- * 判据跟冲刷那侧的落库去重是同一条：每条落库气泡都继承 `metadata.activeMsg2.messageId`
- * （见 activeMsgRuntime.flushInboxToChatImpl 里的 isAlreadyPersisted）。两处各留一份是
- * 因为这个模块不能反过来 import activeMsgRuntime（会成环，见文件头），改判据时两边一起改。
- *
- * 近史查询按角色缓存：一趟补收里同一个角色常常有好几条要核对。查不出来就按「本地没有」
- * 处理——这一档只决定要不要跟用户说「拿不回来了」，宁可多说一次也别把丢消息说成没事。
- */
-const isPushAlreadyInChat = async (
-  push: Record<string, any>,
-  cache: Map<string, Set<string>>,
-): Promise<boolean> => {
-  const charId = push?.metadata?.charId;
-  const messageId = push?.messageId;
-  if (typeof charId !== 'string' || !charId) return false;
-  if (typeof messageId !== 'string' || !messageId) return false;
-  let ids = cache.get(charId);
-  if (!ids) {
-    try {
-      const recent = await DB.getRecentMessagesByCharId(charId, 200);
-      ids = new Set(
-        recent
-          .map((m: any) => m?.metadata?.activeMsg2?.messageId)
-          .filter((id: unknown): id is string => typeof id === 'string' && !!id),
-      );
-    } catch (error) {
-      console.warn(`${HEADER} 核对本地聊天记录失败，这条按「本地没有」处理`, { charId, error });
-      ids = new Set<string>();
-    }
-    cache.set(charId, ids);
-  }
-  return ids.has(messageId);
+  } catch { /* 补收不依赖这份标记，localStorage 不可用也继续落库。 */ }
 };
 
 /**
@@ -749,20 +850,53 @@ const backfillOutboxEntries = async (
   entries: AmsgOutboxEntry[],
 ): Promise<Omit<OutboxDrainResult, 'entries'>> => {
   const now = Date.now();
+  const localCharIds = listUserSpaces().length > 1 ? new Set((await DB.getAllCharacters()).map(c => c.id)) : null;
   const ackNow: string[] = [];
   const writtenIds: string[] = [];
   let written = 0;
-  let staleDropped = 0;
-  // 超龄行核对本地聊天记录时用的近史缓存，一趟补收内每个角色只查一次。
+  // 每个角色只扫一次完整历史，不受最近 200 条和记忆归档水位影响。
+  // 核对失败就让本次补收失败，不能把“读不到本地”当作“从未收到”而重放。
+  const candidatesByChar = new Map<string, string[]>();
+  for (const entry of entries) {
+    const push = entry.push || {};
+    if ((push.messageKind ?? 'content') !== 'content') continue;
+    const charId = push.metadata?.charId;
+    if (typeof charId !== 'string' || !charId) continue;
+    const candidates = candidatesByChar.get(charId) ?? [];
+    candidates.push(entry.messageId);
+    candidatesByChar.set(charId, candidates);
+  }
   const persistedIdsByChar = new Map<string, Set<string>>();
+  for (const [charId, ids] of candidatesByChar) {
+    // Other users' messages still enter the shared durable inbox. Their own page
+    // will deduplicate and run the unchanged chat pipeline when that space opens.
+    if (localCharIds && !localCharIds.has(charId)) continue;
+    persistedIdsByChar.set(charId, await DB.findPersistedActiveMessageIds(charId, ids));
+  }
+  // 收件箱里已经躺着的那些，各自是什么时候到这台设备的。
+  //
+  // 补收拉回来的这批，跟 Service Worker 直送进收件箱的那批是同一批消息、同一个主键，
+  // 写进去就是整条覆盖。如果连「到达时间」也一起覆盖成现在，这条消息在收件箱里躺了多久
+  // 就再也查不出来了（永远显示「刚到」），而「送达时用户在不在场」正是靠它判的——判错
+  // 的后果是：明明是用户离开时到的、通知早就完整念过一遍的消息，回来还要一条条重演打字。
+  // 所以已经有到达时间的，保留原值；这一趟只覆盖内容，不改它第一次落地的时刻。
+  const knownReceivedAt = new Map<string, number>();
+  try {
+    for (const existing of await ActiveMsgStore.listInboxMessages()) {
+      if (typeof existing.receivedAt === 'number' && existing.receivedAt > 0) {
+        knownReceivedAt.set(existing.messageId, existing.receivedAt);
+      }
+    }
+  } catch (error) {
+    // 读不到就按「全是新的」处理：顶多是时间戳记成现在，不该拦住补收本身。
+    console.warn(`${HEADER} 读收件箱已有到达时间失败（这批按新到处理）`, { error });
+  }
 
   for (const entry of entries) {
     const push = entry.push || {};
     const kind = typeof push.messageKind === 'string' ? push.messageKind : 'content';
     if (kind === 'result') {
-      // 聊天那道两天的时效窗刻意不套在结果上：结果晚到本来就是常态（正是为此才上云的），
-      // 隔一天回来照样该落地，跟「隔一天才弹出来的报错」不是一回事。
-      // 但「多晚算太晚」得有人管——账本留 28 天，换设备 / 重装 PWA 的用户第一次接上账本
+      // 结果的有效期由对应处理器判断。账本留 28 天，换设备 / 重装 PWA 的用户第一次接上账本
       // 会把老结果一次性拉回来。这里不替各种产物定规矩，只把账本上记的时间原样交给认领
       // 它的那一方，由它按自己的语义判（门牌整理的上限见 PLATE_RESULT_MAX_AGE_MS）。
       if (await dispatchAmsgResult(push, { createdAt: entry.createdAt })) ackNow.push(entry.messageId);
@@ -772,17 +906,7 @@ const backfillOutboxEntries = async (
       ackNow.push(entry.messageId);
       continue;
     }
-    if (entry.createdAt > 0 && now - entry.createdAt > OUTBOX_BACKFILL_MAX_AGE_MS) {
-      // 超龄不等于用户没收到。账本行躺到超龄，最常见的成因恰恰是**消息早就送达了**，
-      // 只是收尾那笔销账是 fire-and-forget（锁屏 / 切后台就被掐断），账一直挂着没销。
-      // 所以先拿 messageId 去本地聊天记录里核对一遍：找得到就只是补一次销账，既不算
-      // 「拿不回来了」，也不该弹那句「已经拿不回来了」的红字——用户明明看过这条消息。
-      if (await isPushAlreadyInChat(push, persistedIdsByChar)) {
-        ackNow.push(entry.messageId);
-        continue;
-      }
-      // 数出来交给调用方说给用户听：这一销，这条消息就永久没了（见 staleDropped）。
-      staleDropped += 1;
+    if (kind === 'content' && persistedIdsByChar.get(push.metadata?.charId)?.has(entry.messageId)) {
       ackNow.push(entry.messageId);
       continue;
     }
@@ -795,6 +919,9 @@ const backfillOutboxEntries = async (
     // 情绪结果在 SW 那侧是单独一条写法，这里显式对齐：冲刷管线靠这个字段分流，
     // 认不出来就会被当成一条正文气泡渲染出去。
     if (kind === 'emotion_update') message.messageType = 'emotion_update';
+    // 这条 SW 早就送到过（只是还没被冲刷消费）：保住它真正落地的那个时刻。
+    const firstSeenAt = knownReceivedAt.get(message.messageId);
+    if (firstSeenAt != null) message.receivedAt = firstSeenAt;
     try {
       await ActiveMsgStore.saveInboxMessage(message);
       written += 1;
@@ -806,10 +933,7 @@ const backfillOutboxEntries = async (
   }
 
   if (written > 0) console.log(`${HEADER} 从云端账本补收 ${written} 条（推送多半是丢了）`);
-  if (staleDropped > 0) {
-    console.warn(`${HEADER} 账本上有 ${staleDropped} 条超出补收窗口，只销账不上屏（这些消息拿不回来了）`);
-  }
-  return { written, writtenIds, ackNow, staleDropped };
+  return { written, writtenIds, ackNow, staleDropped: 0 };
 };
 
 /**
@@ -819,8 +943,8 @@ const backfillOutboxEntries = async (
  * 客户端不再需要拿最近几条聊天记录去反推。读失败照常抛——「没读成」和「读到了、
  * 里面确实没有」是两个结论，调用方要拿它下判决时只能认后者。
  *
- * 头一次拉走的是另一条路（见 adoptOutboxBacklog）：那一趟账本上装的是存量，不是
- * 「我丢了的消息」。
+ * 首次和后续补收走同一条路：已落库的按完整历史去重，未收到的继续保存；
+ * 服务端仍保留的正文不会因为首次接管或年龄被丢弃。
  *
  * 调用方拿到 written > 0 之后要自己 flush 一次收件箱（见文件头注：不在这里 flush
  * 是为了避免和 activeMsgRuntime 成环）。要跟用户报「补回了几条」的，还得拿 writtenIds
@@ -828,22 +952,14 @@ const backfillOutboxEntries = async (
  */
 export const drainOutbox = async (
   options?: {
-    /**
-     * 头一趟也把存量当「我丢了的消息」补收（默认 false = 走 adoptOutboxBacklog 整批销账）。
-     *
-     * 只给用户手点的那次补收用：自动路径分不清存量里哪些是真丢的、哪些是当时收到了只是
-     * 客户端还不会销账，倒出来就是重放；而用户是察觉到「消息没来」才去点那个按钮的，
-     * 这个判断他自己做得了。按补收处理之后照样记下接管标记，后面回到自动路径。
-     */
+    /** 兼容原调用方；首次补收如今默认恢复存量，此选项不再改变行为。 */
     treatBacklogAsMissed?: boolean;
   },
 ): Promise<OutboxDrainResult> => {
   const entries = await ActiveMsgClient.listOutboxEntries();
-  if (!hasAdoptedOutbox()) {
-    if (!options?.treatBacklogAsMissed) return await adoptOutboxBacklog(entries);
-    markOutboxAdopted();
-  }
-  return { ...await backfillOutboxEntries(entries), entries };
+  const result = await backfillOutboxEntries(entries);
+  markOutboxAdopted();
+  return { ...result, entries };
 };
 
 /**
@@ -872,6 +988,7 @@ export const failInstantChatPending = async (
   // 这一轮随 chat 段上云的作废回执跟着作废：没销账 = 还是「未告知」，下一轮会重新
   // 注入。销掉的话角色永远不知道那条任务被作废过，聊天里许下的承诺就这么没了。
   discardInstantChatExpiredNotices(charId, uuid);
+  void import('./friendFeedEmotion').then(m=>m.settleFriendFeedCloudTask(charId,uuid,false)).catch(()=>{});
   // 「情绪更新中」那盏灯也在这里熄。
   //
   // 平时它的熄灭信号搭在最后一条回复的推送上（metadata.amsgEmotionDone，见
@@ -887,6 +1004,9 @@ export const failInstantChatPending = async (
   trackEvent('即时对话云端任务失败');
   // 「API 调用记录」里那笔挂着的也收尾，否则它会一直写着「云端生成中」直到被裁掉。
   settleCloudApiCall({ id: cloudApiCallLogId(uuid), ok: false });
+  if (consumeEmotionEvalInFlight(uuid)) {
+    settleCloudApiCall({ id: cloudEmotionApiCallLogId(uuid), ok: false });
+  }
   try {
     await DB.saveMessage({
       charId,
@@ -900,4 +1020,36 @@ export const failInstantChatPending = async (
   } catch (error) {
     console.warn(`${HEADER} 失败说明写入失败`, { charId, error });
   }
+};
+
+/** Stop locally first; a failed remote request must never let late content reappear. */
+export const stopInstantChat = async (charId: string): Promise<void> => {
+  const pending = getInstantChatPending(charId);
+  if (!pending) return;
+  const visibleIds = getReplyDisplayIds(charId);
+  markReplyStopped(pending.uuid);
+  clearInstantChatPending(charId);
+  discardInstantChatExpiredNotices(charId, pending.uuid);
+  void import('./friendFeedEmotion').then(m=>m.settleFriendFeedCloudTask(charId,pending.uuid,false)).catch(()=>{});
+  announceEmotionDone(charId);
+  settleCloudApiCall({ id: cloudApiCallLogId(pending.uuid), ok: false });
+  if (consumeEmotionEvalInFlight(pending.uuid)) {
+    settleCloudApiCall({ id: cloudEmotionApiCallLogId(pending.uuid), ok: false });
+  }
+  // Issue cancellation immediately; history reconciliation must not delay the remote abort.
+  const cancel = ActiveMsgClient.cancelTask(pending.uuid);
+  const keptText = stageStoppedReplyReceipt(charId, pending.uuid, (async () => {
+    const messages = (await DB.getMessagesByCharId(charId)).filter(message =>
+      (message.metadata as any)?.activeMsg2?.taskUuid === pending.uuid);
+    const kept = messages.filter(message => !visibleIds || visibleIds.has(message.id));
+    const unseen = messages.filter(message => visibleIds && !visibleIds.has(message.id));
+    if (unseen.length) await DB.deleteMessages(unseen.map(message => message.id));
+    window.dispatchEvent(new CustomEvent('active-msg-progress', { detail: { charId } }));
+    return kept.map(message => message.content).join('\n');
+  })());
+  const reconcile = keptText.then(text => ActiveMsgClient.writeClientStateValue(
+    amsgStateNamespace(charId), stoppedReplyKey(pending.uuid), JSON.stringify({ text })));
+  const results = await Promise.allSettled([cancel, reconcile]);
+  const failed = results.find(result => result.status === 'rejected');
+  if (failed?.status === 'rejected') throw failed.reason;
 };

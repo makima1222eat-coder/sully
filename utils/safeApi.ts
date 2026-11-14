@@ -13,11 +13,15 @@
 import { appendDevDebugApiLog, makeDebugLogger } from './devDebug';
 import { getApiCallAmbientContext, recordApiCall, type ApiCallMeta } from './apiCallLog';
 import { resolveBlobRefsInRequestBody } from './apiBlobRefs';
+import { waitForPalaceRequest } from './memoryPalace/maintenanceMode';
+import { fetchLlm } from './anthropicApi';
+import { isAnthropicEndpoint } from './llmEndpoint';
+import { normalizeAssistantCompletion, readAssistantMessage, splitInlineThinking } from './assistantThinking';
 
 const log = makeDebugLogger('api', 'SafeAPI');
 
 export function isChatCompletionUrl(url: string): boolean {
-    return url.includes('/chat/completions');
+    return url.includes('/chat/completions') || isAnthropicEndpoint(url);
 }
 
 /** Parse a fetch Response as JSON safely (text-first, then JSON.parse) */
@@ -73,7 +77,7 @@ function parseRawBodyText(text: string, status: number, contentType?: string | n
     }
 
     try {
-        return JSON.parse(text);
+        return normalizeAssistantCompletion(JSON.parse(text));
     } catch (e) {
         // Show a snippet of what we got for debugging
         const preview = text.slice(0, 200);
@@ -114,6 +118,8 @@ interface SseFeedDelta {
 }
 
 class SseAssembler {
+    private anthropicContent: any[] | undefined;
+    private anthropicThinking: any[] | undefined;
     content = '';
     private role = 'assistant';
     private finishReason: string | null = null;
@@ -156,28 +162,14 @@ class SseAssembler {
         let reasoningDelta = '';
         // delta 路径（OpenAI 流式常见）
         if (choice.delta) {
+            if (Array.isArray(choice.delta.anthropic_content)) this.anthropicContent = choice.delta.anthropic_content;
+            if (Array.isArray(choice.delta.anthropic_thinking)) this.anthropicThinking = choice.delta.anthropic_thinking;
             for (const k of Object.keys(choice.delta)) this.deltaKeys.add(k);
-            if (typeof choice.delta.content === 'string') {
-                delta = choice.delta.content;
-                this.content += delta;
-            }
-            // Anthropic 透传形态: delta.content 是分块数组 [{type:'text',text}|{type:'thinking',thinking}]
-            else if (Array.isArray(choice.delta.content)) {
-                for (const block of choice.delta.content) {
-                    if (block?.type === 'text' && typeof block.text === 'string') {
-                        delta += block.text;
-                        this.content += block.text;
-                    } else if (block?.type === 'thinking' && typeof block.thinking === 'string') {
-                        this.reasoning += block.thinking;
-                        reasoningDelta += block.thinking;
-                    }
-                }
-            }
-            const dr = choice.delta.reasoning_content ?? choice.delta.reasoning ?? choice.delta.thinking;
-            if (typeof dr === 'string') {
-                this.reasoning += dr;
-                reasoningDelta += dr;
-            }
+            const parts = readAssistantMessage(choice.delta);
+            delta = parts.content;
+            reasoningDelta = parts.reasoning;
+            this.content += delta;
+            this.reasoning += reasoningDelta;
             if (choice.delta.role) this.role = choice.delta.role;
             if (Array.isArray(choice.delta.tool_calls)) {
                 for (const frag of choice.delta.tool_calls) {
@@ -192,15 +184,11 @@ class SseAssembler {
         }
         // message 路径（一次性 SSE，不常见但兼容）
         else if (choice.message) {
-            if (typeof choice.message.content === 'string') {
-                delta = choice.message.content;
-                this.content += delta;
-            }
-            const mr = choice.message.reasoning_content ?? choice.message.reasoning ?? choice.message.thinking;
-            if (typeof mr === 'string') {
-                this.reasoning += mr;
-                reasoningDelta += mr;
-            }
+            const parts = readAssistantMessage(choice.message);
+            delta = parts.content;
+            reasoningDelta = parts.reasoning;
+            this.content += delta;
+            this.reasoning += reasoningDelta;
             if (choice.message.role) this.role = choice.message.role;
             if (Array.isArray(choice.message.tool_calls)) this.toolCalls.push(...choice.message.tool_calls);
         }
@@ -231,6 +219,8 @@ class SseAssembler {
                     role: this.role,
                     content: this.content,
                     ...(this.reasoning ? { reasoning_content: this.reasoning } : {}),
+                    ...(this.anthropicThinking ? { anthropic_thinking: this.anthropicThinking } : {}),
+                    ...(this.anthropicContent ? { anthropic_content: this.anthropicContent } : {}),
                     ...(this.toolCalls.length ? {
                         tool_calls: this.toolCalls.filter(Boolean).map((tc, i) => ({ ...tc, id: tc.id || `call_sse_${i}` })),
                     } : {}),
@@ -347,6 +337,68 @@ async function readBodyWithStreaming(
 }
 
 /**
+ * 把非 2xx 响应体里的错误详情提取成可读字符串：
+ * - 避免 `data.error` 是无 `.message` 的对象时拼出 `[object Object]`；
+ * - 保留 `error.code` / `error.type` / `error.param` / `error.details`；
+ * - 兼容 FastAPI / vLLM / 自建中转常见的顶层 `detail` / `message` / `msg`。
+ */
+export function formatApiErrorPayload(data: any, status: number): string {
+    if (data == null) return `HTTP ${status}`;
+    if (typeof data === 'string') return data.trim() || `HTTP ${status}`;
+    if (typeof data !== 'object') return String(data) || `HTTP ${status}`;
+
+    const stringifyExtra = (val: unknown): string => {
+        if (val == null || val === '') return '';
+        if (typeof val === 'string') return val.trim();
+        if (typeof val === 'number' || typeof val === 'boolean') return String(val);
+        try {
+            return JSON.stringify(val);
+        } catch {
+            return String(val);
+        }
+    };
+
+    const err = data.error;
+    if (typeof err === 'string' && err.trim()) {
+        return err.trim();
+    }
+    if (err && typeof err === 'object' && !Array.isArray(err)) {
+        const message = typeof err.message === 'string' ? err.message.trim() : '';
+        const code = typeof err.code === 'string' || typeof err.code === 'number' ? String(err.code).trim() : '';
+        const type = typeof err.type === 'string' ? err.type.trim() : '';
+        const param = typeof err.param === 'string' && err.param.trim() ? `param=${err.param.trim()}` : '';
+        const details = stringifyExtra(err.details ?? err.detail ?? err.data);
+
+        const tags = [code, type !== code ? type : '', param].filter((t) => t && !message.includes(t));
+        const tagSuffix = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
+        const detailSuffix = details && !message.includes(details) ? ` (${details})` : '';
+
+        if (message) {
+            return `${message}${tagSuffix}${detailSuffix}`;
+        }
+        const fallbackStructured = `${tags.join(', ')}${detailSuffix}`.trim();
+        if (fallbackStructured) return fallbackStructured;
+        return stringifyExtra(err) || `HTTP ${status}`;
+    }
+
+    const topMessage = typeof data.message === 'string' ? data.message.trim()
+        : typeof data.msg === 'string' ? data.msg.trim()
+            : '';
+    const topDetail = stringifyExtra(data.detail ?? data.details);
+    const topCode = typeof data.code === 'string' || typeof data.code === 'number' ? String(data.code).trim() : '';
+    if (topMessage) {
+        const codePart = topCode && !topMessage.includes(topCode) ? ` [${topCode}]` : '';
+        const detailPart = topDetail && !topMessage.includes(topDetail) ? ` (${topDetail})` : '';
+        return `${topMessage}${codePart}${detailPart}`;
+    }
+    if (topDetail) {
+        return topCode && !topDetail.includes(topCode) ? `${topDetail} [${topCode}]` : topDetail;
+    }
+
+    return `HTTP ${status}`;
+}
+
+/**
  * Fetch with automatic retry for transient errors on non-billable endpoints.
  * Chat completions never retry automatically: a timeout/network error does not
  * prove the upstream generation stopped, so retrying can charge the user twice.
@@ -389,6 +441,7 @@ export async function safeFetchJson(
         : { ...metaOptions, body: resolvedBody as BodyInit };
 
     for (let attempt = 0; attempt <= automaticRetryLimit; attempt++) {
+        if (meta?.appName === '记忆宫殿') await waitForPalaceRequest(options.signal ?? undefined);
         // 全局 fetch 拦截器和这里的“已解析响应兜底”共享 ID。前者覆盖裸 fetch，
         // 后者不依赖 Response.clone()，避免部分 iOS/WebView 克隆流不结束时漏记。
         const requestId = `api-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -411,7 +464,7 @@ export async function safeFetchJson(
         }
         const attemptStartedAt = Date.now();
         try {
-            const response = await fetch(url, attemptOptions);
+            const response = await fetchLlm(url, attemptOptions);
             if (timeoutHandle) clearTimeout(timeoutHandle);
             lastStatus = response.status;
             const headersMs = Date.now() - attemptStartedAt;
@@ -427,7 +480,7 @@ export async function safeFetchJson(
                 // Non-retryable or last attempt: parse body for error details
                 const data = await safeResponseJson(response);
                 // If we somehow got valid JSON with error info, wrap it
-                const errMsg = data?.error?.message || data?.error || `HTTP ${response.status}`;
+                const errMsg = formatApiErrorPayload(data, response.status);
                 throw new Error(`API Error ${response.status}: ${errMsg}`);
             }
 
@@ -509,35 +562,12 @@ export async function safeFetchJson(
  * Safely extract the AI content string from an OpenAI-compatible response.
  * Returns '' instead of crashing when the structure is unexpected.
  *
- * Handles thinking models (DeepSeek-R1, GLM-4.5, QwQ, Qwen3, ...):
- *  - Falls back to `reasoning_content` when `content` is missing/empty
- *  - Strips hidden <think>...</think> chain-of-thought blocks
+ * Excludes labelled reasoning and inline thinking blocks. A reasoning-only
+ * response is an empty answer, never a substitute for user-visible content.
  */
 export function extractContent(data: any): string {
     const msg = data?.choices?.[0]?.message;
-    const contentToText = (value: unknown): string => {
-        if (typeof value === 'string') return value;
-        if (Array.isArray(value)) {
-            return value.map(part => {
-                if (typeof part === 'string') return part;
-                if (!part || typeof part !== 'object') return '';
-                const record = part as Record<string, unknown>;
-                return contentToText(record.text ?? record.content ?? record.value);
-            }).filter(Boolean).join('');
-        }
-        if (value && typeof value === 'object') {
-            const record = value as Record<string, unknown>;
-            return contentToText(record.text ?? record.content ?? record.value);
-        }
-        return '';
-    };
-
-    let text = contentToText(msg?.content);
-    if (!text.trim()) text = contentToText(msg?.reasoning_content);
-    // Strip hidden chain-of-thought blocks: <think> / <thinking> / <thought>
-    text = text.replace(/<(think|thinking|thought)>[\s\S]*?<\/\1>/gi, '');
-    text = text.replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, '');
-    return text.trim();
+    return splitInlineThinking(readAssistantMessage(msg).content).content.trim();
 }
 
 /**
@@ -662,7 +692,26 @@ function repairTruncatedJson(text: string): string | null {
     return repaired;
 }
 
-export function extractJson(raw: string): any | null {
+/** Repair formatting outside strings; preserve apostrophes and literal `, }` in prose. */
+function repairJsonPresentation(text: string): string {
+    let result = '';
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (escaped) { result += ch; escaped = false; continue; }
+        if (inString && ch === '\\') { result += ch; escaped = true; continue; }
+        if (ch === '"') inString = !inString;
+        if (inString && ch.charCodeAt(0) < 32) {
+            result += JSON.stringify(ch).slice(1, -1);
+        } else if (!inString && ch === ',' && /^[\s]*[}\]]/.test(text.slice(i + 1))) {
+            continue;
+        } else result += ch;
+    }
+    return result;
+}
+
+export function extractJson(raw: string, options: { allowTruncated?: boolean; silent?: boolean } = {}): any | null {
     if (!raw) return null;
 
     // 1. Strip markdown code fences
@@ -690,6 +739,7 @@ export function extractJson(raw: string): any | null {
 
     // 4. Try parsing the extracted substring
     try { return JSON.parse(jsonStr); } catch {}
+    try { return JSON.parse(repairJsonPresentation(jsonStr)); } catch {}
 
     // 5. Fix common AI formatting issues and retry
     let fixed = jsonStr
@@ -708,6 +758,7 @@ export function extractJson(raw: string): any | null {
     // — the inner " breaks JSON parsing because they're not \-escaped.
     const innerQuoteFixed = escapeUnescapedInnerQuotes(jsonStr);
     if (innerQuoteFixed && innerQuoteFixed !== jsonStr) {
+        try { return JSON.parse(repairJsonPresentation(innerQuoteFixed)); } catch {}
         try { return JSON.parse(innerQuoteFixed); } catch {}
         try {
             return JSON.parse(innerQuoteFixed
@@ -719,7 +770,7 @@ export function extractJson(raw: string): any | null {
     // 7. Try to repair truncated JSON (LLM hit max_tokens)
     // Find the first { and attempt to close any open strings/brackets
     const firstBrace = text.indexOf('{');
-    if (firstBrace >= 0) {
+    if (firstBrace >= 0 && options.allowTruncated !== false) {
         let truncated = text.slice(firstBrace);
         const repaired = repairTruncatedJson(truncated);
         if (repaired) {
@@ -765,6 +816,6 @@ export function extractJson(raw: string): any | null {
         } catch {}
     }
 
-    console.error('[extractJson] All attempts failed. Raw:', raw.slice(0, 300));
+    if (!options.silent) console.error('[extractJson] All attempts failed. Raw:', raw.slice(0, 300));
     return null;
 }

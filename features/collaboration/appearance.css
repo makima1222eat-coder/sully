@@ -1,0 +1,143 @@
+/* Theme tokens also drive the settings, history drawer, file library and dialogs. */
+.collab-ui-root:where(.collab-ui-charcoal) {
+  --collab-bg: #171c1b;
+  --collab-panel: #1c2320;
+  --collab-panel-solid: #232b28;
+  --collab-ink: #e5ece7;
+  --collab-muted: #a0b0a6;
+  --collab-line: #39483f;
+  --collab-accent: #9fc8b1;
+  --collab-user: #304b3d;
+  --collab-user-ink: #edf5ef;
+  --collab-accent-ink: #172a1f;
+}
+.collab-ui-root:where(.collab-ui-warm-night) {
+  --collab-bg: #221f1d;
+  --collab-panel: #282420;
+  --collab-panel-solid: #302b27;
+  --collab-ink: #eee6df;
+  --collab-muted: #b9aaa0;
+  --collab-line: #4c4139;
+  --collab-accent: #dcb38f;
+  --collab-user: #4d3c2f;
+  --collab-user-ink: #f6e9dd;
+  --collab-accent-ink: #302216;
+}
+.collab-ui-root:where(.collab-ui-midnight) {
+  --collab-bg: #171c2b;
+  --collab-panel: #1d2436;
+  --collab-panel-solid: #242d42;
+  --collab-ink: #e5e9f5;
+  --collab-muted: #a7b2cc;
+  --collab-line: #3b4763;
+  --collab-accent: #b5b9e9;
+  --collab-user: #353f67;
+  --collab-user-ink: #eff0ff;
+  --collab-accent-ink: #222646;
+}
+.collab-ui-root:where(.collab-ui-dark) { color-scheme: dark; }
+/* Existing components use light utility colors. Remap exact utility tokens only within
+   this window (avoiding substring matches on placeholder:/hover:/active:), keeping the
+   actual document/artwork previews inside their own iframe intact. */
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .bg-white:not(.collab-switch-thumb),
+  .bg-white\/65, .bg-white\/70, .bg-white\/72, .bg-white\/78, .bg-white\/80,
+  .bg-white\/82, .bg-white\/85, .bg-white\/90, .bg-white\/92, .bg-white\/96,
+  .bg-\[\#f4f6fa\], .bg-\[\#f7f8fb\], .bg-\[\#f8f9fc\],
+  .focus-within\:bg-white:focus-within,
+  .hover\:bg-white\/55:hover,
+  .active\:bg-white:active, .active\:bg-white\/80:active
+) {
+  background-color: var(--collab-panel-solid) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) .collab-switch-thumb {
+  background-color: var(--collab-ink) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .bg-slate-50, .bg-slate-50\/80, .bg-slate-100, .bg-slate-200,
+  .bg-slate-900\/6, .bg-white\/5, .bg-white\/8, .bg-white\/10,
+  .active\:bg-slate-50:active, .active\:bg-slate-100:active, .active\:bg-slate-100\/80:active,
+  .active\:bg-slate-200:active, .active\:bg-slate-200\/70:active,
+  .disabled\:bg-slate-200:disabled
+) {
+  background-color: color-mix(in srgb, var(--collab-ink) 7%, var(--collab-panel-solid)) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .text-slate-950, .text-slate-900, .text-slate-800, .text-slate-700, .text-slate-600,
+  .hover\:text-slate-700:hover, .active\:text-slate-700:active
+) {
+  color: var(--collab-ink) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .text-slate-500, .text-slate-400, .text-slate-400\/80, .text-slate-300,
+  .disabled\:text-slate-400:disabled
+) {
+  color: var(--collab-muted) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .border-slate-100, .border-slate-200,
+  .border-slate-200\/60, .border-slate-200\/65, .border-slate-200\/70, .border-slate-200\/80, .border-slate-200\/90,
+  .border-slate-800, .border-slate-900,
+  .border-white\/10, .border-white\/60, .border-white\/65, .border-white\/70, .border-white\/80,
+  .border-black\/5, .border-black\/8,
+  .border-indigo-200,
+  .focus\:border-slate-400:focus
+) {
+  border-color: var(--collab-line) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .bg-indigo-50, .bg-indigo-50\/90, .bg-indigo-100, .bg-violet-50, .bg-sky-50, .bg-sky-100
+) {
+  background-color: color-mix(in srgb, var(--collab-accent) 14%, var(--collab-panel-solid)) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .text-indigo-500, .text-indigo-600, .text-indigo-700, .text-violet-500, .text-sky-500, .text-sky-600
+) {
+  color: var(--collab-accent) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .bg-rose-50, .bg-rose-50\/80, .bg-rose-100, .bg-amber-50, .bg-amber-50\/80, .bg-emerald-50,
+  .active\:bg-rose-50:active
+) {
+  background-color: var(--collab-panel-solid) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(
+  .text-rose-200, .text-rose-400, .text-rose-500, .text-rose-600, .text-rose-700,
+  .hover\:text-rose-600:hover
+) { color: #f5a5ae !important; }
+.collab-ui-root:where(.collab-ui-dark) :is(.text-amber-600, .text-amber-800) { color: #e8c18f !important; }
+.collab-ui-root:where(.collab-ui-dark) .text-emerald-700 { color: #9fcfb5 !important; }
+.collab-ui-root:where(.collab-ui-dark) :is(.bg-slate-900, .bg-indigo-500, .bg-indigo-600) {
+  background-color: var(--collab-accent) !important;
+  color: var(--collab-accent-ink) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :where(.collab-ui-composer) .collab-primary-action {
+  background: var(--collab-accent) !important;
+  color: var(--collab-accent-ink) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(.collab-brand-mark, .collab-assistant-mark, .collab-empty-brand, .collab-mode-brand) {
+  color: var(--collab-accent-ink) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(.collab-action-dialog, .collab-settings-panel, .collab-file-library) {
+  background: var(--collab-panel) !important;
+}
+.collab-ui-root:where(.collab-ui-dark) :is(input, textarea, select) {
+  color: var(--collab-ink) !important;
+  caret-color: var(--collab-accent);
+  color-scheme: dark;
+}
+.collab-ui-root:where(.collab-ui-dark) select option {
+  background-color: var(--collab-panel-solid);
+  color: var(--collab-ink);
+}
+.collab-ui-root:where(.collab-ui-dark) :is(input, textarea)::placeholder { color: var(--collab-muted); opacity: .8; }
+.collab-ui-root:where(.collab-ui-dark) :is(button, input, textarea, select):focus-visible {
+  outline: 2px solid var(--collab-accent);
+  outline-offset: 2px;
+}
+.collab-ui-root:where(.collab-ui-dark) .collab-voice-track { background: var(--collab-line); }
+.collab-ui-root .collab-css-editor { tab-size: 2; }
+.collab-ui-root:where(.collab-ui-dark) button.collab-theme-selected {
+  border-color: var(--collab-accent) !important;
+  box-shadow: 0 0 0 1px var(--collab-accent);
+}

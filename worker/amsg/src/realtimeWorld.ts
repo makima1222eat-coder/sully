@@ -1,3 +1,4 @@
+import {weatherForCharacter} from '../../../utils/characterWeather';
 /**
  * 到点现拉「外面的世界」：今日节日 + 实时天气 + 热搜，填进 fire_pack 的
  * AMSG_SLOT_REALTIME_WORLD 槽位。
@@ -16,6 +17,8 @@ import {
   fetchBraveRegionalNews,
   fetchHotNews,
   fetchWeatherWithFallback,
+  normalizeFreeWeatherSource,
+  type FreeWeatherSource,
   getHotNewsSlot,
   getNewsScopePlatforms,
   NEWS_REGION_META,
@@ -28,6 +31,7 @@ import {
   type WeatherData,
 } from '../../../utils/realtimeWorldCore';
 import type { AmsgToolConfig } from '../../../utils/amsgToolPack';
+import { getUserHolidayReminder } from '../../../utils/userHolidays';
 
 /** 两份快照都放全局命名空间：天气按城市、热榜按时段，本来就是所有角色共用一份。 */
 export const AMSG_WEATHER_SNAPSHOT_KEY = 'world_weather';
@@ -63,6 +67,7 @@ type WriteState = (
 
 interface WeatherSnapshot {
   city: string;
+  freeSource?: FreeWeatherSource;
   data: WeatherData;
   fetchedAt: number;
 }
@@ -119,25 +124,27 @@ const loadWeather = async (
 ): Promise<WeatherData | null> => {
   const city = cfg.weatherCity?.trim();
   if (!city) return null;
+  const freeSource = normalizeFreeWeatherSource(cfg.weatherFreeSource);
 
   const snap = parseSnapshot<WeatherSnapshot>(globalRows, AMSG_WEATHER_SNAPSHOT_KEY,
     (v) => v && typeof v.city === 'string' && v.data && typeof v.fetchedAt === 'number');
-  if (snap && snap.city === city && nowMs - snap.fetchedAt < WEATHER_TTL_MS) {
+  const matches = snap && snap.city === city && normalizeFreeWeatherSource(snap.freeSource) === freeSource;
+  if (matches && nowMs - snap.fetchedAt < WEATHER_TTL_MS) {
     console.log('[amsg:world] 天气命中快照', { city, ageMin: Math.round((nowMs - snap.fetchedAt) / 60000) });
     return snap.data;
   }
 
-  const fresh = await fetchWeatherWithFallback(city, cfg.weatherApiKey);
+  const fresh = await fetchWeatherWithFallback(city, cfg.weatherApiKey, freeSource);
   if (fresh) {
     pendingWrites.push({
       key: AMSG_WEATHER_SNAPSHOT_KEY,
-      value: JSON.stringify({ city, data: fresh, fetchedAt: nowMs } satisfies WeatherSnapshot),
+      value: JSON.stringify({ city, freeSource, data: fresh, fetchedAt: nowMs } satisfies WeatherSnapshot),
     });
     return fresh;
   }
   // 拉不到就用手上这份旧的：半小时前的气温也比「今天天气怎么样都不知道」强，
   // 而且不写快照，下次触发会再试一次。城市换过了、或者旧得过头了就宁可不说。
-  if (snap && snap.city === city && nowMs - snap.fetchedAt <= WEATHER_FALLBACK_MAX_AGE_MS) {
+  if (matches && nowMs - snap.fetchedAt <= WEATHER_FALLBACK_MAX_AGE_MS) {
     console.warn('[amsg:world] 天气拉取失败，先用上一次的读数', { city });
     return snap.data;
   }
@@ -200,7 +207,9 @@ const loadHotNews = async (
  * 注意这里不给「当前时间」那一行：时间由 fire_pack 自己的 AMSG_SLOT_CURRENT_TIME 填，
  * 两边都出就是一份提示词两个钟。
  */
-export const buildRealtimeWorldBlock = async (args: {
+type RealtimeWorldArgs = {
+  charId?: string;
+  userName?: string;
   toolConfig: AmsgToolConfig;
   /** 角色的时间感知开关（tool_pack 带上来的）：关掉就连今日节日一起不给。 */
   timeAwarenessEnabled: boolean;
@@ -211,8 +220,22 @@ export const buildRealtimeWorldBlock = async (args: {
   globalRows: StateRow[];
   globalNamespace: string;
   writeState?: WriteState;
-}): Promise<string> => {
+};
+
+export const buildUserHolidayBlock = async (args: RealtimeWorldArgs): Promise<string> => {
   const { toolConfig: cfg, nowMs, globalRows } = args;
+  if (!args.timeAwarenessEnabled || !cfg.userHolidays?.timeZone) return '';
+  return getUserHolidayReminder(cfg.userHolidays, {
+    async read(key) {
+      try { return JSON.parse(globalRows.find(row => row.key === key)?.value || 'null'); } catch { return null; }
+    },
+    async write(key, data) { await args.writeState?.(args.globalNamespace, [{ key, value: JSON.stringify(data) }]); },
+  }, nowMs, args.userName);
+};
+
+export const buildRealtimeWorldBlock = async (args: RealtimeWorldArgs): Promise<string> => {
+  const { nowMs, globalRows } = args;
+  const cfg = weatherForCharacter(args.toolConfig, args.charId);
 
   const specialDates = args.timeAwarenessEnabled ? checkSpecialDates(args.tzId, nowMs) : [];
   if (!cfg.weatherEnabled && !cfg.newsEnabled) {

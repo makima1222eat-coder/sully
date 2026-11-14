@@ -1,10 +1,11 @@
 import { conversationBlocked, executeConversationActions, isSilent } from './conversationActions';
+import { withReplyCancellation, type ReplyRun } from './chatReplyCancellation';
+import { dialogueMaxTokens } from './characterApi';
 /**
  * applyAssistantPostProcessing — 抽自 hooks/useChatAI.ts 的 sendMessage 后处理管线
  *
- * Phase 0 重构目标: 把"API 拿到原始 aiContent → 13 步处理 → 逐条落库到 IndexedDB"
- * 这段约 1500 行的流水线抽成可复用函数, 让本地 fetch 和 instant push (Phase 1) 两条
- * 路径都调它, 保证行为字节级一致。
+ * 把"API 拿到原始 aiContent → 13 步处理 → 逐条落库到 IndexedDB"这段流水线抽成可复用函数,
+ * 本地 fetch 路径 (useChatAI) 和云端回复的冲刷 (activeMsgRuntime) 都调它, 保证行为一致。
  *
  * 13 步 (与计划编号对应):
  *  1. normalizeAiContent — 剥 <think>/时间戳/[聊天][通话][约会] 等
@@ -21,13 +22,14 @@ import { conversationBlocked, executeConversationActions, isSilent } from './con
  * 12. hasDisplayContent + per-chunk sanitize
  * 13. 拟人打字延迟 (setTimeout)
  *
- * Phase 0 保证: 本地 fetch 路径 directives=[] / skipSecondPassLLM=false 行为字节级不变。
- * Phase 1 会让 instant push 路径 directives=[] / skipSecondPassLLM=true (worker 已跑过).
- * Phase 2 会让 worker 端把识别出的副作用 (RECALL/SEARCH/...) 结构化传 directives, 这里只重放。
+ * 本地 fetch 路径: directives=[] / skipSecondPassLLM=false, 跑完整管线。
+ * 云端回复: skipSecondPassLLM=true (worker 已跑过工具循环), worker 把识别出的副作用结构化成
+ * directives 传过来, 这里只重放。
  */
 
 import { CharacterProfile, UserProfile, Message, Emoji, EmojiCategory, RealtimeConfig, GroupProfile } from '../types';
 import { DB } from './db';
+import { readAssistantThinking, splitInlineThinking } from './assistantThinking';
 import { ChatParser, type FrozenMusicSong } from './chatParser';
 import { resolveCharTimeZone } from './timezone';
 import { NotionManager, FeishuManager, XhsNote } from './realtimeContext';
@@ -55,6 +57,10 @@ import { normalizeAssistantActionFormatting } from './assistantActionFormat';
 import { markAmsgStateDirty } from './amsgStateSync';
 import { announceScheduleChanges, applyAssistantScheduleChanges } from './scheduleChange';
 import { isBlobRef } from './blobRef';
+import { consumeSARChatSurfaceChunk, type SARModuleSurfaceMeta } from './vrWorld/sarModuleRuntime';
+import { stripLeakedSourceTags } from './sanitize';
+import {consumeFriendFeedMainReply} from './friendFeedMain';
+import {consumeHomeVisitReply} from './homeVisitReply';
 
 // ─── 模块内辅助 ──────────────────────────────────────────────────────────────
 
@@ -81,13 +87,11 @@ export function buildReplySnapshotContent(msg: { type?: string; content: string 
 const normalizeAiContent = (raw: string): string => {
     let cleaned = normalizeAssistantActionFormatting(raw || '');
     // Strip hidden chain-of-thought blocks: <think> / <thinking> / <thought>
-    cleaned = cleaned.replace(/<(think|thinking|thought)>[\s\S]*?<\/\1>/gi, '');
-    cleaned = cleaned.replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, '');
+    cleaned = splitInlineThinking(cleaned).content;
     cleaned = cleaned.replace(/\[\d{4}[-/年]\d{1,2}[-/月]\d{1,2}.*?\]/g, '');
     cleaned = cleaned.replace(/^[\w一-龥]+:\s*/, '');
-    // Strip source tags [聊天]/[通话]/[约会] and English [Chat]/[Call]/[Date]/[Story: …] leaked from history context — replace with newline to preserve intended splits
-    cleaned = cleaned.replace(/\s*\[(?:聊天|通话|约会|Chat|Call|Date)\]\s*/gi, '\n');
-    cleaned = cleaned.replace(/\s*\[(?:Story|剧情)[:：][^\]\n]{0,80}\]\s*/gi, '\n');
+    // Strip source tags leaked from history context, including model-mutated forms such as [聊chat].
+    cleaned = stripLeakedSourceTags(cleaned);
     cleaned = cleaned.replace(/\[(?:你|You|User|用户|System)\s*发送了表情包[:：]\s*(.*?)\]/g, '[[SEND_EMOJI: $1]]');
     return cleaned;
 };
@@ -111,6 +115,70 @@ export const extractInnerVoice = (text: string): { voice: string | null; rest: s
         .replace(/\n{3,}/g, '\n\n')
         .replace(/^\s+/, '');
     return { voice: voices.length ? voices.join('\n') : null, rest };
+};
+
+/**
+ * 把 SAR 的 CHAR_SURFACE 按“最终会落库的 Chat 气泡”拆开。
+ *
+ * 这里不能只按换行切：内置翻译模式的一组 <原文>/<译文> 最终会合并成一条
+ * `原文\n%%BILINGUAL%%\n译文` 消息；语音块 + 字幕也必须保持一个原子气泡。
+ * 这份拆法刻意和 renderAndPersist 保持一致，surface 才不会在特殊模式里串到下一泡。
+ */
+export const splitSARChatSurfaceBubbles = (raw: string): string[] => {
+    // Match canonical preprocessing before splitting. History-style stickers must
+    // become emoji tokens, not text chunks that consume the next speech's slot.
+    // This only normalizes display text; surface commands are never executed.
+    const withoutShares = extractMimickedXhsShares(normalizeAiContent(raw)).cleanedContent;
+    const withoutCards = extractHtmlBlocks(withoutShares).cleanedContent;
+    let content = ChatParser.sanitize(withoutCards, { keepCitations: true });
+    // Only speech takes a surface slot. Card/action directives belong to canonical;
+    // keep emoji tokens just long enough for splitResponse to exclude them too.
+    content = content.replace(/\[\[(?!SEND_EMOJI:)[\s\S]*?\]\]/g, '').trim();
+    if (!content) return [];
+
+    const chunks: string[] = [];
+    const appendPlain = (segment: string) => {
+        for (const part of ChatParser.splitResponse(segment)) {
+            if (part.type !== 'text') continue;
+            const rawBlocks = part.content.split(/^\s*---\s*$/m).filter(block => block.trim());
+            const blocks = rawBlocks.length > 0 ? rawBlocks : [part.content];
+            for (const block of blocks) {
+                for (const chunk of ChatParser.chunkText(block.trim())) {
+                    const clean = ChatParser.sanitize(chunk);
+                    if (clean && ChatParser.hasDisplayContent(clean)) chunks.push(clean);
+                }
+            }
+        }
+    };
+
+    const tagPattern = /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>([\s\S]*?)<\/译文>\s*<\/翻译>/g;
+    if (!tagPattern.test(content)) {
+        appendPlain(content);
+        return chunks;
+    }
+
+    tagPattern.lastIndex = 0;
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = tagPattern.exec(content)) !== null) {
+        const textBefore = content.slice(lastIndex, match.index).trim();
+        if (textBefore) appendPlain(textBefore);
+
+        // 表情是独立消息，不参与文字 surface 的序号；与真正落库分支保持一致。
+        const stripEmoji = (value: string) => value.replace(/\[\[SEND_EMOJI:\s*.*?\]\]/g, '').trim();
+        const original = ChatParser.sanitize(stripEmoji(match[1]));
+        const translated = ChatParser.sanitize(stripEmoji(match[2]));
+        if (original || translated) {
+            chunks.push(original && translated
+                ? `${original}\n%%BILINGUAL%%\n${translated}`
+                : (original || translated));
+        }
+        lastIndex = match.index + match[0].length;
+    }
+
+    const textAfter = content.slice(lastIndex).trim();
+    if (textAfter) appendPlain(textAfter.replace(/<\/?翻译>|<\/?原文>|<\/?译文>/g, '').trim());
+    return chunks;
 };
 
 /**
@@ -201,14 +269,14 @@ const parseMimickedXhsCount = (interactionText: string, label: string): number =
     const match = interactionText.match(new RegExp(`([\\d.,+万千亿kKmMwW]+)\\s*${label}`));
     return parseXhsCount(match?.[1] || 0);
 };
-// XHS side-effect helpers (POKE-style: 不抽到 agenticTools, 留给 Phase 2 Round 2 的 directive 重放)
+// XHS side-effect helpers (POKE-style: 不抽到 agenticTools, 云端回复靠 directive 重放触发)
 
 async function xhsPublish(
     conf: { mcpUrl: string },
     owner: Pick<CharacterProfile, 'id' | 'name'>,
     title: string,
     content: string,
-    tags: string[],
+    tags: string[], signal?: AbortSignal,
 ): Promise<{ success: boolean; noteId?: string; message: string }> {
     let images: string[] = [];
     try {
@@ -226,7 +294,7 @@ async function xhsPublish(
         }
     } catch { /* ignore stock failures */ }
 
-    const r = await XhsMcpClient.publishNote(conf.mcpUrl, { title, content, tags, images: images.length > 0 ? images : undefined });
+    const r = await XhsMcpClient.publishNote(conf.mcpUrl, { title, content, tags, images: images.length > 0 ? images : undefined }, signal);
     const noteId = r.success ? extractPublishedNoteId(r) : '';
     if (r.success && noteId) {
         const now = Date.now();
@@ -249,23 +317,23 @@ async function xhsPublish(
     return { success: r.success, noteId: noteId || undefined, message: r.error || (r.success ? '发布成功' : '发布失败') };
 }
 
-async function xhsComment(conf: { mcpUrl: string }, noteId: string, content: string, xsecToken?: string): Promise<{ success: boolean; message: string }> {
-    const r = await XhsMcpClient.comment(conf.mcpUrl, noteId, content, xsecToken);
+async function xhsComment(conf: { mcpUrl: string }, noteId: string, content: string, xsecToken?: string, signal?: AbortSignal): Promise<{ success: boolean; message: string }> {
+    const r = await XhsMcpClient.comment(conf.mcpUrl, noteId, content, xsecToken, signal);
     return { success: r.success, message: r.error || (r.success ? '评论成功' : '评论失败') };
 }
 
-async function xhsLike(conf: { mcpUrl: string }, feedId: string, xsecToken: string): Promise<{ success: boolean; message: string }> {
-    const r = await XhsMcpClient.likeFeed(conf.mcpUrl, feedId, xsecToken);
+async function xhsLike(conf: { mcpUrl: string }, feedId: string, xsecToken: string, signal?: AbortSignal): Promise<{ success: boolean; message: string }> {
+    const r = await XhsMcpClient.likeFeed(conf.mcpUrl, feedId, xsecToken, undefined, signal);
     return { success: r.success, message: r.error || (r.success ? '点赞成功' : '点赞失败') };
 }
 
-async function xhsFavorite(conf: { mcpUrl: string }, feedId: string, xsecToken: string): Promise<{ success: boolean; message: string }> {
-    const r = await XhsMcpClient.favoriteFeed(conf.mcpUrl, feedId, xsecToken);
+async function xhsFavorite(conf: { mcpUrl: string }, feedId: string, xsecToken: string, signal?: AbortSignal): Promise<{ success: boolean; message: string }> {
+    const r = await XhsMcpClient.favoriteFeed(conf.mcpUrl, feedId, xsecToken, undefined, signal);
     return { success: r.success, message: r.error || (r.success ? '收藏成功' : '收藏失败') };
 }
 
-async function xhsReplyComment(conf: { mcpUrl: string }, feedId: string, xsecToken: string, content: string, commentId?: string, userId?: string, parentCommentId?: string): Promise<{ success: boolean; message: string }> {
-    const r = await XhsMcpClient.replyComment(conf.mcpUrl, feedId, xsecToken, content, commentId, userId, parentCommentId);
+async function xhsReplyComment(conf: { mcpUrl: string }, feedId: string, xsecToken: string, content: string, commentId?: string, userId?: string, parentCommentId?: string, signal?: AbortSignal): Promise<{ success: boolean; message: string }> {
+    const r = await XhsMcpClient.replyComment(conf.mcpUrl, feedId, xsecToken, content, commentId, userId, parentCommentId, signal);
     return { success: r.success, message: r.error || (r.success ? '回复成功' : '回复失败') };
 }
 
@@ -275,10 +343,12 @@ async function xhsReplyComment(conf: { mcpUrl: string }, feedId: string, xsecTok
  * worker `onLLMOutput` hook 把识别到的副作用标签结构化传回, 客户端 applyAssistantPostProcessing
  * 反向重建标签后让下游 chatParser / 内联 XHS handler 复用同一份执行逻辑 (避免在客户端再写一遍).
  *
- * 字段形状跟 worker/instant-push/src/classifier.ts:Directive 必须保持一致 — 用 type 做
+ * 字段形状跟 worker/amsg/src/classifier.ts:Directive 必须保持一致 — 用 type 做
  * discriminator, 其他字段是 flat 而不是 nested payload (减少 push body 嵌套).
  */
 export type PostProcessDirective =
+    | { type: 'friend_feed_reply'; action: unknown }
+    | { type: 'home_visit_reply'; action: unknown }
     | { type: 'poke' }
     | { type: 'transfer'; amount: number }
     | { type: 'transfer_accept' }
@@ -318,6 +388,10 @@ function reconstructDirectiveTags(directives: PostProcessDirective[] | undefined
     const parts: string[] = [];
     for (const d of directives) {
         switch (d.type) {
+            case 'friend_feed_reply':
+            case 'home_visit_reply':
+                // Consumed through the structured side-action path, never reconstructed into a bubble.
+                break;
             case 'poke':
                 parts.push('[[ACTION:POKE]]');
                 break;
@@ -456,6 +530,7 @@ export interface PostProcessHooks {
 }
 
 export interface PostProcessCtx {
+    replyRun?: ReplyRun;
     char: CharacterProfile;
     userProfile: UserProfile;
     emojis: Emoji[];
@@ -490,9 +565,9 @@ export interface PostProcessCtx {
      * 本地 fetch 路径 caller 不传 — 函数内自动创建 fresh, 单次 send 内同 round runXhsBrowse/Search 填充
      * 后立刻被同 round XHS_SHARE replay 读到 (跟历史行为字节级一致).
      *
-     * Instant push 路径 caller (utils/activeMsgRuntime.ts) **必传** module-level 单例:
-     * runXhsBrowse 在 instantToolRunner round 1 填充 → /continue → worker round 2 LLM 输出 XHS_SHARE
-     * → push 落库 → applyAssistantPostProcessing replay 读同一份 ref. 跨 round 共享 = 跟本地路径同 UX.
+     * 云端回复的 caller (utils/activeMsgRuntime.ts) **必传** module-level 单例: worker 跑 XHS 工具时
+     * 把引用到的笔记随 push 带回来, activeMsgRuntime 先重建进这个单例, 再由这里 replay XHS_SHARE
+     * 读同一份 ref. 跨 push 共享 = 跟本地路径同 UX.
      */
     lastXhsNotesRef?: { current: XhsNote[] };
     /** API 调用配置 */
@@ -509,20 +584,22 @@ export interface PostProcessCtx {
      * 其余路径（非流式 / 双语 / 工具模式 / 实时送达的主动消息）不传，打字节奏不变。
      */
     instantRender?: boolean;
+    /** 用户准备生成下一轮时结束 inbox 的打字等待；仅加速显示，不取消正文或副作用。 */
+    skipTypingSignal?: AbortSignal;
     /**
-     * Phase 1+: 当 worker 已在自己内部跑过 2nd-pass LLM 时, 主线程不该再调一次。
-     * Phase 0 始终为 false / undefined。
+     * worker 已在自己内部跑过 2nd-pass LLM (云端回复) 时置 true, 主线程不该再调一次。
+     * 本地 fetch 路径不传。
      */
     skipSecondPassLLM?: boolean;
     /**
-     * Phase 2+: worker 端把识别到的副作用结构化传过来; 非空时只重放, 不再扫原文。
-     * Phase 0 始终为 [] / undefined。
+     * worker 端把识别到的副作用结构化传过来; 非空时只重放, 不再扫原文。
+     * 本地 fetch 路径不传。
      */
     directives?: PostProcessDirective[];
     /**
-     * Phase 2 Round 2: push 路径 reasoning chain 来源. SW 把 ReasoningPush 写到
-     * reasoning_buffer, flushInboxToChat 在处理 sessionId 的第一条 content 时 claim
-     * 出来塞到这里. 本地 fetch 路径不传 (Step 4 仍从 initialData.choices[0].message.reasoning_content 读).
+     * 云端回复的 reasoning chain 来源: flushInboxToChat 从第一条 content push 的
+     * metadata.amsgReasoning (或挪进 client_state 的那份) 取出来塞到这里.
+     * 本地 fetch 路径不传 (Step 4 从 initialData.choices[0].message.reasoning_content 读).
      */
     reasoningContent?: string;
     /**
@@ -534,18 +611,21 @@ export interface PostProcessCtx {
      * 在线送达 vs 离线补收的判定见 activeMsgRuntime.resolveInboxPersistTimestamp。
      */
     messageTimestamp?: number;
+    /** SAR 模块的纯展示层。canonical 正文仍走 rawAiContent 的完整后处理与落库。 */
+    sarModuleSurface?: SARModuleSurfaceMeta;
 }
 
 // ─── 主入口 ─────────────────────────────────────────────────────────────────
 
 /**
- * 与 useChatAI 旧版 inline 实现行为字节级对齐。
- * skipSecondPassLLM=false + directives=[] 时是 Phase 0 默认形态。
+ * skipSecondPassLLM=false + directives=[] 时是本地 fetch 路径的默认形态。
  */
 export async function applyAssistantPostProcessing(
     rawAiContent: string,
     ctx: PostProcessCtx,
 ): Promise<void> {
+    const replyStep = <T>(operation: () => Promise<T>) => withReplyCancellation(ctx.replyRun, operation);
+    ctx.replyRun?.check();
     const {
         char,
         userProfile,
@@ -566,6 +646,7 @@ export async function applyAssistantPostProcessing(
         directives,
         reasoningContent: pushReasoningContent,
         messageTimestamp,
+        sarModuleSurface,
     } = ctx;
     if (conversationBlocked(await DB.getMessagesByCharId(char.id, true))) {
         if (/\[\[ACTION:UNBLOCK\]\]/i.test(rawAiContent) && !isSilent(rawAiContent)) {
@@ -580,13 +661,24 @@ export async function applyAssistantPostProcessing(
     }
     const { baseUrl, headers, effectiveApi } = api;
     // 拟人打字延迟：流式预览已实时展示过气泡时（instantRender）跳过，避免二次慢放
-    const typingPause = (ms: number): Promise<void> =>
-        instantRender ? Promise.resolve() : new Promise(r => setTimeout(r, ms));
+    const typingPause = (ms: number): Promise<void> => {
+        const signal = ctx.skipTypingSignal;
+        if (instantRender || signal?.aborted) return Promise.resolve();
+        return new Promise(resolve => {
+            const finish = () => {
+                clearTimeout(timer);
+                signal?.removeEventListener('abort', finish);
+                resolve();
+            };
+            const timer = setTimeout(finish, ms);
+            signal?.addEventListener('abort', finish, { once: true });
+        });
+    };
     // 统一落库入口：ctx.messageTimestamp（若有）盖到每条消息上，保证同一轮拆出的
     // 正文 / 表情 / 卡片 / 系统提示时间戳一致；没传则维持 DB.saveMessage 默认（写库当刻）。
     // 全函数落库一律走这里，别直接调 DB.saveMessage——漏一处就会出现气泡时间戳互相打架。
     const persistMessage: typeof DB.saveMessage = (msg) =>
-        DB.saveMessage(messageTimestamp != null ? { ...msg, timestamp: messageTimestamp } : msg);
+        (ctx.replyRun?.saveMessage ?? DB.saveMessage)(messageTimestamp != null ? { ...msg, timestamp: messageTimestamp } : msg);
     const {
         setMessages,
         addToast,
@@ -608,26 +700,26 @@ export async function applyAssistantPostProcessing(
     // API 调用记录用 meta：二轮重生 / 调阅 / 日记 / 小红书等都归在「消息」App 下，purpose 见各分支。
     const apiLogMeta = { appName: '消息', charId: char.id, charName: char.name };
 
-    // Phase 1: skipSecondPassLLM=true (instant push 路径) 时, 跳过所有需要回连 LLM 的
+    // skipSecondPassLLM=true (云端回复) 时, 跳过所有需要回连 LLM 的
     // 二轮分支 (RECALL / SEARCH / READ_DIARY / FS_READ_DIARY / READ_NOTE / XHS_*)。
     // 这些 tag 留在原文里, 由后面 Step 6 的 ChatParser.sanitize 兜底剥掉 (chatParser.ts:225
     // 的正则覆盖 ACTION/RECALL/SEARCH/DIARY/READ_DIARY/FS_DIARY/FS_READ_DIARY/...),
     // XHS_* / READ_NOTE 兜底用 Step 12 的 hasDisplayContent + per-chunk sanitize 再清一遍。
     // 写日记类 (DIARY / FS_DIARY) 不走 LLM, 属于纯副作用 (像 POKE), 客户端可以直接执行。
-    // Phase 2 Round 2: directives 非空时, worker 已经把副作用标签结构化传过来 (并从 push body
+    // directives 非空时, worker 已经把副作用标签结构化传过来 (并从 push body
     // 里剥光了). 我们重建原 tag 字符串塞回 rawAiContent 头部, 让下游 chatParser.parseAndExecuteActions
     // + 后置 XHS_* 内联 handler 用同一份代码执行 — 零重复实现, 跟本地 fetch 路径同一份 source of truth.
     // tag 末尾 +\n\n 保证不跟正文粘连导致 regex 漏匹配; chatParser.sanitize 会把它们清干净.
     const replayedTagPrefix = reconstructDirectiveTags(directives);
     const hasReplayDirectives = !!directives && directives.length > 0;
 
-    // Phase 1 把 XHS 副作用 (LIKE/FAV/COMMENT/REPLY/POST/SHARE) 跟 2nd-pass LLM tools (SEARCH/BROWSE/
-    // DETAIL/MY_PROFILE) 一起用 skipSecondPassLLM 关掉了. Round 2 拆开: 副作用类只需要 MCP 调用,
-    // 不需要 LLM round-trip, 当 worker 给了 directives 时 (xhs_* in classifier) 这些 tag 已重建回正文,
-    // 必须执行. 用 disabledXhsSideEffects = (skipSecondPassLLM && !hasReplayDirectives) 区分:
-    //   - 本地 fetch 路径: skipSecondPassLLM=false → false → 不禁用, 跟历史行为一致
-    //   - Phase 1 push 路径 (老 worker, 无 directives): true && true → 禁用 (旧 trade-off 不变)
-    //   - Phase 2 push 路径 (Round 2 worker, 有 directives): true && false → 不禁用, 副作用照常跑
+    // XHS 副作用 (LIKE/FAV/COMMENT/REPLY/POST/SHARE) 跟 2nd-pass LLM tools (SEARCH/BROWSE/
+    // DETAIL/MY_PROFILE) 分开对待: 副作用类只需要 MCP 调用, 不需要 LLM round-trip, 当 worker 给了
+    // directives 时 (xhs_* in classifier) 这些 tag 已重建回正文, 必须执行.
+    // 用 disabledXhsSideEffects = (skipSecondPassLLM && !hasReplayDirectives) 区分:
+    //   - 本地 fetch 路径: skipSecondPassLLM=false → false → 不禁用
+    //   - 云端回复但没带 directives: true && true → 禁用 (原文里的 tag 没经 worker 识别, 不执行)
+    //   - 云端回复带 directives: true && false → 不禁用, 副作用照常跑
     const disabledXhsSideEffects = skipSecondPassLLM && !hasReplayDirectives;
 
     /** 从缓存或 notesPool 中查找 xsecToken — 仅副作用 XHS handler (COMMENT/REPLY/LIKE/FAV) 使用 */
@@ -639,13 +731,14 @@ export async function applyAssistantPostProcessing(
 
     /**
      * XHS 跨 tool 共享笔记缓冲 — 取代旧版 `let lastXhsNotesRef.current`.
-     * Caller (instant push 路径) 传了 module-level 单例就用它 (跨 round 共享让 XHS_SHARE 找到上轮笔记);
+     * Caller (云端回复) 传了 module-level 单例就用它 (跨 push 共享让 XHS_SHARE 找到 worker 带回的笔记);
      * 没传 (本地 fetch 路径) 自动创建 fresh (单次 send 内 runXhsBrowse → XHS_SHARE 同一函数闭包内共享, 跟历史一致).
      */
     const lastXhsNotesRef = ctx.lastXhsNotesRef ?? { current: [] as XhsNote[] };
 
     /** agenticTools 入参 ctx — 9 个 run* 函数共享 */
     const agenticCtx: AgenticToolCtx = {
+        signal: ctx.replyRun?.signal,
         char,
         userProfile,
         realtimeConfig,
@@ -662,6 +755,7 @@ export async function applyAssistantPostProcessing(
 
     // 局部 data 副本 — 后续 2nd-pass 会覆盖, 模仿旧版的 let data 行为
     let data: any = initialData;
+    const initialRawMessage = initialData?.choices?.[0]?.message || {content:rawAiContent};
 
     let scheduleFailureNotified = false;
     // 这句话**说出口**的时刻。本地聊天没传就是「现在」；主动消息传 push 的 sentAt。
@@ -674,11 +768,11 @@ export async function applyAssistantPostProcessing(
      * 拿旧钟去判会把新写的日程改动当成隔夜的整批丢掉。
      */
     const consumeScheduleChanges = async (content: string, at: Date): Promise<string> => {
-        const result = await applyAssistantScheduleChanges(content, char, at);
+        const result = await replyStep(async () => applyAssistantScheduleChanges(content, char, at));
         if (result.changes.length > 0 && result.schedule) {
             // 本地聊天直接复用 caller 的 groups；主动消息路径只在真的改了日程时读一次，
             // 不给每一条普通 push 平添 IndexedDB 查询和新的失败点。
-            const syncGroups = groups ?? await DB.getGroups().catch(() => undefined);
+            const syncGroups = groups ?? await replyStep(async () => DB.getGroups().catch(() => undefined));
             // realtimeConfig 缺席也照打脏：快照里它本来就是可选的，而「没开过实时设置」
             // 就是默认状态（localStorage 里压根没这个键）。少打这一次脏，云端 fire_pack
             // 会一直留着旧日程，下一次主动消息还在念角色刚说过不做的那件事。
@@ -712,10 +806,15 @@ export async function applyAssistantPostProcessing(
     };
 
     // ─── Step 1: 初次粗洗 ───
+    rawAiContent = splitInlineThinking(rawAiContent).content;
+    rawAiContent = await replyStep(() => consumeHomeVisitReply(char.id, rawAiContent,
+        (directives || []).flatMap(d=>d.type==='home_visit_reply'?[d.action]:[])));
+    rawAiContent = await replyStep(() => consumeFriendFeedMainReply(char.id, rawAiContent,
+        (directives || []).flatMap(d => d.type === 'friend_feed_reply' ? [d.action] : [])));
     let aiContent = replayedTagPrefix ? `${replayedTagPrefix}${rawAiContent}` : rawAiContent;
     aiContent = normalizeAiContent(aiContent);
     // 先于 lead-in / 二轮渲染消费：否则控制标签会作为普通气泡短暂闪给用户看。
-    aiContent = await consumeScheduleChanges(aiContent, utteranceAt);
+    aiContent = await replyStep(async () => consumeScheduleChanges(aiContent, utteranceAt));
     // 在任何 lead-in/二轮渲染之前先剥掉仿卡片文本，防止它被 chunkText 拆成灰色普通气泡。
     const mimickedXhsShares = extractMimickedXhsShares(aiContent);
     aiContent = mimickedXhsShares.cleanedContent;
@@ -738,29 +837,13 @@ export async function applyAssistantPostProcessing(
     // 抽取思考链 (showThinkingChain 开启时): reasoning_content + 内联 <think> 块。
     const extractThinkingChain = (dataObj: any, reasoningOverride?: string): string | null => {
         if (!(char as any).showThinkingChain) return null;
-        const lastRaw = dataObj?.choices?.[0]?.message?.content || '';
-        const lastReasoning = (
-            (reasoningOverride && reasoningOverride.trim())
-            || dataObj?.choices?.[0]?.message?.reasoning_content
-            || ''
-        ).trim();
-        const thinkBlocks: string[] = [];
-        const thinkPat = /<(think|thinking|thought)>([\s\S]*?)<\/\1>/gi;
-        let tm: RegExpExecArray | null;
-        while ((tm = thinkPat.exec(lastRaw)) !== null) {
-            const t = tm[2].trim();
-            if (t) thinkBlocks.push(t);
-        }
-        if (!/<\/(?:think|thinking|thought)>/i.test(lastRaw)) {
-            const openOnly = lastRaw.match(/<(?:think|thinking|thought)>([\s\S]*$)/i);
-            if (openOnly && openOnly[1].trim()) thinkBlocks.push(openOnly[1].trim());
-        }
-        const chain = [lastReasoning, ...thinkBlocks].filter(s => !!s).join('\n\n').trim();
-        return chain || null;
+        return readAssistantThinking(dataObj?.choices?.[0]?.message
+            || (dataObj === initialData ? initialRawMessage : undefined), reasoningOverride) || null;
     };
 
     // 把一段文本 (parseAndExecuteActions / HTML 之外的部分) 渲染成气泡并落库 —— 双语 / 表情 / 引用 / 分段
     // 与原 inline 末尾逻辑一致。抽出来是为了让"执行功能前的本轮正文 A"能在二轮前先展示, 二轮结果 B 复用同一套。
+    let sarSurfaceClaimed = false;
     const renderAndPersist = async (rawContent: string, firstThinkingChain: string | null): Promise<void> => {
         // 【心声】：行首 [心声] 行 → metadata.innerVoice（落在本批第一条气泡上）。
         // 开关关闭时仍然剥掉（模型漏出的心声不该变成气泡），只是不落 metadata。
@@ -773,8 +856,24 @@ export async function applyAssistantPostProcessing(
                 ...(firstInnerVoice ? { innerVoice: firstInnerVoice } : {}),
             }
             : null;
-        const takeMeta = (base: any): any => {
-            const merged = firstMeta ? { ...(base || {}), ...firstMeta } : base;
+        const surfaceChunks = !sarSurfaceClaimed && sarModuleSurface?.surface
+            ? splitSARChatSurfaceBubbles(sarModuleSurface.surface)
+            : [];
+        if (surfaceChunks.length > 0) sarSurfaceClaimed = true;
+        let surfaceIndex = 0;
+        const takeMeta = (base: any, canonicalChunk?: string): any => {
+            let surfaceChunk: string | undefined;
+            if (canonicalChunk !== undefined) {
+                const aligned = consumeSARChatSurfaceChunk(canonicalChunk, surfaceChunks, surfaceIndex);
+                surfaceChunk = aligned.surface;
+                surfaceIndex = aligned.nextIndex;
+            }
+            const sarMeta = surfaceChunk && sarModuleSurface
+                ? { sarModuleSurface: { ...sarModuleSurface, surface: surfaceChunk } }
+                : undefined;
+            const merged = firstMeta || sarMeta
+                ? { ...(base || {}), ...(sarMeta || {}), ...(firstMeta || {}) }
+                : base;
             firstMeta = null;
             return merged;
         };
@@ -785,15 +884,15 @@ export async function applyAssistantPostProcessing(
         // 编了个不存在的名字，或者用户在上次打包之后删了 / 改名了这个表情。
         // 降级文案跟横幅那边（sanitizeIntoSegments 的 [表情：x]）对齐，锁屏看到什么点进去就是什么。
         const sendEmojiBubble = async (name: string): Promise<void> => {
-            await typingPause(Math.random() * 500 + 300);
+            await replyStep(async () => typingPause(Math.random() * 500 + 300));
             const foundEmoji = resolveEmojiForSend(name, emojis, ctx.categories);
             if (foundEmoji) {
-                await persistMessage({ charId: char.id, role: 'assistant', type: 'emoji', content: foundEmoji.url, metadata: takeMeta(mcdInheritMeta) } as any);
+                await replyStep(async () => persistMessage({ charId: char.id, role: 'assistant', type: 'emoji', content: foundEmoji.url, metadata: takeMeta(mcdInheritMeta) } as any));
             } else {
                 console.warn('[emoji] 表情库里没有这个名字，落降级文本气泡', { name, charId: char.id });
-                await persistMessage({ charId: char.id, role: 'assistant', type: 'text', content: `[表情：${name}]`, metadata: takeMeta(mcdInheritMeta) } as any);
+                await replyStep(async () => persistMessage({ charId: char.id, role: 'assistant', type: 'text', content: `[表情：${name}]`, metadata: takeMeta(mcdInheritMeta) } as any));
             }
-            setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+            setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
         };
 
         // 把 [[QUOTE: ...]] / [回复 "..."] 的引用文本解析成"被回复的那条用户消息"。
@@ -847,7 +946,7 @@ export async function applyAssistantPostProcessing(
             const renderPlainSegment = async (segment: string): Promise<void> => {
                 for (const part of ChatParser.splitResponse(segment)) {
                     if (part.type === 'emoji') {
-                        await sendEmojiBubble(part.content);
+                        await replyStep(async () => sendEmojiBubble(part.content));
                         continue;
                     }
                     const cleaned = ChatParser.sanitize(part.content);
@@ -856,9 +955,9 @@ export async function applyAssistantPostProcessing(
                     for (const chunk of chunks) {
                         if (!chunk) continue;
                         const replyData = globalMsgIndex === 0 ? aiReplyTarget : undefined;
-                        await typingPause(Math.min(Math.max(chunk.length * 50, 500), 2000));
-                        await persistMessage({ charId: char.id, role: 'assistant', type: 'text', content: chunk, replyTo: replyData, metadata: takeMeta(mcdInheritMeta) } as any);
-                        setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+                        await replyStep(async () => typingPause(Math.min(Math.max(chunk.length * 50, 500), 2000)));
+                        await replyStep(async () => persistMessage({ charId: char.id, role: 'assistant', type: 'text', content: chunk, replyTo: replyData, metadata: takeMeta(mcdInheritMeta, chunk) } as any));
+                        setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
                         globalMsgIndex++;
                     }
                 }
@@ -869,7 +968,7 @@ export async function applyAssistantPostProcessing(
 
             while ((tagMatch = tagPattern.exec(content)) !== null) {
                 const textBefore = content.slice(lastIndex, tagMatch.index).trim();
-                if (textBefore) await renderPlainSegment(textBefore);
+                if (textBefore) await replyStep(async () => renderPlainSegment(textBefore));
 
                 // 混进 <原文>/<译文> 里的表情标签剥出来，紧跟这条双语气泡之后发
                 const inlineEmojis: string[] = [];
@@ -882,18 +981,18 @@ export async function applyAssistantPostProcessing(
                         ? `${originalText}\n%%BILINGUAL%%\n${translatedText}`
                         : (originalText || translatedText);
                     const replyData = globalMsgIndex === 0 ? aiReplyTarget : undefined;
-                    await typingPause(Math.min(Math.max(biContent.length * 30, 400), 2000));
-                    await persistMessage({ charId: char.id, role: 'assistant', type: 'text', content: biContent, replyTo: replyData, metadata: takeMeta(mcdInheritMeta) } as any);
-                    setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+                    await replyStep(async () => typingPause(Math.min(Math.max(biContent.length * 30, 400), 2000)));
+                    await replyStep(async () => persistMessage({ charId: char.id, role: 'assistant', type: 'text', content: biContent, replyTo: replyData, metadata: takeMeta(mcdInheritMeta, biContent) } as any));
+                    setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
                     globalMsgIndex++;
                 }
-                for (const name of inlineEmojis) await sendEmojiBubble(name);
+                for (const name of inlineEmojis) await replyStep(async () => sendEmojiBubble(name));
 
                 lastIndex = tagMatch.index + tagMatch[0].length;
             }
 
             const textAfter = content.slice(lastIndex).trim();
-            if (textAfter) await renderPlainSegment(textAfter.replace(/<\/?翻译>|<\/?原文>|<\/?译文>/g, '').trim());
+            if (textAfter) await replyStep(async () => renderPlainSegment(textAfter.replace(/<\/?翻译>|<\/?原文>|<\/?译文>/g, '').trim()));
         } else {
             // ─── normal path (splitResponse → chunkText → per-chunk save) ───
             const parts = ChatParser.splitResponse(content);
@@ -905,7 +1004,7 @@ export async function applyAssistantPostProcessing(
                 const part = parts[partIndex];
 
                 if (part.type === 'emoji') {
-                    await sendEmojiBubble(part.content);
+                    await replyStep(async () => sendEmojiBubble(part.content));
                 } else {
                     const rawBlocks = part.content.split(/^\s*---\s*$/m).filter(b => b.trim());
                     const allChunks: string[] = [];
@@ -917,7 +1016,7 @@ export async function applyAssistantPostProcessing(
                     for (let i = 0; i < allChunks.length; i++) {
                         let chunk = allChunks[i];
                         const delay = Math.min(Math.max(chunk.length * 50, 500), 2000);
-                        await typingPause(delay);
+                        await replyStep(async () => typingPause(delay));
 
                         let chunkReplyTarget: { id: number, content: string, name: string } | undefined;
                         const chunkQuoteMatch = chunk.match(QUOTE_RE_DOUBLE) || chunk.match(QUOTE_RE_SINGLE) || chunk.match(REPLY_RE_CN) || chunk.match(QUOTE_RE_NL);
@@ -932,8 +1031,8 @@ export async function applyAssistantPostProcessing(
                         if (ChatParser.hasDisplayContent(chunk)) {
                             const cleanChunk = ChatParser.sanitize(chunk);
                             if (cleanChunk) {
-                                await persistMessage({ charId: char.id, role: 'assistant', type: 'text', content: cleanChunk, replyTo: replyData, metadata: takeMeta(mcdInheritMeta) } as any);
-                                setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+                                await replyStep(async () => persistMessage({ charId: char.id, role: 'assistant', type: 'text', content: cleanChunk, replyTo: replyData, metadata: takeMeta(mcdInheritMeta, cleanChunk) } as any));
+                                setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
                                 globalMsgIndex++;
                                 chunkSaved = true;
                             }
@@ -954,10 +1053,10 @@ export async function applyAssistantPostProcessing(
     const renderLeadIn = async (raw: string): Promise<void> => {
         if (leadInRendered) return;
         leadInRendered = true;
-        await renderAndPersist(
+        await replyStep(async () => renderAndPersist(
             raw.replace(/\[\[READ_NOTE:[\s\S]*?\]\]/g, '').replace(/\[\[XHS_[A-Z_]+(?::[\s\S]*?)?\]\]/g, ''),
             round1ThinkingChain,
-        );
+        ));
     };
 
     // ─── Step 2: 二轮 LLM 钩子 ───
@@ -978,7 +1077,7 @@ export async function applyAssistantPostProcessing(
             || /\[\[XHS_BROWSE(?::\s*.+?)?\]\]/.test(aiContent)
             || /\[\[XHS_MY_PROFILE\]\]/.test(aiContent)
             || /\[\[XHS_DETAIL:\s*.+?\]\]/.test(aiContent);
-        if (willRegenerate) await renderLeadIn(aiContent);
+        if (willRegenerate) await replyStep(async () => renderLeadIn(aiContent));
     }
 
     // 5. Handle Recall (Loop if needed)
@@ -989,7 +1088,7 @@ export async function applyAssistantPostProcessing(
         // 模型常把 [[RECALL]] 指令和本轮正文 A 写在同一条回复里 (A 已在 Step 2 开头先行展示)。把 A
         // 作为 assistant 上文喂给二轮, 让二轮结果 B 接着 A 往下说, 更连贯。
         const recallLeadIn = aiContent.replace(/\[\[RECALL:\s*\d{4}[-/年]\d{1,2}\]\]/g, '').trim();
-        const rr = await runRecall({ year, month }, agenticCtx);
+        const rr = await replyStep(async () => runRecall({ year, month }, agenticCtx));
 
         if (rr.ok && rr.alreadyActive) {
             console.log(`♻️ [Recall] ${rr.yearMonth} already in activeMemoryMonths, skipping duplicate recall`);
@@ -998,15 +1097,17 @@ export async function applyAssistantPostProcessing(
             setRecallStatus(`正在调阅 ${year}年${month}月 的详细档案...`);
             const recallMessages = [...fullMessages, ...(recallLeadIn ? [{ role: 'assistant', content: recallLeadIn }] : []), { role: 'user', content: `[系统: 已成功调取 ${year}-${month} 的详细日志]\n${rr.logsText}\n[系统: 现在请结合这些细节回答用户。保持对话自然。]` }];
             try {
-                data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                     method: 'POST', headers,
-                    body: JSON.stringify({ model: effectiveApi.model, messages: recallMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                }, 2, 0, { ...apiLogMeta, purpose: '调阅记忆' });
+                    body: JSON.stringify({ model: effectiveApi.model, messages: recallMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                }, 2, 0, { ...apiLogMeta, purpose: '调阅记忆' }));
                 updateTokenUsage(data, historyMsgCount, 'recall');
                 aiContent = data.choices?.[0]?.message?.content || '';
-                aiContent = normalizeAiContent(aiContent);
+                aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                 addToast(`已调用 ${year}-${month} 详细记忆`, 'info');
             } catch (recallErr: any) {
+                ctx.replyRun?.check();
                 console.error('Recall API failed:', recallErr.message);
             }
         } else {
@@ -1024,7 +1125,7 @@ export async function applyAssistantPostProcessing(
         setSearchStatus(`正在搜索: ${searchQuery}...`);
 
         try {
-            const sr = await runSearch({ query: searchQuery }, agenticCtx);
+            const sr = await replyStep(async () => runSearch({ query: searchQuery }, agenticCtx));
             console.log('🔍 [Search] 搜索结果:', sr);
 
             if (sr.ok) {
@@ -1037,14 +1138,15 @@ export async function applyAssistantPostProcessing(
                     { role: 'user', content: `[系统: 搜索完成！以下是关于"${searchQuery}"的搜索结果]\n\n${sr.resultsText}\n\n[系统: 现在请根据这些真实信息回复用户。用自然的语气分享，比如"我刚搜了一下发现..."、"诶我看到说..."。不要再输出[[SEARCH:...]]了。]` }
                 ];
 
-                data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                     method: 'POST', headers,
-                    body: JSON.stringify({ model: effectiveApi.model, messages: searchMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                }, 2, 0, { ...apiLogMeta, purpose: '联网搜索' });
+                    body: JSON.stringify({ model: effectiveApi.model, messages: searchMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                }, 2, 0, { ...apiLogMeta, purpose: '联网搜索' }));
                 updateTokenUsage(data, historyMsgCount, 'search');
                 aiContent = data.choices?.[0]?.message?.content || '';
                 console.log('🔍 [Search] AI基于搜索结果生成的新回复:', aiContent.slice(0, 100) + '...');
-                aiContent = normalizeAiContent(aiContent);
+                aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                 addToast(`🔍 搜索完成: ${searchQuery}`, 'success');
             } else if (sr.reason === 'no_api_key') {
                 console.log('🔍 [Search] 检测到搜索意图但未配置API Key');
@@ -1056,6 +1158,7 @@ export async function applyAssistantPostProcessing(
                 aiContent = aiContent.replace(searchMatch[0], '').trim();
             }
         } catch (e) {
+            ctx.replyRun?.check();
             console.error('Search execution failed:', e);
             aiContent = aiContent.replace(searchMatch[0], '').trim();
         }
@@ -1107,28 +1210,28 @@ export async function applyAssistantPostProcessing(
         }
 
         // 预写日志: 发请求前先把内容落进待写队列 (localStorage 同步落盘), 这样即使后续 fetch 失败 /
-        // app 被杀, 内容也不丢. 前台可见才立即写 (本地路径 + 前台 instant, fetch 可靠); 后台时不发
+        // app 被杀, 内容也不丢. 前台可见才立即写 (本地路径 + 前台收到的云端回复, fetch 可靠); 后台时不发
         // 这个脆弱的请求 (易被冻结打断, 甚至服务端写成功但响应丢失 → 回前台重试会重复写), 直接留在
         // 队列, 等 drainPendingDiaries 在回前台时补打. 写成功就删掉这条.
         const pendingDiaryId = enqueuePendingDiary({ kind: 'notion', charId: char.id, charName: char.name, title, content, mood: mood || undefined });
         const canWriteDiaryNow = typeof document === 'undefined' || document.visibilityState === 'visible';
         if (canWriteDiaryNow) {
             try {
-                const result = await NotionManager.createDiaryPage(
+                const result = await replyStep(async () => NotionManager.createDiaryPage(
                     realtimeConfig.notionApiKey,
                     realtimeConfig.notionDatabaseId,
                     { title, content, mood: mood || undefined, characterName: char.name }
-                );
+                ));
 
                 if (result.success) {
                     removePendingDiary(pendingDiaryId);
                     console.log('📔 [Diary] 写入成功:', result.url);
-                    await persistMessage({
+                    await replyStep(async () => persistMessage({
                         charId: char.id,
                         role: 'system',
                         type: 'text',
                         content: `📔 ${char.name}写了一篇日记「${title}」`
-                    });
+                    }));
                     addToast(`📔 ${char.name}写了一篇日记!`, 'success');
                 } else {
                     // API 明确拒绝 (配置/权限问题, 重试也没用) → 丢弃 + 报错.
@@ -1137,6 +1240,7 @@ export async function applyAssistantPostProcessing(
                     addToast(`日记写入失败: ${result.message}`, 'error');
                 }
             } catch (e) {
+                ctx.replyRun?.check();
                 // 网络异常 (可恢复). 保留待写队列, 回前台 drainPendingDiaries 补打.
                 console.error('📔 [Diary] 写入异常, 留待回前台重试:', e);
             }
@@ -1149,12 +1253,12 @@ export async function applyAssistantPostProcessing(
         // 主动消息是提前几小时打包的，打包时日记服务还连着、送达前用户把它关掉是常态。
         // 角色那句「我去写日记了」已经说满，日记却静默蒸发——留一条系统提示说明为什么没写成。
         console.log('📔 [Diary] 检测到日记意图但未配置Notion');
-        await persistMessage({
+        await replyStep(async () => persistMessage({
             charId: char.id,
             role: 'system',
             type: 'text',
             content: `📔 ${char.name}想写日记，但日记服务没连上（未配置或已断开），这篇没写成`,
-        });
+        }));
         aiContent = aiContent.replace(diaryMatch[0], '').trim();
     }
 
@@ -1172,14 +1276,16 @@ export async function applyAssistantPostProcessing(
             { role: 'user', content: `[系统: ${reason}。请你：\n1. 先正常回应用户刚才说的话（用户还在等你回复！）\n2. 可以自然地提一下，比如"日记好像打不开诶"、"嗯...好像没找到"\n3. 继续正常聊天，用多条消息回复\n4. 严禁再输出[[READ_DIARY:...]]或[[FS_READ_DIARY:...]]标记]` }
         ];
         try {
-            data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+            data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                 method: 'POST', headers,
-                body: JSON.stringify({ model: effectiveApi.model, messages: msgs, temperature: 0.8, max_tokens: 8000, stream: false })
-            }, 2, 0, { ...apiLogMeta, purpose: '写日记' });
+                body: JSON.stringify({ model: effectiveApi.model, messages: msgs, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+            }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' }));
             updateTokenUsage(data, historyMsgCount, 'diary-fallback');
             aiContent = data.choices?.[0]?.message?.content || '';
-            aiContent = normalizeAiContent(aiContent);
+            aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
         } catch (fallbackErr) {
+            ctx.replyRun?.check();
             console.error('📖 [Diary Fallback] 也失败了:', fallbackErr);
             aiContent = aiContent.replace(tagPattern, '').trim();
         }
@@ -1211,7 +1317,7 @@ export async function applyAssistantPostProcessing(
                 try {
                     setDiaryStatus(`正在翻阅 ${targetDate} 的日记...`);
 
-                    const rdr = await runReadDiary({ date: dateInput }, agenticCtx);
+                    const rdr = await replyStep(async () => runReadDiary({ date: dateInput }, agenticCtx));
 
                     if (rdr.ok) {
                         // 注: "找到 N 篇日记，正在阅读..." 由 runReadDiary 内部 onProgress 触发
@@ -1225,27 +1331,28 @@ export async function applyAssistantPostProcessing(
                             { role: 'user', content: `[系统: 你翻开了自己 ${targetDate} 的日记，以下是你当时写的内容]\n\n${rdr.diaryText}\n\n[系统: 你已经看完了日记。现在请你：\n1. 先正常回应用户刚才说的话（这是最重要的！用户还在等你回复）\n2. 自然地把日记中的回忆融入你的回复中，比如"我想起来了那天..."、"看了日记才发现..."等\n3. 可以分享日记中有趣的细节，表达当时的情绪\n4. 用多条消息回复，别只说一句话就结束\n5. 严禁再输出[[READ_DIARY:...]]标记]` }
                         ];
 
-                        data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                        data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                             method: 'POST', headers,
-                            body: JSON.stringify({ model: effectiveApi.model, messages: diaryMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                        }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' });
+                            body: JSON.stringify({ model: effectiveApi.model, messages: diaryMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                        }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' }));
                         updateTokenUsage(data, historyMsgCount, 'read-diary-notion');
                         aiContent = data.choices?.[0]?.message?.content || '';
-                        aiContent = normalizeAiContent(aiContent);
+                        aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                         addToast(`📖 ${char.name}翻阅了${targetDate}的日记`, 'info');
                     } else if (rdr.reason === 'empty_content') {
                         console.log('📖 [ReadDiary] 日记内容为空');
-                        await diaryFallbackCall('你翻开了日记本但页面是空白的', /\[\[READ_DIARY:.*?\]\]/g);
+                        await replyStep(async () => diaryFallbackCall('你翻开了日记本但页面是空白的', /\[\[READ_DIARY:.*?\]\]/g));
                     } else if (rdr.reason === 'unreachable') {
                         // 「查过了，那天没写」和「压根没查成」是两回事。传输就没跑通时说成
                         // 「那天没写日记」，等于替用户认下一件没发生的事，之后角色还会顺着这个
                         // 假前提聊下去。跟读取异常走同一条圆场路：只说没查成，不下结论。
                         console.log('📖 [ReadDiary] 日记服务连不上，这次没查成:', targetDate);
                         setDiaryStatus('日记服务连不上，继续对话...');
-                        await diaryFallbackCall(
+                        await replyStep(async () => diaryFallbackCall(
                             `你想翻 ${targetDate} 的日记，但日记服务连不上，这次没查成（不知道那天到底写没写）`,
                             /\[\[READ_DIARY:.*?\]\]/g,
-                        );
+                        ));
                     } else {
                         // rdr.reason === 'not_found'  (parse_error / not_configured 被外层 if 拦住)
                         console.log('📖 [ReadDiary] 该日期没有日记:', targetDate);
@@ -1257,26 +1364,28 @@ export async function applyAssistantPostProcessing(
                             { role: 'user', content: `[系统: 你翻了翻日记本，发现 ${targetDate} 那天没有写日记。请你：\n1. 先正常回应用户刚才说的话（用户还在等你回复！）\n2. 自然地提到没找到那天的日记，比如"嗯...那天好像没写日记"、"翻了翻没找到诶"\n3. 用多条消息回复，保持对话自然\n4. 严禁再输出[[READ_DIARY:...]]标记]` }
                         ];
 
-                        data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                        data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                             method: 'POST', headers,
-                            body: JSON.stringify({ model: effectiveApi.model, messages: nodiaryMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                        }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' });
+                            body: JSON.stringify({ model: effectiveApi.model, messages: nodiaryMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                        }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' }));
                         updateTokenUsage(data, historyMsgCount, 'no-diary-notion');
                         aiContent = data.choices?.[0]?.message?.content || '';
-                        aiContent = normalizeAiContent(aiContent);
+                        aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                     }
                 } catch (e) {
+                    ctx.replyRun?.check();
                     console.error('📖 [ReadDiary] 读取异常:', e);
                     setDiaryStatus('日记读取失败，继续对话...');
-                    await diaryFallbackCall('你想翻阅日记但读取出了问题（可能是网络问题）', /\[\[READ_DIARY:.*?\]\]/g);
+                    await replyStep(async () => diaryFallbackCall('你想翻阅日记但读取出了问题（可能是网络问题）', /\[\[READ_DIARY:.*?\]\]/g));
                 }
             } else {
                 console.log('📖 [ReadDiary] 无法解析日期:', dateInput);
-                await diaryFallbackCall(`你想翻阅日记但没能理解要找哪天的（"${dateInput}"）`, /\[\[READ_DIARY:.*?\]\]/g);
+                await replyStep(async () => diaryFallbackCall(`你想翻阅日记但没能理解要找哪天的（"${dateInput}"）`, /\[\[READ_DIARY:.*?\]\]/g));
             }
         } else {
             console.log('📖 [ReadDiary] 检测到读日记意图但未配置Notion');
-            await diaryFallbackCall('你想翻阅日记但日记本暂时不可用', /\[\[READ_DIARY:.*?\]\]/g);
+            await replyStep(async () => diaryFallbackCall('你想翻阅日记但日记本暂时不可用', /\[\[READ_DIARY:.*?\]\]/g));
         }
         setDiaryStatus('');
     }
@@ -1325,23 +1434,23 @@ export async function applyAssistantPostProcessing(
         const canWriteFsDiaryNow = typeof document === 'undefined' || document.visibilityState === 'visible';
         if (canWriteFsDiaryNow) {
             try {
-                const result = await FeishuManager.createDiaryRecord(
+                const result = await replyStep(async () => FeishuManager.createDiaryRecord(
                     realtimeConfig.feishuAppId,
                     realtimeConfig.feishuAppSecret,
                     realtimeConfig.feishuBaseId,
                     realtimeConfig.feishuTableId,
                     { title: fsTitle, content: fsContent, mood: fsMood || undefined, characterName: char.name }
-                );
+                ));
 
                 if (result.success) {
                     removePendingDiary(pendingFsDiaryId);
                     console.log('📒 [Feishu] 写入成功:', result.recordId);
-                    await persistMessage({
+                    await replyStep(async () => persistMessage({
                         charId: char.id,
                         role: 'system',
                         type: 'text',
                         content: `📒 ${char.name}写了一篇日记「${fsTitle}」(飞书)`
-                    });
+                    }));
                     addToast(`📒 ${char.name}写了一篇日记! (飞书)`, 'success');
                 } else {
                     removePendingDiary(pendingFsDiaryId);
@@ -1349,6 +1458,7 @@ export async function applyAssistantPostProcessing(
                     addToast(`飞书日记写入失败: ${result.message}`, 'error');
                 }
             } catch (e) {
+                ctx.replyRun?.check();
                 // 网络异常: 保留待写队列, 回前台 drainPendingDiaries 补打.
                 console.error('📒 [Feishu] 写入异常, 留待回前台重试:', e);
             }
@@ -1360,12 +1470,12 @@ export async function applyAssistantPostProcessing(
     } else if (fsDiaryMatch) {
         // 同 Notion：配置在打包之后被关掉时，别让这篇日记无声无息地消失。
         console.log('📒 [Feishu] 检测到日记意图但未配置飞书');
-        await persistMessage({
+        await replyStep(async () => persistMessage({
             charId: char.id,
             role: 'system',
             type: 'text',
             content: `📒 ${char.name}想写日记，但日记服务没连上（未配置或已断开），这篇没写成`,
-        });
+        }));
         aiContent = aiContent.replace(fsDiaryMatch[0], '').trim();
     }
 
@@ -1385,7 +1495,7 @@ export async function applyAssistantPostProcessing(
                 try {
                     setDiaryStatus(`正在翻阅 ${targetDate} 的飞书日记...`);
 
-                    const fsrdr = await runFsReadDiary({ date: dateInput }, agenticCtx);
+                    const fsrdr = await replyStep(async () => runFsReadDiary({ date: dateInput }, agenticCtx));
 
                     if (fsrdr.ok) {
                         // 注: "找到 N 篇飞书日记，正在阅读..." 由 runFsReadDiary 内部 onProgress 触发
@@ -1399,22 +1509,23 @@ export async function applyAssistantPostProcessing(
                             { role: 'user', content: `[系统: 你翻开了自己 ${targetDate} 的日记（飞书），以下是你当时写的内容]\n\n${fsrdr.diaryText}\n\n[系统: 你已经看完了日记。现在请你：\n1. 先正常回应用户刚才说的话（这是最重要的！用户还在等你回复）\n2. 自然地把日记中的回忆融入你的回复中，比如"我想起来了那天..."、"看了日记才发现..."等\n3. 可以分享日记中有趣的细节，表达当时的情绪\n4. 用多条消息回复，别只说一句话就结束\n5. 严禁再输出[[FS_READ_DIARY:...]]标记]` }
                         ];
 
-                        data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                        data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                             method: 'POST', headers,
-                            body: JSON.stringify({ model: effectiveApi.model, messages: diaryMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                        }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' });
+                            body: JSON.stringify({ model: effectiveApi.model, messages: diaryMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                        }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' }));
                         updateTokenUsage(data, historyMsgCount, 'read-diary-feishu');
                         aiContent = data.choices?.[0]?.message?.content || '';
-                        aiContent = normalizeAiContent(aiContent);
+                        aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                         addToast(`📖 ${char.name}翻阅了${targetDate}的飞书日记`, 'info');
                     } else if (fsrdr.reason === 'unreachable') {
                         // 同 Notion：没查成不等于那天没写，别把没跑成说成没写。
                         console.log('📖 [Feishu ReadDiary] 飞书连不上，这次没查成:', targetDate);
                         setDiaryStatus('飞书日记服务连不上，继续对话...');
-                        await diaryFallbackCall(
+                        await replyStep(async () => diaryFallbackCall(
                             `你想翻 ${targetDate} 的飞书日记，但飞书连不上，这次没查成（不知道那天到底写没写）`,
                             /\[\[FS_READ_DIARY:.*?\]\]/g,
-                        );
+                        ));
                     } else {
                         // fsrdr.reason === 'not_found'
                         setDiaryStatus(`${targetDate} 没有找到飞书日记...`);
@@ -1425,26 +1536,28 @@ export async function applyAssistantPostProcessing(
                             { role: 'user', content: `[系统: 你翻了翻飞书日记本，发现 ${targetDate} 那天没有写日记。请你：\n1. 先正常回应用户刚才说的话（用户还在等你回复！）\n2. 自然地提到没找到那天的日记，比如"嗯...那天好像没写日记"、"翻了翻没找到诶"\n3. 用多条消息回复，保持对话自然\n4. 严禁再输出[[FS_READ_DIARY:...]]标记]` }
                         ];
 
-                        data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                        data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                             method: 'POST', headers,
-                            body: JSON.stringify({ model: effectiveApi.model, messages: nodiaryMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                        }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' });
+                            body: JSON.stringify({ model: effectiveApi.model, messages: nodiaryMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                        }, 2, 0, { ...apiLogMeta, purpose: '翻阅日记' }));
                         updateTokenUsage(data, historyMsgCount, 'no-diary-feishu');
                         aiContent = data.choices?.[0]?.message?.content || '';
-                        aiContent = normalizeAiContent(aiContent);
+                        aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                     }
                 } catch (e) {
+                    ctx.replyRun?.check();
                     console.error('📖 [Feishu ReadDiary] 读取异常:', e);
                     setDiaryStatus('飞书日记读取失败，继续对话...');
-                    await diaryFallbackCall('你想翻阅飞书日记但读取出了问题（可能是网络问题）', /\[\[FS_READ_DIARY:.*?\]\]/g);
+                    await replyStep(async () => diaryFallbackCall('你想翻阅飞书日记但读取出了问题（可能是网络问题）', /\[\[FS_READ_DIARY:.*?\]\]/g));
                 }
             } else {
                 console.log('📖 [Feishu ReadDiary] 无法解析日期:', dateInput);
-                await diaryFallbackCall(`你想翻阅飞书日记但没能理解要找哪天的（"${dateInput}"）`, /\[\[FS_READ_DIARY:.*?\]\]/g);
+                await replyStep(async () => diaryFallbackCall(`你想翻阅飞书日记但没能理解要找哪天的（"${dateInput}"）`, /\[\[FS_READ_DIARY:.*?\]\]/g));
             }
         } else {
             console.log('📖 [Feishu ReadDiary] 检测到读日记意图但未配置飞书');
-            await diaryFallbackCall('你想翻阅飞书日记但飞书暂时不可用', /\[\[FS_READ_DIARY:.*?\]\]/g);
+            await replyStep(async () => diaryFallbackCall('你想翻阅飞书日记但飞书暂时不可用', /\[\[FS_READ_DIARY:.*?\]\]/g));
         }
         setDiaryStatus('');
     }
@@ -1461,7 +1574,7 @@ export async function applyAssistantPostProcessing(
             try {
                 setDiaryStatus(`正在翻阅笔记: ${keyword}...`);
 
-                const rnr = await runReadNote({ keyword }, agenticCtx);
+                const rnr = await replyStep(async () => runReadNote({ keyword }, agenticCtx));
 
                 if (rnr.ok) {
                     // 注: "找到 N 篇笔记，正在阅读..." 由 runReadNote 内部 onProgress 触发
@@ -1475,25 +1588,26 @@ export async function applyAssistantPostProcessing(
                         { role: 'user', content: `[系统: 你翻阅了${userProfile.name}的笔记，以下是内容:\n\n${rnr.noteText}\n\n请你：\n1. 先正常回应用户刚才说的话\n2. 自然地提到你看到的笔记内容，语气温馨，像不经意间看到的\n3. 可以对内容表示好奇、关心或共鸣\n4. 用多条消息回复，保持对话自然\n5. 严禁再输出[[READ_NOTE:...]]标记]` }
                     ];
 
-                    data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                    data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                         method: 'POST', headers,
-                        body: JSON.stringify({ model: effectiveApi.model, messages: noteMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                    }, 2, 0, { ...apiLogMeta, purpose: '翻阅笔记' });
+                        body: JSON.stringify({ model: effectiveApi.model, messages: noteMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                    }, 2, 0, { ...apiLogMeta, purpose: '翻阅笔记' }));
                     updateTokenUsage(data, historyMsgCount, 'read-note');
                     aiContent = data.choices?.[0]?.message?.content || '';
-                    aiContent = normalizeAiContent(aiContent);
+                    aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                     addToast(`📝 ${char.name}翻阅了关于"${keyword}"的笔记`, 'info');
                 } else if (rnr.reason === 'empty_content') {
                     console.log('📝 [ReadNote] 笔记内容为空');
-                    await diaryFallbackCall('你翻阅了笔记但内容是空的', /\[\[READ_NOTE:.*?\]\]/g);
+                    await replyStep(async () => diaryFallbackCall('你翻阅了笔记但内容是空的', /\[\[READ_NOTE:.*?\]\]/g));
                 } else if (rnr.reason === 'unreachable') {
                     // 同日记：没查成不等于没有这篇笔记。说成「没找到」，用户会以为自己没写过。
                     console.log('📝 [ReadNote] 笔记服务连不上，这次没查成:', keyword);
                     setDiaryStatus('笔记服务连不上，继续对话...');
-                    await diaryFallbackCall(
+                    await replyStep(async () => diaryFallbackCall(
                         `你想翻${userProfile.name}关于"${keyword}"的笔记，但笔记服务连不上，这次没查成（不知道到底有没有这篇）`,
                         /\[\[READ_NOTE:.*?\]\]/g,
-                    );
+                    ));
                 } else {
                     // rnr.reason === 'not_found'
                     console.log('📝 [ReadNote] 没有找到匹配的笔记:', keyword);
@@ -1505,22 +1619,24 @@ export async function applyAssistantPostProcessing(
                         { role: 'user', content: `[系统: 你想看${userProfile.name}关于"${keyword}"的笔记，但没有找到。请你：\n1. 先正常回应用户刚才说的话\n2. 可以自然地提一下，比如"嗯，好像没找到那篇笔记"\n3. 继续正常聊天\n4. 严禁再输出[[READ_NOTE:...]]标记]` }
                     ];
 
-                    data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                    data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                         method: 'POST', headers,
-                        body: JSON.stringify({ model: effectiveApi.model, messages: nonoteMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                    }, 2, 0, { ...apiLogMeta, purpose: '翻阅笔记' });
+                        body: JSON.stringify({ model: effectiveApi.model, messages: nonoteMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                    }, 2, 0, { ...apiLogMeta, purpose: '翻阅笔记' }));
                     updateTokenUsage(data, historyMsgCount, 'read-note-empty');
                     aiContent = data.choices?.[0]?.message?.content || '';
-                    aiContent = normalizeAiContent(aiContent);
+                    aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                 }
             } catch (e) {
+                ctx.replyRun?.check();
                 console.error('📝 [ReadNote] 读取异常:', e);
                 setDiaryStatus('笔记读取失败，继续对话...');
-                await diaryFallbackCall('你想翻阅笔记但读取出了问题（可能是网络问题）', /\[\[READ_NOTE:.*?\]\]/g);
+                await replyStep(async () => diaryFallbackCall('你想翻阅笔记但读取出了问题（可能是网络问题）', /\[\[READ_NOTE:.*?\]\]/g));
             }
         } else {
             console.log('📝 [ReadNote] 检测到读笔记意图但未配置笔记数据库');
-            await diaryFallbackCall('你想翻阅笔记但笔记功能暂时不可用', /\[\[READ_NOTE:.*?\]\]/g);
+            await replyStep(async () => diaryFallbackCall('你想翻阅笔记但笔记功能暂时不可用', /\[\[READ_NOTE:.*?\]\]/g));
         }
         setDiaryStatus('');
     }
@@ -1538,7 +1654,7 @@ export async function applyAssistantPostProcessing(
         setXhsStatus(`正在小红书搜索: ${keyword}...`);
 
         try {
-            const xsr = await runXhsSearch({ keyword }, agenticCtx);
+            const xsr = await replyStep(async () => runXhsSearch({ keyword }, agenticCtx));
             if (xsr.ok) {
                 const cleanedForXhs = aiContent.replace(/\[\[XHS_SEARCH:.*?\]\]/g, '').trim() || '让我去小红书看看...';
                 const xhsMessages = [
@@ -1547,19 +1663,20 @@ export async function applyAssistantPostProcessing(
                     { role: 'user', content: `[系统: 你在小红书搜索了"${keyword}"，以下是搜索结果]\n\n${xsr.notesText}\n\n[系统: 你已经看完了搜索结果（注意：以上只是摘要，想看某条笔记的完整正文可以用 [[XHS_DETAIL: noteId]]）。现在请你：\n1. 自然地分享你看到的内容，比如"我刚在小红书搜了一下..."、"诶小红书上有人说..."\n2. 可以评价、吐槽、分享感兴趣的内容\n3. 如果觉得某条笔记特别值得分享，可以用 [[XHS_SHARE: 序号]] 把它作为卡片分享给用户（序号从1开始），可以分享多条；不要手写“[你分享了小红书笔记]”及标题/作者/互动/简介，分享卡片必须使用该标记\n4. 如果想评论某条笔记，可以用 [[XHS_COMMENT: noteId | 评论内容]]\n5. 如果喜欢某条笔记，可以用 [[XHS_LIKE: noteId]] 点赞，[[XHS_FAV: noteId]] 收藏\n6. 如果想看某条笔记的完整内容和评论区，可以用 [[XHS_DETAIL: noteId]]\n7. 严禁再输出[[XHS_SEARCH:...]]标记]` }
                 ];
 
-                data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                     method: 'POST', headers,
-                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                }, 2, 0, { ...apiLogMeta, purpose: '小红书搜索' });
+                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                }, 2, 0, { ...apiLogMeta, purpose: '小红书搜索' }));
                 updateTokenUsage(data, historyMsgCount, 'xhs-search');
                 aiContent = data.choices?.[0]?.message?.content || '';
-                aiContent = normalizeAiContent(aiContent);
-                await persistMessage({
+                aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
+                await replyStep(async () => persistMessage({
                     charId: char.id,
                     role: 'system',
                     type: 'text',
                     content: `📕 ${char.name}在小红书搜索了「${keyword}」，看了 ${xsr.notes.length} 条笔记`
-                });
+                }));
                 addToast(`📕 ${char.name}搜索了小红书: ${keyword}`, 'info');
             } else {
                 // xsr.reason === 'no_results' (not_enabled 已被外层 if 排除)
@@ -1567,6 +1684,7 @@ export async function applyAssistantPostProcessing(
                 aiContent = aiContent.replace(xhsSearchMatch[0], '').trim();
             }
         } catch (e) {
+            ctx.replyRun?.check();
             console.error('📕 [XHS] 搜索异常:', e);
             aiContent = aiContent.replace(xhsSearchMatch[0], '').trim();
         }
@@ -1584,7 +1702,7 @@ export async function applyAssistantPostProcessing(
         setXhsStatus('正在刷小红书...');
 
         try {
-            const xbr = await runXhsBrowse({ category }, agenticCtx);
+            const xbr = await replyStep(async () => runXhsBrowse({ category }, agenticCtx));
             if (xbr.ok) {
                 const cleanedForXhs = aiContent.replace(/\[\[XHS_BROWSE(?::.*?)?\]\]/g, '').trim() || '让我刷刷小红书...';
                 const xhsMessages = [
@@ -1593,19 +1711,21 @@ export async function applyAssistantPostProcessing(
                     { role: 'user', content: `[系统: 你刷了一会儿小红书首页，以下是你看到的内容]\n\n${xbr.notesText}\n\n[系统: 你已经看完了（注意：以上只是摘要，想看某条笔记的完整正文可以用 [[XHS_DETAIL: noteId]]）。现在请你：\n1. 像在跟朋友分享一样，随意聊聊你看到了什么有趣的\n2. 不用全部都提，挑你感兴趣的1-3条聊就行\n3. 可以吐槽、感叹、分享想法\n4. 如果觉得某条笔记特别值得分享，可以用 [[XHS_SHARE: 序号]] 把它作为卡片分享给用户（序号从1开始），可以分享多条；不要手写“[你分享了小红书笔记]”及标题/作者/互动/简介，分享卡片必须使用该标记\n5. 如果想发一条自己的笔记，可以用 [[XHS_POST: 标题 | 内容 | #标签1 #标签2]]\n6. 如果喜欢某条笔记，可以用 [[XHS_LIKE: noteId]] 点赞，[[XHS_FAV: noteId]] 收藏\n7. 如果想看某条笔记的完整内容和评论区，可以用 [[XHS_DETAIL: noteId]]\n8. 严禁再输出[[XHS_BROWSE]]标记]` }
                 ];
 
-                data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                     method: 'POST', headers,
-                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                }, 2, 0, { ...apiLogMeta, purpose: '小红书浏览' });
+                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                }, 2, 0, { ...apiLogMeta, purpose: '小红书浏览' }));
                 updateTokenUsage(data, historyMsgCount, 'xhs-browse');
                 aiContent = data.choices?.[0]?.message?.content || '';
-                aiContent = normalizeAiContent(aiContent);
+                aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                 addToast(`📕 ${char.name}刷了会儿小红书`, 'info');
             } else {
                 // xbr.reason === 'no_results' (not_enabled 已被外层 if 排除)
                 aiContent = aiContent.replace(xhsBrowseMatch[0], '').trim();
             }
         } catch (e) {
+            ctx.replyRun?.check();
             console.error('📕 [XHS] 浏览异常:', e);
             aiContent = aiContent.replace(xhsBrowseMatch[0], '').trim();
         }
@@ -1631,17 +1751,17 @@ export async function applyAssistantPostProcessing(
         if (note) {
             sharedXhsCardKeys.add(normalizeXhsCardKey(note.title));
             console.log('📕 [XHS] AI分享笔记卡片:', note.title);
-            await persistMessage({
+            await replyStep(async () => persistMessage({
                 charId: char.id,
                 role: 'assistant',
                 type: 'xhs_card',
                 content: note.title || '小红书笔记',
                 // 跟正文气泡带同一个标记 (mcdInheritMeta): 主动消息重试时靠它认出"这张卡上一趟已经发过了"
                 metadata: { xhsNote: note, ...(mcdInheritMeta || {}) }
-            });
-            setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+            }));
+            setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
         } else {
-            // 笔记缓冲为空 / 越界 → 卡片发不出来. instant 路径靠 saveXhsSessionNotes 持久化恢复,
+            // 笔记缓冲为空 / 越界 → 卡片发不出来. 云端回复靠 saveXhsSessionNotes 持久化恢复,
             // 走到这里说明恢复也没命中 (TTL 过期 / 跨 session), 留日志便于排查, 不再静默吞掉.
             console.warn('📕 [XHS] XHS_SHARE 序号越界, 跳过卡片', { idx: idx + 1, available: lastXhsNotesRef.current.length });
         }
@@ -1679,17 +1799,17 @@ export async function applyAssistantPostProcessing(
             shareCount: cachedNote.shareCount ?? parsedNote.shareCount,
         } : parsedNote;
         console.warn('📕 [XHS] 检测到仿卡片文本，已恢复为 xhs_card:', note.title, cachedNote ? '(命中缓存)' : '(文本兜底)');
-        await persistMessage({
+        await replyStep(async () => persistMessage({
             charId: char.id,
             role: 'assistant',
             type: 'xhs_card',
             content: note.title || '小红书笔记',
             metadata: { xhsNote: note, ...(mcdInheritMeta || {}) },
-        });
+        }));
         if (parsedKey) sharedXhsCardKeys.add(parsedKey);
     }
     if (mimickedXhsShares.shares.length > 0) {
-        setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+        setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
     }
     // [[XHS_POST: 标题 | 内容 | #标签1 #标签2]]
     const xhsPostMatch = aiContent.match(/\[\[XHS_POST:\s*(.+?)\]\]/s);
@@ -1704,22 +1824,23 @@ export async function applyAssistantPostProcessing(
         setXhsStatus(`正在发布小红书: ${postTitle}...`);
 
         try {
-            const result = await xhsPublish(xhsConf, char, postTitle, postContent, postTags);
+            const result = await replyStep(async () => xhsPublish(xhsConf, char, postTitle, postContent, postTags, ctx.replyRun?.signal));
             if (result.success) {
                 console.log('📕 [XHS] 发布成功:', result.noteId);
                 const tagsStr = postTags.length > 0 ? ` #${postTags.join(' #')}` : '';
-                await persistMessage({
+                await replyStep(async () => persistMessage({
                     charId: char.id,
                     role: 'system',
                     type: 'text',
                     content: `📕 ${char.name}发了一条小红书「${postTitle}」\n${postContent.slice(0, 200)}${postContent.length > 200 ? '...' : ''}${tagsStr}`
-                });
+                }));
                 addToast(`📕 ${char.name}发了一条小红书!`, 'success');
             } else {
                 console.error('📕 [XHS] 发布失败:', result.message);
                 addToast(`小红书发布失败: ${result.message}`, 'error');
             }
         } catch (e) {
+            ctx.replyRun?.check();
             console.error('📕 [XHS] 发布异常:', e);
         }
         aiContent = aiContent.replace(xhsPostMatch[0], '').trim();
@@ -1742,19 +1863,20 @@ export async function applyAssistantPostProcessing(
             setXhsStatus('正在评论...');
 
             try {
-                const result = await xhsComment(xhsConf, noteId, commentContent, xsecToken);
+                const result = await replyStep(async () => xhsComment(xhsConf, noteId, commentContent, xsecToken, ctx.replyRun?.signal));
                 if (result.success) {
-                    await persistMessage({
+                    await replyStep(async () => persistMessage({
                         charId: char.id,
                         role: 'system',
                         type: 'text',
                         content: `📕 ${char.name}在小红书评论了: "${commentContent.slice(0, 100)}${commentContent.length > 100 ? '...' : ''}"`
-                    });
+                    }));
                     addToast(`📕 ${char.name}在小红书留了评论`, 'success');
                 } else {
                     addToast(`评论失败: ${result.message}`, 'error');
                 }
             } catch (e) {
+                ctx.replyRun?.check();
                 console.error('📕 [XHS] 评论异常:', e);
             }
         }
@@ -1784,7 +1906,7 @@ export async function applyAssistantPostProcessing(
                     parentCommentId ? `(parentId=${parentCommentId})` : '(顶级评论)');
                 setXhsStatus('正在回复评论...');
                 try {
-                    let result = await xhsReplyComment(xhsConf, noteId, xsecToken || '', replyContent, commentId, commentUserId, parentCommentId);
+                    let result = await replyStep(async () => xhsReplyComment(xhsConf, noteId, xsecToken || '', replyContent, commentId, commentUserId, parentCommentId, ctx.replyRun?.signal));
                     const selectorBroken = !result.success && result.message?.includes('未找到评论');
                     if (selectorBroken) {
                         console.warn(`📕 [XHS] 回复失败(DOM选择器不匹配)，跳过重试直接降级:`, result.message);
@@ -1792,8 +1914,8 @@ export async function applyAssistantPostProcessing(
                         const replyRetries = [3000, 4000, 5000];
                         for (let i = 0; i < replyRetries.length && !result.success; i++) {
                             console.warn(`📕 [XHS] 回复失败(${i + 1}/${replyRetries.length})，${replyRetries[i] / 1000}秒后重试:`, result.message);
-                            await new Promise(r => setTimeout(r, replyRetries[i]));
-                            result = await xhsReplyComment(xhsConf, noteId, xsecToken || '', replyContent, commentId, commentUserId, parentCommentId);
+                            await replyStep(async () => new Promise(r => setTimeout(r, replyRetries[i])));
+                            result = await replyStep(async () => xhsReplyComment(xhsConf, noteId, xsecToken || '', replyContent, commentId, commentUserId, parentCommentId, ctx.replyRun?.signal));
                         }
                     }
                     if (result.success) {
@@ -1803,11 +1925,11 @@ export async function applyAssistantPostProcessing(
                         const fallbackContent = commentAuthorName
                             ? `@${commentAuthorName} ${replyContent}`
                             : replyContent;
-                        let fallback = await xhsComment(xhsConf, noteId, fallbackContent, xsecToken);
+                        let fallback = await replyStep(async () => xhsComment(xhsConf, noteId, fallbackContent, xsecToken, ctx.replyRun?.signal));
                         if (!fallback.success) {
                             console.warn(`📕 [XHS] 顶级评论也失败，3秒后重试:`, fallback.message);
-                            await new Promise(r => setTimeout(r, 3000));
-                            fallback = await xhsComment(xhsConf, noteId, fallbackContent, xsecToken);
+                            await replyStep(async () => new Promise(r => setTimeout(r, 3000)));
+                            fallback = await replyStep(async () => xhsComment(xhsConf, noteId, fallbackContent, xsecToken, ctx.replyRun?.signal));
                         }
                         if (fallback.success) {
                             addToast(`📕 ${char.name}评论了一条笔记（@提及回复）`, 'success');
@@ -1815,7 +1937,8 @@ export async function applyAssistantPostProcessing(
                             addToast(`回复失败: ${result.message}`, 'error');
                         }
                     }
-                } catch (e) { console.error('📕 [XHS] 回复异常:', e); }
+                } catch (e) { ctx.replyRun?.check(); console.error('📕 [XHS] 回复异常:', e); }
+
                 setXhsStatus('');
             } else {
                 console.warn('📕 [XHS] 回复缺少 xsecToken 或内容');
@@ -1835,13 +1958,14 @@ export async function applyAssistantPostProcessing(
             const xsecToken = findXsecToken(noteId, lastXhsNotesRef.current);
             console.log(`📕 [XHS] AI要点赞笔记:`, noteId, xsecToken ? '(有xsecToken)' : '(bridge自动获取)');
             try {
-                const result = await xhsLike(xhsConf, noteId, xsecToken || '');
+                const result = await replyStep(async () => xhsLike(xhsConf, noteId, xsecToken || '', ctx.replyRun?.signal));
                 if (result.success) {
                     addToast(`📕 ${char.name}点赞了一条笔记`, 'success');
                 } else {
                     console.warn('📕 [XHS] 点赞失败:', result.message);
                 }
-            } catch (e) { console.error('📕 [XHS] 点赞异常:', e); }
+            } catch (e) { ctx.replyRun?.check(); console.error('📕 [XHS] 点赞异常:', e); }
+
         }
     }
     aiContent = aiContent.replace(/\[\[XHS_LIKE:.*?\]\]/g, '').trim();
@@ -1854,13 +1978,14 @@ export async function applyAssistantPostProcessing(
             const xsecToken = findXsecToken(noteId, lastXhsNotesRef.current);
             console.log(`📕 [XHS] AI要收藏笔记:`, noteId, xsecToken ? '(有xsecToken)' : '(bridge自动获取)');
             try {
-                const result = await xhsFavorite(xhsConf, noteId, xsecToken || '');
+                const result = await replyStep(async () => xhsFavorite(xhsConf, noteId, xsecToken || '', ctx.replyRun?.signal));
                 if (result.success) {
                     addToast(`📕 ${char.name}收藏了一条笔记`, 'success');
                 } else {
                     console.warn('📕 [XHS] 收藏失败:', result.message);
                 }
-            } catch (e) { console.error('📕 [XHS] 收藏异常:', e); }
+            } catch (e) { ctx.replyRun?.check(); console.error('📕 [XHS] 收藏异常:', e); }
+
         }
     }
     aiContent = aiContent.replace(/\[\[XHS_FAV:.*?\]\]/g, '').trim();
@@ -1874,7 +1999,7 @@ export async function applyAssistantPostProcessing(
         try {
             let xmpr: Awaited<ReturnType<typeof runXhsMyProfile>>;
             try {
-                const ownedPosts = await DB.getXhsOwnedPosts(char.id);
+                const ownedPosts = await replyStep(async () => DB.getXhsOwnedPosts(char.id));
                 const latestUserMessage = [...fullMessages].reverse().find(message => message?.role === 'user');
                 const latestUserText = typeof latestUserMessage?.content === 'string'
                     ? latestUserMessage.content
@@ -1904,8 +2029,9 @@ export async function applyAssistantPostProcessing(
                     notes: localNotes,
                 };
             } catch (localProfileError) {
+                ctx.replyRun?.check();
                 console.warn('[XHS] 角色主页读取失败，回退到真实账号主页:', localProfileError);
-                xmpr = await runXhsMyProfile({}, agenticCtx);
+                xmpr = await replyStep(async () => runXhsMyProfile({}, agenticCtx));
             }
 
             if (xmpr.ok) {
@@ -1922,13 +2048,14 @@ export async function applyAssistantPostProcessing(
                     { role: 'user', content: `[系统: 你打开了自己的小红书]\n\n你的小红书账号昵称: ${nickname || '未知'}${userId ? ` (userId: ${userId})` : ''}${profileSection}\n\n${gotProfile ? '你的笔记' : `搜索「${nickname}」找到的相关笔记`}:\n${feedsStr}\n\n[系统: ${gotProfile ? '以上是按角色归属保存的主页数据，序号已根据用户刚才的说法按相关性和时间排序。' : '注意，搜索结果可能包含别人的帖子，你需要辨别哪些是你自己发的（看作者名字）。'}现在请你：\n1. 如果用户说“刚才那个帖子”“之前那篇”或要求查看自己帖子的评论区，选择最符合时间/标题的候选并输出 [[XHS_DETAIL: noteId]]；不要只口头说去看。\n2. 如果多个候选同样符合、无法判断是哪条，就自然地向用户确认，不能猜。\n3. 普通查看主页时，可以自然地聊聊看到的内容。\n4. 如果想发新笔记，可以用 [[XHS_POST: 标题 | 内容 | #标签1 #标签2]]。\n5. 严禁再输出[[XHS_MY_PROFILE]]标记。]` }
                 ];
 
-                data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                     method: 'POST', headers,
-                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                }, 2, 0, { ...apiLogMeta, purpose: '小红书主页' });
+                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                }, 2, 0, { ...apiLogMeta, purpose: '小红书主页' }));
                 updateTokenUsage(data, historyMsgCount, 'xhs-profile');
                 aiContent = data.choices?.[0]?.message?.content || '';
-                aiContent = normalizeAiContent(aiContent);
+                aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                 addToast(`📕 ${char.name}看了看自己的小红书`, 'info');
             } else if (xmpr.reason === 'no_identity') {
                 console.warn('📕 [XHS] 无昵称也无userId，无法查看主页。请在设置中填写。');
@@ -1940,13 +2067,14 @@ export async function applyAssistantPostProcessing(
                     { role: 'assistant', content: cleanedForXhs },
                     { role: 'user', content: `[系统: 你打开了自己的小红书]\n\n你的小红书账号昵称: 未知${profileSection}\n\n搜索「」找到的相关笔记:\n（无法获取主页：请在设置-小红书中填写你的昵称或用户ID）\n\n[系统: 注意，搜索结果可能包含别人的帖子，你需要辨别哪些是你自己发的（看作者名字）。现在请你：\n1. 自然地聊聊你看到了什么，"我看了看我的小红书..."、"我之前发的那个帖子..."\n2. 如果想发新笔记，可以用 [[XHS_POST: 标题 | 内容 | #标签1 #标签2]]\n3. 如果想看某条笔记的详细内容，可以用 [[XHS_DETAIL: noteId]]\n4. 严禁再输出[[XHS_MY_PROFILE]]标记]` }
                 ];
-                data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                     method: 'POST', headers,
-                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                }, 2, 0, { ...apiLogMeta, purpose: '小红书主页' });
+                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                }, 2, 0, { ...apiLogMeta, purpose: '小红书主页' }));
                 updateTokenUsage(data, historyMsgCount, 'xhs-profile');
                 aiContent = data.choices?.[0]?.message?.content || '';
-                aiContent = normalizeAiContent(aiContent);
+                aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
                 addToast(`📕 ${char.name}看了看自己的小红书`, 'info');
             } else if (xmpr.reason === 'unreachable') {
                 // 主页没打开、降级搜昵称也没跑通 = 小红书那头连不上, 一条笔记都没拿到。
@@ -1959,15 +2087,17 @@ export async function applyAssistantPostProcessing(
                     { role: 'assistant', content: cleanedForXhs },
                     { role: 'user', content: `[系统: 你想打开自己的小红书，但这次连不上，什么都没加载出来]\n\n[系统: 现在请你：\n1. 先正常回应用户刚才说的话（用户还在等你回复！）\n2. 自然地提一句"小红书打不开/刷不出来"就好\n3. 你这次什么都没看到，不要描述任何笔记、数据或评论\n4. 严禁再输出[[XHS_MY_PROFILE]]标记]` }
                 ];
-                data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+                data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                     method: 'POST', headers,
-                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-                }, 2, 0, { ...apiLogMeta, purpose: '小红书主页' });
+                    body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+                }, 2, 0, { ...apiLogMeta, purpose: '小红书主页' }));
                 updateTokenUsage(data, historyMsgCount, 'xhs-profile-unreachable');
                 aiContent = data.choices?.[0]?.message?.content || '';
-                aiContent = normalizeAiContent(aiContent);
+                aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
             }
         } catch (e) {
+            ctx.replyRun?.check();
             console.error('📕 [XHS] 查看主页异常:', e);
             aiContent = aiContent.replace(xhsProfileMatch[0], '').trim();
         }
@@ -1984,7 +2114,7 @@ export async function applyAssistantPostProcessing(
         setXhsStatus('正在查看笔记详情...');
 
         try {
-            const xdr = await runXhsDetail({ noteId }, agenticCtx);
+            const xdr = await replyStep(async () => runXhsDetail({ noteId }, agenticCtx));
             // not_enabled 已被外层 if 排除; 剩下的 ok:false 只有 unreachable —— 详情没读到
             // (小红书服务多半跑在用户自己电脑上, 人睡了机器关了就连不上)。这种情况下角色
             // 往往已经说了"我看看这条", 只删标记就没了下文, 所以复用下面 detailFailed 的
@@ -2010,16 +2140,18 @@ export async function applyAssistantPostProcessing(
                         : `[系统: 你点开了一条小红书笔记的详情页（noteId=${noteId}）]\n\n${detailStr}\n\n[系统: 你已经看完了这条笔记的完整内容和真实评论区。现在请你：\n1. 自然地分享你看到的内容和感受\n2. 如果想评论这条笔记，可以用 [[XHS_COMMENT: ${noteId} | 评论内容]]\n3. 如果想回复某条评论，可以用 [[XHS_REPLY: ${noteId} | commentId | 回复内容]]（commentId 在上面的评论区数据里）\n4. 如果想点赞，可以用 [[XHS_LIKE: ${noteId}]]；想收藏可以用 [[XHS_FAV: ${noteId}]]\n5. 严禁再输出[[XHS_DETAIL:...]]标记]` }
             ];
 
-            data = await safeFetchJson(`${baseUrl}/chat/completions`, {
+            data = await replyStep(async () => safeFetchJson(`${baseUrl}/chat/completions`, {
+                    signal: ctx.replyRun?.signal,
                 method: 'POST', headers,
-                body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: 8000, stream: false })
-            }, 2, 0, { ...apiLogMeta, purpose: '小红书详情' });
+                body: JSON.stringify({ model: effectiveApi.model, messages: xhsMessages, temperature: 0.8, max_tokens: dialogueMaxTokens(effectiveApi), stream: false })
+            }, 2, 0, { ...apiLogMeta, purpose: '小红书详情' }));
             updateTokenUsage(data, historyMsgCount, 'xhs-detail');
             aiContent = data.choices?.[0]?.message?.content || '';
-            aiContent = normalizeAiContent(aiContent);
+            aiContent = normalizeAiContent(await replyStep(async () => consumeHomeVisitReply(char.id, await consumeFriendFeedMainReply(char.id, aiContent))));
             addToast(`📕 ${char.name}${detailFailed ? '尝试查看一条笔记（加载失败）' : '看了一条笔记的详情'}`, 'info');
             }  // end of else (xdr.ok)
         } catch (e) {
+            ctx.replyRun?.check();
             console.error('📕 [XHS] 查看详情异常:', e);
             aiContent = aiContent.replace(xhsDetailMatch[0], '').trim();
         }
@@ -2042,19 +2174,20 @@ export async function applyAssistantPostProcessing(
             console.log(`📕 [XHS] AI要评论笔记(detail后):`, noteId, commentContent.slice(0, 30), xsecToken ? '(有xsecToken)' : '(无xsecToken)');
             setXhsStatus('正在评论...');
             try {
-                const result = await xhsComment(xhsConf, noteId, commentContent, xsecToken);
+                const result = await replyStep(async () => xhsComment(xhsConf, noteId, commentContent, xsecToken, ctx.replyRun?.signal));
                 if (result.success) {
-                    await persistMessage({
+                    await replyStep(async () => persistMessage({
                         charId: char.id,
                         role: 'system',
                         type: 'text',
                         content: `📕 ${char.name}在小红书评论了: "${commentContent.slice(0, 100)}${commentContent.length > 100 ? '...' : ''}"`
-                    });
+                    }));
                     addToast(`📕 ${char.name}在小红书留了评论`, 'success');
                 } else {
                     addToast(`评论失败: ${result.message}`, 'error');
                 }
             } catch (e) {
+                ctx.replyRun?.check();
                 console.error('📕 [XHS] 评论异常(detail后):', e);
             }
         }
@@ -2081,7 +2214,7 @@ export async function applyAssistantPostProcessing(
                     xsecToken ? '(有xsecToken)' : '(bridge自动获取)');
                 setXhsStatus('正在回复评论...');
                 try {
-                    let result = await xhsReplyComment(xhsConf, noteId, xsecToken || '', replyContent, commentId, commentUserId, parentCommentId);
+                    let result = await replyStep(async () => xhsReplyComment(xhsConf, noteId, xsecToken || '', replyContent, commentId, commentUserId, parentCommentId, ctx.replyRun?.signal));
                     const selectorBroken = !result.success && result.message?.includes('未找到评论');
                     if (selectorBroken) {
                         console.warn(`📕 [XHS] 回复失败(detail后)(DOM选择器不匹配)，跳过重试直接降级:`, result.message);
@@ -2089,8 +2222,8 @@ export async function applyAssistantPostProcessing(
                         const replyRetries = [3000, 4000, 5000];
                         for (let i = 0; i < replyRetries.length && !result.success; i++) {
                             console.warn(`📕 [XHS] 回复失败(detail后)(${i + 1}/${replyRetries.length})，${replyRetries[i] / 1000}秒后重试:`, result.message);
-                            await new Promise(r => setTimeout(r, replyRetries[i]));
-                            result = await xhsReplyComment(xhsConf, noteId, xsecToken || '', replyContent, commentId, commentUserId, parentCommentId);
+                            await replyStep(async () => new Promise(r => setTimeout(r, replyRetries[i])));
+                            result = await replyStep(async () => xhsReplyComment(xhsConf, noteId, xsecToken || '', replyContent, commentId, commentUserId, parentCommentId, ctx.replyRun?.signal));
                         }
                     }
                     if (result.success) {
@@ -2100,11 +2233,11 @@ export async function applyAssistantPostProcessing(
                         const fallbackContent = commentAuthorName
                             ? `@${commentAuthorName} ${replyContent}`
                             : replyContent;
-                        let fallback = await xhsComment(xhsConf, noteId, fallbackContent, xsecToken || '');
+                        let fallback = await replyStep(async () => xhsComment(xhsConf, noteId, fallbackContent, xsecToken || '', ctx.replyRun?.signal));
                         if (!fallback.success) {
                             console.warn(`📕 [XHS] 顶级评论也失败(detail后)，3秒后重试:`, fallback.message);
-                            await new Promise(r => setTimeout(r, 3000));
-                            fallback = await xhsComment(xhsConf, noteId, fallbackContent, xsecToken);
+                            await replyStep(async () => new Promise(r => setTimeout(r, 3000)));
+                            fallback = await replyStep(async () => xhsComment(xhsConf, noteId, fallbackContent, xsecToken, ctx.replyRun?.signal));
                         }
                         if (fallback.success) {
                             addToast(`📕 ${char.name}评论了一条笔记（@提及回复）`, 'success');
@@ -2112,7 +2245,8 @@ export async function applyAssistantPostProcessing(
                             addToast(`回复失败: ${result.message}`, 'error');
                         }
                     }
-                } catch (e) { console.error('📕 [XHS] 回复异常(detail后):', e); }
+                } catch (e) { ctx.replyRun?.check(); console.error('📕 [XHS] 回复异常(detail后):', e); }
+
                 setXhsStatus('');
             } else {
                 console.warn('📕 [XHS] 回复缺少 xsecToken 或内容(detail后)');
@@ -2129,13 +2263,14 @@ export async function applyAssistantPostProcessing(
             const xsecToken = findXsecToken(noteId, lastXhsNotesRef.current);
             console.log(`📕 [XHS] AI要点赞笔记(detail后):`, noteId, xsecToken ? '(有xsecToken)' : '(bridge自动获取)');
             try {
-                const result = await xhsLike(xhsConf, noteId, xsecToken || '');
+                const result = await replyStep(async () => xhsLike(xhsConf, noteId, xsecToken || '', ctx.replyRun?.signal));
                 if (result.success) {
                     addToast(`📕 ${char.name}点赞了一条笔记`, 'success');
                 } else {
                     console.warn('📕 [XHS] 点赞失败(detail后):', result.message);
                 }
-            } catch (e) { console.error('📕 [XHS] 点赞异常(detail后):', e); }
+            } catch (e) { ctx.replyRun?.check(); console.error('📕 [XHS] 点赞异常(detail后):', e); }
+
         }
     }
     aiContent = aiContent.replace(/\[\[XHS_LIKE:.*?\]\]/g, '').trim();
@@ -2148,13 +2283,14 @@ export async function applyAssistantPostProcessing(
             const xsecToken = findXsecToken(noteId, lastXhsNotesRef.current);
             console.log(`📕 [XHS] AI要收藏笔记(detail后):`, noteId, xsecToken ? '(有xsecToken)' : '(bridge自动获取)');
             try {
-                const result = await xhsFavorite(xhsConf, noteId, xsecToken || '');
+                const result = await replyStep(async () => xhsFavorite(xhsConf, noteId, xsecToken || '', ctx.replyRun?.signal));
                 if (result.success) {
                     addToast(`📕 ${char.name}收藏了一条笔记`, 'success');
                 } else {
                     console.warn('📕 [XHS] 收藏失败(detail后):', result.message);
                 }
-            } catch (e) { console.error('📕 [XHS] 收藏异常(detail后):', e); }
+            } catch (e) { ctx.replyRun?.check(); console.error('📕 [XHS] 收藏异常(detail后):', e); }
+
         }
     }
     aiContent = aiContent.replace(/\[\[XHS_FAV:.*?\]\]/g, '').trim();
@@ -2170,22 +2306,23 @@ export async function applyAssistantPostProcessing(
         console.log(`📕 [XHS] AI要发小红书(profile后):`, postTitle);
         setXhsStatus(`正在发布小红书: ${postTitle}...`);
         try {
-            const result = await xhsPublish(xhsConf, char, postTitle, postContent, postTags);
+            const result = await replyStep(async () => xhsPublish(xhsConf, char, postTitle, postContent, postTags, ctx.replyRun?.signal));
             if (result.success) {
                 console.log('📕 [XHS] 发布成功(profile后):', result.noteId);
                 const tagsStr = postTags.length > 0 ? ` #${postTags.join(' #')}` : '';
-                await persistMessage({
+                await replyStep(async () => persistMessage({
                     charId: char.id,
                     role: 'system',
                     type: 'text',
                     content: `📕 ${char.name}发了一条小红书「${postTitle}」\n${postContent.slice(0, 200)}${postContent.length > 200 ? '...' : ''}${tagsStr}`
-                });
+                }));
                 addToast(`📕 ${char.name}发了一条小红书!`, 'success');
             } else {
                 console.error('📕 [XHS] 发布失败(profile后):', result.message);
                 addToast(`小红书发布失败: ${result.message}`, 'error');
             }
         } catch (e) {
+            ctx.replyRun?.check();
             console.error('📕 [XHS] 发布异常(profile后):', e);
         }
         setXhsStatus('');
@@ -2197,7 +2334,7 @@ export async function applyAssistantPostProcessing(
     //
     // 这一段是刚刚生成的，所以按「现在」判时段，不跟着首轮那句的 spokenAt 走：两者之间
     // 隔着 RECALL / SEARCH / XHS 几趟往返，隔夜补收的 spokenAt 会把新写的改动整批作废。
-    aiContent = await consumeScheduleChanges(aiContent, new Date());
+    aiContent = await replyStep(async () => consumeScheduleChanges(aiContent, new Date()));
 
     // ─── Step 3: ChatParser.parseAndExecuteActions ───
     // mcdInheritMeta 一起传下去：戳一戳 / 转账卡 / 音乐卡 / 新闻卡 / 日程系统提示 / 生活记录卡
@@ -2210,7 +2347,7 @@ export async function applyAssistantPostProcessing(
         (d): d is Extract<PostProcessDirective, { type: 'music_action' }> =>
             d.type === 'music_action' && !!d.song,
     )?.song;
-    aiContent = await ChatParser.parseAndExecuteActions(aiContent, char.id, char.name, addToast, musicHooks, resolveCharTimeZone(char), messageTimestamp, mcdInheritMeta, frozenMusicSong);
+    aiContent = await replyStep(async () => ChatParser.parseAndExecuteActions(aiContent, char.id, char.name, addToast, musicHooks, resolveCharTimeZone(char), messageTimestamp, mcdInheritMeta, frozenMusicSong, ctx.replyRun));
 
     // ─── Step 4: thinking chain 抽取 (本轮末尾展示用) ───
     // 跑过二轮 (data !== initialData) → 取二轮 data 的 reasoning; 没跑二轮 → 取一轮 (round1ThinkingChain,
@@ -2228,7 +2365,7 @@ export async function applyAssistantPostProcessing(
         const { blocks, cleanedContent } = extractHtmlBlocks(aiContent);
         for (const blk of blocks) {
             try {
-                await persistMessage({
+                await replyStep(async () => persistMessage({
                     charId: char.id,
                     role: 'assistant',
                     type: 'html_card',
@@ -2238,10 +2375,11 @@ export async function applyAssistantPostProcessing(
                         htmlTextPreview: blk.textPreview,
                         ...(mcdInheritMeta || {}),
                     }),
-                } as any);
-                setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
-                await new Promise(r => setTimeout(r, 300));
+                } as any));
+                setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
+                await replyStep(async () => new Promise(r => setTimeout(r, 300)));
             } catch (e) {
+                ctx.replyRun?.check();
                 console.error('[HTML] 落库 html_card 失败', e);
             }
         }
@@ -2257,20 +2395,20 @@ export async function applyAssistantPostProcessing(
     // ─── Step 6: 展示本轮回复 (二轮结果 B / 无二轮时的单轮回复) ───
     // - 跑过二轮 (data !== initialData): aiContent 现在是 B; 一轮正文 A 已在 Step 2 开头先行展示, 这里只展示 B。
     // - 有重生指令但没真正发起二轮 (data 不变: 未配置/无结果/无日志/已激活/二轮异常 等): A 已展示, 跳过避免重复。
-    // - 没有重生 (普通回复 / instant push): leadInRendered 必为 false, 正常展示本轮唯一回复。
+    // - 没有重生 (普通回复 / 云端回复): leadInRendered 必为 false, 正常展示本轮唯一回复。
     if (leadInRendered && data === initialData) {
-        setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+        setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
     } else {
         const sanitizedBody = ChatParser.sanitize(aiContent, { keepCitations: true })
             .replace(/\[\[INNER_STATE:\s*[\s\S]*?\]\]/g, '')
             .trim();
         if (sanitizedBody) {
-            await renderAndPersist(aiContent, pendingThinkingChain);
+            await replyStep(async () => renderAndPersist(aiContent, pendingThinkingChain));
         } else if (!leadInRendered && (data !== initialData || recallMatch || searchMatch || readDiaryMatch || fsReadDiaryMatch)) {
             // 跑过二轮却吐空, 且本轮还没展示过任何内容 → 至少补一句, 避免整轮静默。
-            await renderAndPersist('嗯...', pendingThinkingChain);
+            await replyStep(async () => renderAndPersist('嗯...', pendingThinkingChain));
         } else {
-            setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+            setMessages(await replyStep(async () => DB.getRecentMessagesByCharId(char.id, 200)));
         }
     }
 }

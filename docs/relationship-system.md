@@ -8,7 +8,23 @@
 查 A 的手机时，TA 通讯录里的人可能是神经链接里**真实存在的角色 B**，也可能是按人设虚构的 **NPC**。真角色之间能背着用户私下对话，且对话会在双方手机里保持一致。
 （AI 玩 AI / 智能体不在本系统内——那块单独做一个「智能体 App」。）
 
+## 生成保存
+
+外卖、购物、自定义 App 等单次生成，以及联系人扫描，统一使用 `DB.savePhoneGeneration`。基于数据库中的最新角色合并本次增量，将手机记录和对应私聊卡片放在同一事务中提交；提交成功后通过 `phone-generation-committed` 同步 OS 内存，再提示成功。离开查手机页面不取消保存，结果始终归属于发起生成的角色。角色已删除时拒绝保存；失败全部回滚，避免聊天已有新卡片但手机仍是旧记录。`sendToChat` 以提交时的设置为准；联系人备注、话题盒和生成期间新增的记录不能被旧快照覆盖。回归见 `utils/phoneGeneration.test.ts`。
+
+## 删除私聊卡片后的补同步
+
+记录详情和长按菜单均可「检查并补同步到私聊」，不因旧 `systemMessageId` 永久禁用。私聊卡片仍在时提示已存在；卡片已删时允许再次补发，没有终身次数限制。手动补发是显式操作，不受自动 `sendToChat` 开关限制。
+
+`DB.syncPhoneEvidenceToChat` 在同一 IndexedDB 事务中读取最新角色/记录、核对关联卡片、补卡并更新关联编号。新卡使用角色范围内的 `deliveryId = phone-evidence:<recordId>` 查重，兼容旧卡仅有 `systemMessageId` 的情况；连续点击、跨标签页并发及丢失关联后的重试不会重复写卡，失败全部回滚。角色或原记录被删后不能补发，也不能误认其他角色的同编号卡片。提交后 `phone-evidence-synced` 只刷新内存关联与消息列表，不用旧页面快照覆盖记录。
+
+补发使用原记录内容和发生时间，不调用生成 API，不直接创建长期记忆；已经从旧卡片整理出的记忆不会自动删除或重写。后续常规聊天/记忆整理仍按现有规则处理恢复的消息。测试见 `utils/phoneEvidenceSync.test.ts` 与 `utils/checkPhoneSyncUI.test.ts`。
+
 ## 数据模型（`types.ts`）
+
+自定义 App 内页顶部提供「编辑」入口，回填名称、图标、颜色、生成指令和布局。保存时保留原 App ID 与已生成记录，更新配置只影响后续生成，不自动重新生成旧记录。
+
+通讯录、完整聊天原文和话题盒都存在角色的 `phoneState` 中，随完整备份 / 文字备份的 `characters` 分片一起导出与恢复，与 `sendToChat` 开关无关。仅媒体备份不包含聊天文字。真实对话异步完成时，`applyRealConversationToPhoneState` 必须在 `updateCharacter` 的函数式回调里基于最新状态合并，避免覆盖生成期间新增的其他联系人和记录。回归见 `utils/phoneConversationBackup.test.ts`。
 
 - `PhoneContact`：联系人。`kind: 'real' | 'npc'`；`linkedCharId`（real 时绑定真实角色）；`affinity`（机主对 TA 的好感，**-100..100**，负=反感）；`status: 'friend'|'pending'|'blocked'|'deleted'`。
   - `note`：**机主/用户手写的备注**——当「已确立的事实」用，prompt 里要求严格遵守，**不被自动生成覆盖**（见下）。
@@ -26,7 +42,7 @@
 
 1. `ContextBuilder.buildCoreContext(char, user, true)`
 2. 记忆宫殿（若 `memoryPalaceEnabled`）：`injectMemoryPalace(char, recent, /*queryHint*/ X.name, user.name)` —— **query 用对方的人名**。
-3. 最近上下文：`char.contextLimit || 500`（即 chatapp 设置面板里的「上下文条数」），不再写死 50。
+3. 最近上下文：`loadCharacterContextMessages(char)`，与聊天共用「自适应 / 手动」和用户起点。自适应读取水位线后原文；手动可读取已归档的最近 N 条。
 
 ## 能力
 
@@ -95,6 +111,7 @@ A 发起 / NPC 推进的 prompt 里给了一份**具体动机清单**（好奇�
 
 - 脚本统一是「我:/对方:」逐行格式。一条消息可能跨多行（模型连发几条），**存库时每一行都补回说话人前缀**（`runRealConversation` 的 `lineify` / `runNpcConversation` 走 `serializeTurns(parseTranscript())`）。
 - 解析一律走 `parseTranscript()`：无前缀的续行**继承上一条说话人**，不会被误判给对方（修复「A 发的消息 UI 分给 B」）。渲染（`renderChatDetail`/`renderContactDetail`）、翻转（`flipTranscript`）、续写回解析都用它，保证无损。
+- 模型或旧备份的脚本可能是数组/对象，不能直接 `.split()`。`phoneTranscriptToText` 保留字符串、兼容逐行数组和带 `role/content`、`speaker/text`、`isMe/text` 的消息；未知对象保留可读字段。智能体（含深度对话）的生成落库、历史会话读取和编辑回写统一经过 `normalizePhoneAiSession`，`parseTranscript` 也有兜底，避免一条异常记录拖垮列表；不要求用户删除原记录。
 - `upsertContact` 合并时**只覆盖有值的字段**，且不动已有非空 `note`——扫描通讯录/对话回填不会把用户手填的备注抹掉（修复「角色不看备注」）。备注在 prompt 里以「必须遵守的已确立事实」注入。
 
 ## 注意

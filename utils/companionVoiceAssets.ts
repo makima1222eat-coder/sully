@@ -6,7 +6,8 @@ export const COMPANION_STARTUP_VOICE_ASSET_PREFIX = 'companion-startup-voice:';
 export const COMPANION_TOUCH_VOICE_ASSET_PREFIX = 'companion-touch-voice:';
 
 interface CompanionVoiceAsset {
-  blob: Blob;
+  blob?: Blob;
+  blobRef?: string;
   mimeType: string;
   savedAt: number;
 }
@@ -45,6 +46,7 @@ export const getCompanionVoiceBlob = async (assetId: string): Promise<Blob | nul
   const raw = await DB.getAssetRaw(assetId).catch(() => null) as CompanionVoiceAsset | Blob | null;
   if (raw instanceof Blob) return raw;
   if (raw?.blob instanceof Blob) return raw.blob;
+  if (raw?.blobRef?.startsWith('blobref:')) return DB.getBlobAsset(raw.blobRef.slice(8));
 
   // v1 把陪伴语音放在不参与普通备份的 blob_assets。读取时原地迁移到可备份 assets。
   const legacy = await DB.getBlobAsset(assetId).catch(() => null);
@@ -64,10 +66,15 @@ export const deleteCompanionVoiceBlob = async (assetId: string): Promise<void> =
 
 /** 在导出读取 assets store 前，把所有旧版 blob_assets 陪伴语音搬进可备份资产表。 */
 export const ensureCompanionVoiceAssetsForBackup = async (characters: CharacterProfile[]): Promise<number> => {
+  return ensureCompanionVoiceAssetIdsForBackup(collectCharacterCompanionVoiceAssetIds(characters));
+};
+
+/** Cursor export retains only referenced IDs, not every full character object. */
+export const ensureCompanionVoiceAssetIdsForBackup = async (assetIds: Iterable<string>): Promise<number> => {
   let migrated = 0;
-  for (const assetId of collectCharacterCompanionVoiceAssetIds(characters)) {
+  for (const assetId of assetIds) {
     const current = await DB.getAssetRaw(assetId).catch(() => null) as CompanionVoiceAsset | Blob | null;
-    if (current instanceof Blob || current?.blob instanceof Blob) continue;
+    if (current instanceof Blob || current?.blob instanceof Blob || current?.blobRef?.startsWith('blobref:')) continue;
     const legacy = await DB.getBlobAsset(assetId).catch(() => null);
     if (!legacy) continue;
     await saveCompanionVoiceBlob(assetId, legacy);

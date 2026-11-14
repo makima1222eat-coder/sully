@@ -1,3 +1,4 @@
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useOS } from '../context/OSContext';
@@ -155,6 +156,14 @@ const JournalApp: React.FC = () => {
         setMode('calendar');
         loadDiaries(char.id);
     };
+    useAppShortcut(ShortcutAppID.Journal, (intent, isCurrent) => {
+        const target = characters.find(c => c.id === intent.characterId);
+        setSelectedChar(target || null); setCurrentEntry(null); setDiaries([]);
+        setMode(target ? 'calendar' : 'select');
+        if (target) void DB.getDiariesByCharId(target.id).then(items => {
+            if (isCurrent()) setDiaries(items.sort((a, b) => b.date.localeCompare(a.date)));
+        }).catch(() => { if (isCurrent()) addToast('日记读取失败，请重试', 'error'); });
+    });
 
     const openEntry = (date: string) => {
         const existing = diaries.find(d => d.date === date);
@@ -432,6 +441,7 @@ const JournalApp: React.FC = () => {
     // --- AI Interaction ---
 
     const handleExchange = async () => {
+
         if (!currentEntry || !selectedChar || !apiConfig.apiKey) {
             addToast('配置错误或内容为空', 'error');
             return;
@@ -451,7 +461,8 @@ const JournalApp: React.FC = () => {
             // 主动点了“保存”。旧代码在这里直接 saveEntry()，于是循环按钮先弹“日记已保存”。
             await saveEntry({ silent: true });
             await injectMemoryPalace(selectedChar, undefined, currentEntry.userPage.text);
-            let systemPrompt = ContextBuilder.buildCoreContext(selectedChar, userProfile);
+            const characterContextInput = { char: selectedChar, user: userProfile };
+            let systemPrompt = '';
 
             const styleOptions = PAPER_STYLES.map(p => p.id).join(', ');
             const defaultStickers = DEFAULT_STICKERS.join(' ');
@@ -459,14 +470,13 @@ const JournalApp: React.FC = () => {
                 ? `Custom Stickers (Name: URL): \n${customStickers.map(s => `- ${s.name}: ${s.url}`).join('\n')}`
                 : '';
 
-            const recentMsgs = await DB.getMessagesByCharId(selectedChar.id);
-            const contextLimit = 30;
+            const recentMsgs = await loadCharacterContextMessages(selectedChar);
             // 用统一的 normalizeMessageContent 把消息转成可读文本，绝不能直接塞 m.content：
             // score_card（含上一次交换日记同步进来的卡片）的 content 是整段 JSON，里面带
             // charAvatar 的 base64 data URL + 双方日记全文。重新生成时这张卡已在历史里，
             // 直接 dump 原始 content 会把 base64 头像和 JSON 结构整个灌进 prompt，
             // 造成 token 异常膨胀。normalize 后日记卡会被压成一行摘要，不再泄漏 base64/JSON。
-            const recentContext = recentMsgs.slice(-contextLimit).map(m => {
+            const recentContext = recentMsgs.map(m => {
                 const content = normalizeMessageContent(m, selectedChar.name, userProfile.name);
                 return `[${new Date(m.timestamp).toLocaleTimeString()}] ${m.role === 'user' ? 'User' : 'You'}: ${content}`;
             }).join('\n');
@@ -509,13 +519,20 @@ Structure:
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: [
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: `Users Diary:\n${currentEntry.userPage.text}` }
-                    ],
+                    ])),
                     temperature: 0.85
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'journal',
+                    appName: '交换日记',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '交换日记回信',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error('API Error');
             const data = await safeResponseJson(response);
@@ -587,9 +604,10 @@ Structure:
 
         // 主 API 散文式总结 — 当宫殿没开 / 副 API 缺失 / 提取为空时的 fallback
         const generateProseSummary = async (): Promise<string> => {
-            const baseContext = ContextBuilder.buildCoreContext(selectedChar, userProfile);
+            const characterContextInput = { char: selectedChar, user: userProfile };
+
             const charPart = diary.charPage?.text?.trim() || '(对方没有回复)';
-            const prompt = `${baseContext}
+            const prompt = `
 
 ### [系统指令: 交换日记归档]
 当前任务: 把这篇【交换日记】(日期 ${diary.date}) 总结成一段对你 (${selectedChar.name}) 长期有效的记忆。
@@ -620,11 +638,18 @@ ${charPart}
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: [{ role: 'user', content: prompt }],
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'user', content: prompt }])),
                     temperature: 0.4,
                     max_tokens: 1200,
                 }),
-            });
+                __sullyMeta: {
+                    appId: 'journal',
+                    appName: '交换日记',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '日记归档总结',
+                },
+            } as RequestInit);
             if (!response.ok) throw new Error(`主 API 失败 (${response.status})`);
             const data = await safeResponseJson(response);
             let s = (data.choices?.[0]?.message?.content || '').trim();
@@ -1262,7 +1287,7 @@ ${charPart}
             {/* Sticker Import Modal */}
             <Modal 
                 isOpen={showImportModal} title="添加日记贴纸" onClose={() => setShowImportModal(false)}
-                footer={<button onClick={handleImportStickers} className="w-full py-3 bg-white/10 text-white font-bold rounded-2xl hover:bg-white/20 transition-all">确认添加</button>}
+                footer={<button onClick={handleImportStickers} className="w-full py-3 bg-slate-900 text-white font-bold rounded-2xl hover:bg-slate-800 transition-all">确认添加</button>}
             >
                 <div className="space-y-3">
                     <p className="text-xs text-slate-500">格式：贴纸名称--图片URL (每行一个)</p>
@@ -1290,3 +1315,5 @@ ${charPart}
 };
 
 export default JournalApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

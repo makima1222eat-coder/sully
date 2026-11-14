@@ -1,13 +1,15 @@
+import { ContextBuilder } from '../utils/context';
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useOS } from '../context/OSContext';
 import { DB } from '../utils/db';
 import { CharacterProfile, SocialPost, SocialComment, SubAccount, SocialAppProfile } from '../types';
-import { ContextBuilder } from '../utils/context';
+import { buildSparkCommentHistory, buildSparkGenerationContext, resolveSparkAuthor, selectSparkParticipants } from '../utils/socialGeneration';
 import { processImageToBlob } from '../utils/file';
 import { putImageBlob } from '../utils/blobRef';
 import Modal from '../components/os/Modal';
-import { safeResponseJson } from '../utils/safeApi';
+import { extractContent, safeResponseJson } from '../utils/safeApi';
 import { CharacterGroupFilterBar, filterCharactersByGroup, GROUP_FILTER_ALL } from '../components/character/CharacterGroupFilter';
 import { House, User, Package, Warning } from '@phosphor-icons/react';
 import { mergeSocialComments, prependUniqueSocialPosts, updateSocialPost } from '../utils/socialFeedMerge';
@@ -157,6 +159,7 @@ const SocialApp: React.FC = () => {
     const [feed, setFeed] = useState<SocialPost[]>([]);
     // Modes: 'home' (Feed) | 'me' (Profile) | 'create' (Modal Overlay)
     const [activeTab, setActiveTab] = useState<'home' | 'me'>('home');
+    useAppShortcut(ShortcutAppID.Social, intent => { setSelectedPost(null); setIsCreateOpen(false); setShowSettings(false); setActiveTab(intent.entryId === 'me' ? 'me' : 'home'); });
     const [isCreateOpen, setIsCreateOpen] = useState(false); 
     
     const [selectedPost, setSelectedPost] = useState<SocialPost | null>(null);
@@ -429,7 +432,21 @@ const SocialApp: React.FC = () => {
     };
 
     // --- AI Logic (Updated for Multi-Handle) ---
+    const buildGenerationContext = async (participants: CharacterProfile[]) => {
+        const recent = await Promise.all(participants.map(async char =>
+            [char.id, await loadCharacterContextMessages(char)] as const));
+        return buildSparkGenerationContext(participants.map(char => ({ ...char, mountedWorldbooks: [] })), userProfile, socialProfile, characterHandles, Object.fromEntries(recent));
+    };
+
+    const buildGenerationMessages = (members: CharacterProfile[], context: string, prompt: string) => {
+        const history = [{ role: 'user', content: prompt }];
+        return ContextBuilder.buildGroupWorldbookRequest({ members, user: userProfile, history,
+            render: (slots, turns) => [{ role: 'system', content: slots.before + context + slots.after }, ...turns],
+        });
+    };
+
     const handleRefresh = async () => {
+
         if (!apiConfig.apiKey) { addToast('请配置 API Key', 'error'); return; }
         if (refreshRequestRef.current) return;
         const controller = new AbortController();
@@ -440,21 +457,8 @@ const SocialApp: React.FC = () => {
             const shuffledChars = [...characters].sort(() => 0.5 - Math.random());
             const selectedChars = shuffledChars.slice(0, Math.min(3, characters.length));
             
-            // Build Character Map with Multiple Handles Info
-            let charContexts = "";
-            let identityMap = "### 角色身份表 (Identities)\n";
-
-            for (const char of selectedChars) {
-                const coreContext = ContextBuilder.buildCoreContext(char, userProfile, false);
-                const msgs = await DB.getMessagesByCharId(char.id);
-                const recentStatus = msgs.length > 0 ? `(最近私聊状态: 刚和用户聊过 "${msgs[msgs.length-1].content.substring(0, 20)}...")` : '(最近无私聊，生活平淡)';
-                
-                const handles = characterHandles[char.id] || [];
-                const handleList = handles.map(h => `- 网名: "${h.handle}" (备注: ${h.note})`).join('\n');
-                
-                identityMap += `\n角色 [${char.name}] 可用账号:\n${handleList}\n`;
-                charContexts += `\n<<< 角色档案: ${char.name} >>>\n${coreContext}\n${recentStatus}\n<<< 档案结束 >>>\n`;
-            }
+            const context = await buildGenerationContext(selectedChars);
+            if (controller.signal.aborted) return;
 
             const prompt = `### 任务: 模拟社交APP "Spark" 的推荐流
 你需要生成 6-8 条新的社交媒体帖子。
@@ -469,16 +473,10 @@ const SocialApp: React.FC = () => {
 2. **路人/网友发帖 (70%)**: 
    - 模拟真实的互联网生态：吃瓜群众、技术宅、美妆博主、情感树洞。
 
-### 身份配置
-${identityMap}
-
 ### 🚫 绝对禁令
 1. **禁止扮演用户**: 用户的网名是 "${socialProfile.name}"。绝对禁止生成 \`authorName\` 等于或近似 "${socialProfile.name}" 的帖子（无论是角色帖还是路人帖）。如果你想用类似的名字，请改成完全不同的网名。
 2. **路人不得冒用身份**: 路人的 \`authorName\` 必须是全新的网名，绝对不能与上方【角色身份表】中列出的任何【网名】重合。
 3. **禁止上帝视角**。
-
-### 输入上下文
-${charContexts}
 
 ### 输出格式 (JSON Array)
 [
@@ -496,34 +494,24 @@ ${charContexts}
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: "user", content: prompt }], temperature: 0.95, max_tokens: 8000 }),
+                body: JSON.stringify({ model: apiConfig.model, messages: buildGenerationMessages(selectedChars, context, prompt), temperature: 0.8, max_tokens: 8000 }),
                 signal: controller.signal,
                 __sullyMeta: { appId: 'social', appName: 'Spark', purpose: '刷新推荐流' },
             } as RequestInit);
             if (!response.ok) throw new Error(await apiErrorMessage(response));
             const data = await safeResponseJson(response);
             if (controller.signal.aborted) return;
-            const json = safeParseJSON(data.choices[0].message.content);
+            const json = safeParseJSON(extractContent(data));
             if (!Array.isArray(json)) throw new Error('Parsed data is not an array');
             
             const newPosts: SocialPost[] = json
-                .filter((item: any) => {
-                    // Defense in depth: drop any AI-generated post that tries to impersonate the user.
-                    const name = (item?.authorName || '').toString().trim();
-                    return name && name !== socialProfile.name;
-                })
-                .map((item: any) => {
+                .flatMap((item: any) => {
+                const author = resolveSparkAuthor(item, selectedChars, characters, characterHandles, [socialProfile.name, userProfile.name]);
+                if (!author || typeof item.content !== 'string' || !item.content.trim()) return [];
+                item = { ...item, authorName: author.name };
                 let avatar = `https://api.dicebear.com/7.x/notionists/svg?seed=${item.authorName}`;
-                let matchedChar: CharacterProfile | undefined;
-                if (item.isCharacter) {
-                    // Try to find matching char by ID first, then by Handle match
-                    matchedChar = characters.find(char => char.id === item.charId) || characters.find(char => {
-                        const handles = characterHandles[char.id] || [];
-                        return handles.some(h => h.handle === item.authorName);
-                    });
-                    if (matchedChar) avatar = matchedChar.avatar;
-                }
-                // If AI flagged isCharacter but we couldn't match any char/handle, treat as stranger to avoid mis-attribution.
+                const matchedChar = author.character;
+                if (matchedChar) avatar = matchedChar.avatar;
                 const isCharacterPost = !!matchedChar;
                 if (!isCharacterPost) {
                     const seeds = ['micah', 'avataaars', 'bottts', 'notionists'];
@@ -532,11 +520,11 @@ ${charContexts}
                 // Normalize emoji content. AI usually returns real emoji chars; fall back to a ✨ char (not codepoint) for safety.
                 const rawEmojis = Array.isArray(item.emojis) && item.emojis.length > 0 ? item.emojis : ['✨'];
                 const images = rawEmojis.map((e: any) => codepointToEmoji(String(e ?? '✨')));
-                return {
+                return [{
                     id: `post-${Date.now()}-${Math.random()}`,
                     authorName: item.authorName || 'Unknown',
                     authorAvatar: avatar,
-                    title: item.title || '无标题',
+                    title: typeof item.title === 'string' ? item.title : '无标题',
                     content: item.content || '...',
                     images,
                     likes: item.likes || 0,
@@ -546,10 +534,11 @@ ${charContexts}
                     timestamp: Date.now(),
                     tags: ['Life', 'Vlog'],
                     bgStyle: getRandomStyle().bg,
-                    authorType: isCharacterPost ? 'character' : 'stranger',
+                    authorType: isCharacterPost ? 'character' as const : 'stranger' as const,
                     authorCharId: matchedChar?.id,
-                };
+                }];
             });
+            if (!newPosts.length) throw new Error('模型返回的作者身份不匹配，未添加帖子');
             prependPostsToFeed(newPosts);
             addToast('首页已刷新: 冲浪模式开启', 'success');
         } catch (e: any) {
@@ -563,6 +552,7 @@ ${charContexts}
     };
 
     const generateComments = async (post: SocialPost) => {
+
         if (!post || !apiConfig.apiKey) return;
         const livePost = feedRef.current.find(item => item.id === post.id) || post;
         if (livePost.comments.length > 0) return;
@@ -574,19 +564,9 @@ ${charContexts}
         setLoadingComments(true);
         try {
             const shuffledChars = [...characters].sort(() => 0.5 - Math.random());
-            const selectedChars = shuffledChars.slice(0, 2);
-            
-            let identityMap = "";
-            for (const char of selectedChars) {
-                const handles = characterHandles[char.id] || [];
-                const hList = handles.map(h => `"${h.handle}" (${h.note})`).join(', ');
-                identityMap += `- 角色 ${char.name} 可用身份: ${hList}\n`;
-            }
-
-            let contextPrompt = "";
-            for (const char of selectedChars) {
-                contextPrompt += `\n<<< 评论者角色: ${char.name} >>>\n${ContextBuilder.buildCoreContext(char, userProfile, false)}\n`;
-            }
+            const selectedChars = selectSparkParticipants(post, shuffledChars, characterHandles);
+            const context = await buildGenerationContext(selectedChars);
+            if (controller.signal.aborted) return;
             
             let authorType = "Stranger";
             if (post.authorType === 'user') authorType = "User";
@@ -617,50 +597,35 @@ ${post.content || '(楼主没写正文)'}
 请基于上面的【标题 + 正文】生成 4-6 条评论，评论要切实回应正文里提到的内容，不要只对着标题空泛地说。混合使用 **选定角色** 和 **随机路人**。
 角色评论时，请选择一个符合语境的马甲身份。
 
-### 角色身份库
-${identityMap}
-
 ### 禁令
 - **绝对禁止** 生成 \`author\` 等于或近似 "${socialProfile.name}" (用户) 的评论。
 - 路人评论的 \`author\` 必须是全新的网名，绝对不能与上方【角色身份库】中列出的任何马甲网名重合。
 
-### 输入上下文
-${contextPrompt}
-
 ### 输出格式 (JSON Array)
 [
-  { "author": "网名 (Handle) 或 路人昵称", "content": "评论内容..." }
+  { "author": "网名 (Handle) 或 路人昵称", "charId": "角色ID或null", "content": "评论内容..." }
 ]`;
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: "user", content: prompt }], temperature: 0.8 }),
+                body: JSON.stringify({ model: apiConfig.model, messages: buildGenerationMessages(selectedChars, context, prompt), temperature: 0.8 }),
                 signal: controller.signal,
                 __sullyMeta: { appId: 'social', appName: 'Spark', purpose: '生成帖子评论' },
             } as RequestInit);
             if (!response.ok) throw new Error(await apiErrorMessage(response));
             const data = await safeResponseJson(response);
             if (controller.signal.aborted) return;
-            const json = safeParseJSON(data.choices[0].message.content);
+            const json = safeParseJSON(extractContent(data));
             if (Array.isArray(json)) {
                 const comments: SocialComment[] = json
-                    .filter((c: any) => {
-                        const name = (c?.author || c?.authorName || '').toString().trim();
-                        // Drop any AI comment that tries to impersonate the user.
-                        return name && name !== socialProfile.name;
-                    })
-                    .map((c: any) => {
-                        const authorName = c.author || c.authorName || 'Unknown';
+                    .flatMap((c: any) => {
+                        const author = resolveSparkAuthor(c, selectedChars, characters, characterHandles, [socialProfile.name, userProfile.name]);
+                        if (!author || typeof c.content !== 'string' || !c.content.trim()) return [];
+                        const authorName = author.name;
                         let avatar = `https://api.dicebear.com/7.x/notionists/svg?seed=${authorName}`;
-
-                        // Check if char (match by handle)
-                        const char = characters.find(ch => {
-                            const handles = characterHandles[ch.id] || [];
-                            return handles.some(h => h.handle === authorName);
-                        });
-
+                        const char = author.character;
                         if (char) avatar = char.avatar;
-                        return {
+                        return [{
                             id: `cmt-${Math.random()}`,
                             authorName: authorName,
                             authorAvatar: avatar,
@@ -669,8 +634,9 @@ ${contextPrompt}
                             isCharacter: !!char,
                             authorType: char ? 'character' : 'stranger',
                             authorCharId: char?.id,
-                        } as SocialComment;
+                        } as SocialComment];
                     });
+                if (!comments.length) throw new Error('模型返回的评论身份不匹配，未添加评论');
                 updatePostInFeed(post.id, current => ({
                     ...current,
                     comments: mergeSocialComments(current.comments || [], comments),
@@ -687,6 +653,7 @@ ${contextPrompt}
     };
 
     const generateRepliesToUser = async (post: SocialPost, userContent: string) => {
+
         if (!apiConfig.apiKey) return;
         if (replyRequestRef.current) return;
         const controller = new AbortController();
@@ -694,13 +661,9 @@ ${contextPrompt}
         post = feedRef.current.find(item => item.id === post.id) || post;
         setIsReplyingToUser(true);
         try {
-            // Simplified handle map for replies
-            let identityMap = "";
-            characters.forEach(char => {
-                const handles = characterHandles[char.id] || [];
-                const hList = handles.map(h => `"${h.handle}"`).join(', ');
-                identityMap += `- ${char.name}: ${hList}\n`;
-            });
+            const selectedChars = selectSparkParticipants(post, [...characters].sort(() => 0.5 - Math.random()), characterHandles);
+            const context = await buildGenerationContext(selectedChars);
+            if (controller.signal.aborted) return;
 
             // Tell the model who actually wrote the post — if it's the user themselves, replies
             // need to make sense as people responding to the user's own note (not strangers).
@@ -721,45 +684,40 @@ ${contextPrompt}
 ${post.content || '(楼主没写正文)'}
 """
 **用户 "${socialProfile.name}" 刚在帖子下发的评论**: "${userContent}"
+**已有评论对话（最后一条可能就是上述新评论，不要重复回复旧内容）**:
+${buildSparkCommentHistory(post)}
 
 请基于楼主帖子的【标题 + 正文】+ 用户的评论上下文，生成 1-3 条对用户这条评论的回复，要扣题，不能脱离正文凭空发挥。
-${identityMap}
+优先由楼主或正在对话的角色回复；只能使用本次角色档案中的身份。
 
 ### 禁令
 - **绝对禁止** \`author\` 等于或近似 "${socialProfile.name}" (用户自己)。回复必须来自其他人。
 
 ### 输出格式 (JSON Array)
 [
-  { "author": "网名 (Handle)", "content": "回复内容..." }
+  { "author": "网名 (Handle)", "charId": "角色ID或null", "content": "回复内容..." }
 ]`;
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: "user", content: prompt }], temperature: 0.9 }),
+                body: JSON.stringify({ model: apiConfig.model, messages: buildGenerationMessages(selectedChars, context, prompt), temperature: 0.8 }),
                 signal: controller.signal,
                 __sullyMeta: { appId: 'social', appName: 'Spark', purpose: '回复用户评论' },
             } as RequestInit);
             if (!response.ok) throw new Error(await apiErrorMessage(response));
             const data = await safeResponseJson(response);
             if (controller.signal.aborted) return;
-            const json = safeParseJSON(data.choices[0].message.content);
+            const json = safeParseJSON(extractContent(data));
             if (Array.isArray(json)) {
                 const newReplies: SocialComment[] = json
-                    .filter((c: any) => {
-                        const name = (c?.author || c?.authorName || '').toString().trim();
-                        return name && name !== socialProfile.name;
-                    })
-                    .map((c: any) => {
-                        const authorName = c.author || c.authorName || 'Unknown';
+                    .flatMap((c: any) => {
+                        const author = resolveSparkAuthor(c, selectedChars, characters, characterHandles, [socialProfile.name, userProfile.name]);
+                        if (!author || typeof c.content !== 'string' || !c.content.trim()) return [];
+                        const authorName = author.name;
                         let avatar = `https://api.dicebear.com/7.x/notionists/svg?seed=${authorName}`;
-
-                        const char = characters.find(ch => {
-                            const handles = characterHandles[ch.id] || [];
-                            return handles.some(h => h.handle === authorName);
-                        });
-
+                        const char = author.character;
                         if (char) avatar = char.avatar;
-                        return {
+                        return [{
                             id: `cmt-reply-${Date.now()}-${Math.random()}`,
                             authorName: authorName,
                             authorAvatar: avatar,
@@ -768,8 +726,9 @@ ${identityMap}
                             isCharacter: !!char,
                             authorType: char ? 'character' : 'stranger',
                             authorCharId: char?.id,
-                        } as SocialComment;
+                        } as SocialComment];
                     });
+                if (!newReplies.length) throw new Error('模型返回的回复身份不匹配，未添加回复');
                 if (newReplies.length > 0) {
                     updatePostInFeed(post.id, current => ({
                         ...current,
@@ -895,7 +854,7 @@ ${identityMap}
 
     // 1. Feed Item (Glassmorphism)
     const renderFeedItem = (post: SocialPost) => (
-        <div key={post.id} onClick={() => handleOpenPost(post)} className="break-inside-avoid mb-3 bg-white/70 backdrop-blur-md rounded-2xl overflow-hidden shadow-sm hover:shadow-lg transition-all cursor-pointer active:scale-[0.98] border border-white/50 relative group">
+        <div key={post.id} onClick={() => handleOpenPost(post)} className="min-w-0 bg-white/70 backdrop-blur-md rounded-2xl overflow-hidden shadow-sm hover:shadow-lg transition-all cursor-pointer active:scale-[0.98] border border-white/50 relative group">
             <div className="aspect-[4/5] w-full flex items-center justify-center relative overflow-hidden" style={{ background: post.bgStyle }}>
                 {/* Decorative Overlay for "Premium" look */}
                 <div className="absolute inset-0 bg-white/5 backdrop-blur-[1px]"></div>
@@ -907,12 +866,12 @@ ${identityMap}
                 )}
             </div>
             <div className="p-3">
-                <div className="flex justify-between items-center">
-                    <div className="flex items-center gap-2 min-w-0">
+                <div className="flex justify-between items-center gap-2">
+                    <div className="flex flex-1 items-center gap-2 min-w-0">
                         <TokenImg value={post.authorAvatar} className="w-5 h-5 rounded-full object-cover shrink-0 ring-1 ring-white/50" />
                         <span className="text-[11px] text-slate-700 truncate font-medium">{post.authorName}</span>
                     </div>
-                    <div className="flex items-center gap-1 text-slate-400 group-hover:text-slate-600 transition-colors">
+                    <div className="flex shrink-0 items-center gap-1 text-slate-400 group-hover:text-slate-600 transition-colors">
                         <Icons.Heart filled={post.isLiked} className="w-4 h-4" onClick={(e) => handleLike(e, post)} />
                         <span className="text-[10px] font-medium">{post.likes}</span>
                     </div>
@@ -1192,7 +1151,8 @@ ${identityMap}
                                     </button>
                                 )}
                             </div>
-                            <div className="columns-2 gap-2 space-y-2 pb-24">
+                            {/* 完整卡片占一个网格单元，避免多栏分片与 backdrop-filter/裁切组合丢失作者栏。 */}
+                            <div className="grid grid-cols-2 items-start gap-x-2 gap-y-3 pb-24">
                                 {feed.map(post => renderFeedItem(post))}
                             </div>
                         </div>
@@ -1326,3 +1286,5 @@ ${identityMap}
 };
 
 export default SocialApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

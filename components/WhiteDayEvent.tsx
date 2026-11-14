@@ -1,3 +1,4 @@
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 /**
  * WhiteDayEvent.tsx
  * 白色情人节特别活动模块 (2026.3.14)
@@ -640,6 +641,7 @@ export const WhiteDaySession: React.FC<WhiteDaySessionProps> = ({ charId, onClos
     // API 调用 1：生成题目
     // ============================================================
     const generateQuiz = async (cId: string) => {
+
         const c = characters.find(ch => ch.id === cId);
         if (!c || !apiConfig) {
             setErrorMsg('找不到角色或 API 未配置');
@@ -647,15 +649,14 @@ export const WhiteDaySession: React.FC<WhiteDaySessionProps> = ({ charId, onClos
             return;
         }
         try {
-            const msgs = await DB.getMessagesByCharId(cId);
-            const limit = c.contextLimit || 500;
+            const msgs = await loadCharacterContextMessages(c);
             const recentMsgs = msgs
-                .slice(-limit)
                 .map(m => `${m.role}: ${m.type === 'image' ? '[图片]' : m.content}`)
                 .join('\n');
 
             await injectMemoryPalace(c, undefined, '白色情人节 回顾我们的关系');
-            const baseContext = ContextBuilder.buildCoreContext(c, userProfile, true);
+            const characterContextInput = { char: c, user: userProfile, includeDetailedMemories: true };
+
             const availableEmotions = getAvailableEmotions(c);
 
             const prompt = `### 特别活动：白色情人节默契测验 (2026.3.14)
@@ -721,13 +722,19 @@ export const WhiteDaySession: React.FC<WhiteDaySessionProps> = ({ charId, onClos
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: [
-                        { role: 'system', content: baseContext },
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [
                         { role: 'user', content: `[最近记录]:\n${recentMsgs}\n\n---\n\n${prompt}` },
-                    ],
+                    ])),
                     temperature: 0.85,
                 }),
-            });
+                __sullyMeta: {
+                    appId: 'special-moments',
+                    appName: '白色情人节',
+                    charId: c.id,
+                    charName: c.name,
+                    purpose: '默契问答出题',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API 错误: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -789,11 +796,13 @@ export const WhiteDaySession: React.FC<WhiteDaySessionProps> = ({ charId, onClos
     // API 调用 2：评阅答卷
     // ============================================================
     const generateReview = async () => {
+
         if (!char || !quizData || !apiConfig) return;
         setPhase('loading_review');
         try {
             await injectMemoryPalace(char, undefined, '白色情人节 回顾我们的关系');
-            const baseContext = ContextBuilder.buildCoreContext(char, userProfile, true);
+            const characterContextInput = { char, user: userProfile, includeDetailedMemories: true };
+
             const availableEmotions = getAvailableEmotions(char);
 
             const answerSummary = quizData.questions.map((q, i) => {
@@ -849,13 +858,19 @@ ${answerSummary}
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: [
-                        { role: 'system', content: baseContext },
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [
                         { role: 'user', content: prompt },
-                    ],
+                    ])),
                     temperature: 0.82,
                 }),
-            });
+                __sullyMeta: {
+                    appId: 'special-moments',
+                    appName: '白色情人节',
+                    charId: char.id,
+                    charName: char.name,
+                    purpose: '默契答卷批改',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API 错误: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -902,6 +917,7 @@ ${answerSummary}
     // API 调用 3：角色评价巧克力（vision，可选）
     // ============================================================
     const generateComment = async () => {
+
         if (!char || !apiConfig || !canvasRef.current) return;
         try {
             // 截图必须在 setPhase 之前完成，否则元素会被卸载导致 html2canvas 报错
@@ -917,7 +933,8 @@ ${answerSummary}
             setPhase('loading_comment');
 
             await injectMemoryPalace(char, undefined, '白色情人节 回顾我们的关系');
-            const baseContext = ContextBuilder.buildCoreContext(char, userProfile, true);
+            const characterContextInput = { char, user: userProfile, includeDetailedMemories: true };
+
             const availableEmotions = getAvailableEmotions(char);
 
             const prompt = `这是你和 ${userProfile.name} 一起 DIY 的白色情人节巧克力（主要是你做的，${userProfile.name} 帮忙装饰了照片）！请看看这块巧克力，用你的性格和说话方式评价一下——可以说说你们一起做的感受，夸夸自己的手艺，也可以调皮地调侃某个细节。
@@ -930,13 +947,19 @@ ${answerSummary}
 
             const endpoint = `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`;
             const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` };
+            const commentMeta = {
+                appId: 'special-moments',
+                appName: '白色情人节',
+                charId: char.id,
+                charName: char.name,
+                purpose: '手作巧克力点评',
+            };
             let response = await fetch(endpoint, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: [
-                        { role: 'system', content: baseContext },
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [
                         {
                             role: 'user',
                             content: [
@@ -944,10 +967,11 @@ ${answerSummary}
                                 { type: 'image_url', image_url: { url: imageBase64 } },
                             ],
                         },
-                    ],
+                    ])),
                     temperature: 0.88,
                 }),
-            });
+                __sullyMeta: commentMeta,
+            } as RequestInit);
 
             // 模型不支持视觉时降级为纯文字评价
             if (!response.ok && (response.status === 400 || response.status === 422)) {
@@ -957,13 +981,13 @@ ${answerSummary}
                     headers,
                     body: JSON.stringify({
                         model: apiConfig.model,
-                        messages: [
-                            { role: 'system', content: baseContext },
+                        messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [
                             { role: 'user', content: fallbackPrompt },
-                        ],
+                        ])),
                         temperature: 0.88,
                     }),
-                });
+                    __sullyMeta: commentMeta,
+                } as RequestInit);
             }
 
             if (!response.ok) throw new Error(`API 错误: ${response.status}`);
@@ -1325,7 +1349,14 @@ ${answerSummary}
                             }],
                             temperature: 0.7,
                         }),
-                    });
+                        __sullyMeta: {
+                            appId: 'special-moments',
+                            appName: '白色情人节',
+                            charId: char.id,
+                            charName: char.name,
+                            purpose: '巧克力摆件生成',
+                        },
+                    } as RequestInit);
                     if (resp.ok) {
                         const data = await resp.json();
                         const text = data.choices?.[0]?.message?.content?.trim() || '';

@@ -79,7 +79,7 @@ interface VRMVideoCallStageProps {
 
 // 两种渲染器的构图范围：Live2D 与设置面板滑杆一致，VRM 是相机距离/视野平移的安全区。
 const FRAMING_LIMITS = {
-  vrm: { scale: [0.5, 4] as [number, number], offsetX: [-0.9, 0.9] as [number, number], offsetY: [-0.9, 0.9] as [number, number] },
+  vrm: { scale: [0.1, 4] as [number, number], offsetX: [-0.9, 0.9] as [number, number], offsetY: [-0.9, 0.9] as [number, number] },
   live2d: { scale: [0.55, 6] as [number, number], offsetX: [-1.4, 1.4] as [number, number], offsetY: [-3.2, 3.2] as [number, number] },
 };
 
@@ -526,10 +526,10 @@ const VRMVideoCallStage: React.FC<VRMVideoCallStageProps> = ({
             <div className="flex h-28 w-28 items-center justify-center rounded-full border border-white/15 text-5xl font-light" style={{ background: `${accentColor}22`, color: accentColor }}>{characterName[0] || '角'}</div>
           )}
           <div className={`${companionMode ? 'mt-5' : 'mt-3'} text-sm font-medium text-white/85`}>
-            {modelMissing ? '模型文件已丢失，需要重新导入' : modelError ? '模型暂时加载失败' : '给这个角色装上视频模型'}
+            {modelMissing ? '模型文件已丢失，需要重新导入' : modelError ? '模型暂时加载失败' : companionMode ? '给 ta 换上陪伴形象' : '给这个角色装上视频模型'}
           </div>
           <p className="mt-1.5 max-w-[17rem] text-xs leading-relaxed text-white/45">
-            {modelError && !modelMissing ? '模型仍保存在本地，可以直接重新建立渲染，不必重复导入。' : '支持 VRM 0.x / 1.0，以及 Cubism model3.json 文件夹或 ZIP。'}
+            {modelError && !modelMissing ? '模型仍保存在本地，可以直接重新加载，不必重复导入。' : companionMode && !modelMissing ? '图片或 GIF 可以在「外观」中设置，也能沿用见面立绘。想使用动态模型，可以在这里导入。' : '支持 VRM 0.x / 1.0，以及 Cubism model3.json 文件夹或 ZIP。'}
           </p>
           {model?.format === 'live2d' && modelError && !modelMissing ? (
             <div className={`${companionMode ? 'mt-4' : 'mt-2.5'} flex items-center gap-2`}>
@@ -623,7 +623,7 @@ const VRMVideoCallStage: React.FC<VRMVideoCallStageProps> = ({
           </button>
 
           {stageToolsOpen && (
-            <div className="mt-2 w-[13.5rem] overflow-hidden rounded-2xl border border-white/10 bg-[#090a10]/90 px-3 py-2.5 shadow-2xl backdrop-blur-xl">
+            <div className="sully-stage-dark mt-2 w-[13.5rem] overflow-hidden rounded-2xl border border-white/10 bg-[#090a10]/90 px-3 py-2.5 text-white shadow-2xl backdrop-blur-xl">
               <div className="flex items-center justify-between border-b border-white/[0.07] pb-2">
                 <div>
                   <div className="text-[10px] font-medium text-white/75">舞台工具</div>

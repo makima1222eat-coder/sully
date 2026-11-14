@@ -10,6 +10,7 @@ import { loadCharacterContextRange } from './chatContextRange';
 import { ChatPrompts } from './chatPrompts';
 import { cleanApiMessages, flattenImageContentParts } from './promptMessageCleanup';
 import { getFlowNarrativeKey, isScheduleFeatureOn } from './scheduleFeature';
+import {buildHomeSchedulePrompt, hasHomeSchedulePositions, parseHomePosition} from './homeSchedule';
 
 export { getFlowNarrativeKey, isScheduleFeatureOn } from './scheduleFeature';
 
@@ -229,6 +230,7 @@ export async function generateDailyScheduleForChar(
     apiConfig: ApiConfig,
     forceRegenerate: boolean = false
 ): Promise<DailySchedule | null> {
+
     // 总开关关闭时直接短路，避免副 API / 兜底调用
     if (!isScheduleFeatureOn(char)) return null;
 
@@ -254,8 +256,8 @@ export async function generateDailyScheduleForChar(
     const historyMessages: Message[] = await loadCharacterContextRange(char)
         .then(snapshot => snapshot.messages)
         .catch(async e => {
-            console.warn('[Schedule] load private-chat context range failed, falling back to recent history:', e);
-            return DB.getRecentMessagesByCharId(char.id, char.contextLimit || 500, true).catch(() => [] as Message[]);
+            console.warn('[Schedule] load private-chat context range failed, omitting dialogue history:', e);
+            return [] as Message[];
         });
     const emojis = await DB.getEmojis().catch(() => [] as Emoji[]);
 
@@ -268,23 +270,20 @@ export async function generateDailyScheduleForChar(
     }
 
     // 含详细记忆，并让关键词世界书使用与私聊相同的消息窗口激活。
-    const baseContext = ContextBuilder.buildCoreContext(
-        char,
-        userProfile,
-        true,
-        undefined,
-        undefined,
-        { worldbookMessages: historyMessages },
-    );
+    const characterContextInput = { char, user: userProfile, includeDetailedMemories: true, timeOptions: { worldbookMessages: historyMessages } };
+
 
     const chatHistoryBlock = formatChatHistoryForSchedule(historyMessages, char, userProfile, emojis);
 
     const dayOfWeek = ['日', '一', '二', '三', '四', '五', '六'][now.getDay()];
 
     const style = char.scheduleStyle || 'lifestyle';
-    const prompt = style === 'mindful'
-        ? buildMindfulPrompt(baseContext, char, userProfile, today, dayOfWeek, chatHistoryBlock)
-        : buildLifestylePrompt(baseContext, char, userProfile, today, dayOfWeek, chatHistoryBlock);
+    const {scheduleHomeVisitPrompt,submitScheduleHomeVisits}=await import('./homeVisits');
+    const homePrompt = buildHomeSchedulePrompt(char);
+    const visitPrompt=await scheduleHomeVisitPrompt(char);
+    const prompt = (style === 'mindful'
+        ? buildMindfulPrompt('', char, userProfile, today, dayOfWeek, chatHistoryBlock)
+        : buildLifestylePrompt('', char, userProfile, today, dayOfWeek, chatHistoryBlock)) + homePrompt + visitPrompt;
 
     try {
         const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
@@ -292,7 +291,7 @@ export async function generateDailyScheduleForChar(
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
             body: JSON.stringify({
                 model: apiConfig.model,
-                messages: [{ role: 'user', content: prompt }],
+                messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'user', content: prompt }])),
                 temperature: 0.85,
                 max_tokens: 8000
             }),
@@ -316,14 +315,17 @@ export async function generateDailyScheduleForChar(
             console.error('[Schedule] Generation failed: 无法从模型输出解析出JSON:', content.slice(0, 200));
             return null;
         }
-        const slots: ScheduleSlot[] = (parsed.slots || []).map((s: any) => ({
+        const slots: ScheduleSlot[] = (parsed.slots || []).map((s: any) => {
+            const homePosition = parseHomePosition(s.homePosition, char);
+            return {
             startTime: s.startTime || '00:00',
             activity: s.activity || '',
             description: s.description,
             emoji: s.emoji,
-            location: s.location,
+            location: homePosition?.kind === 'home' ? char.home3D?.rooms.find(room => room.id === homePosition.roomId)?.name : typeof s.location === 'string' ? s.location : homePosition?.kind === 'away' ? '外出' : undefined,
+            homePosition,
             innerThought: s.innerThought,
-        })).filter((s: ScheduleSlot) => s.activity);
+        };}).filter((s: ScheduleSlot) => s.activity);
 
         if (slots.length === 0) return null;
 
@@ -352,7 +354,9 @@ export async function generateDailyScheduleForChar(
             flowNarrative,
         };
 
-        await DB.saveDailySchedule(schedule);
+        // Missing or stale room IDs must not overwrite a usable old schedule.
+        if (homePrompt && !hasHomeSchedulePositions(schedule, char)) return null;
+        await submitScheduleHomeVisits(char,schedule.date,parsed.homeVisits,schedule);
         return schedule;
     } catch (e) {
         console.error('[Schedule] Generation failed:', e);

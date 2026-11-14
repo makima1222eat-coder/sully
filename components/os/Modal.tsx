@@ -34,13 +34,13 @@ const Modal: React.FC<ModalProps> = ({ isOpen, title, onClose, children, footer,
     if (!isOpen) return null;
 
     const content = (
-        <div style={keyboardAware ? viewport : undefined} className={`fixed inset-0 z-[100] flex items-center justify-center animate-fade-in ${keyboardAware ? 'p-3' : 'p-6'}`}>
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 animate-fade-in" style={{ ...(keyboardAware ? viewport : {}), paddingTop: 'calc(var(--safe-top, 0px) + 1rem)', paddingBottom: 'calc(var(--safe-bottom, 0px) + 1rem)', maxHeight: 'var(--visual-viewport-height, 100dvh)' }}>
             <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-            <div role="dialog" aria-label={title} aria-modal="true" className={`relative w-full max-w-sm bg-white rounded-[2.5rem] shadow-2xl border border-white/20 overflow-hidden animate-slide-up ${keyboardAware ? 'max-h-full min-h-0 flex flex-col' : ''}`}>
+            <div role="dialog" aria-label={title} aria-modal="true" className="relative w-full max-w-sm max-h-full flex flex-col min-h-0 bg-white text-slate-800 rounded-[2.5rem] shadow-2xl border border-white/20 overflow-hidden animate-slide-up">
                 <div className="px-6 pt-6 pb-2 shrink-0">
                     <h3 className="text-lg font-bold text-slate-800 text-center">{title}</h3>
                 </div>
-                <div className={`px-6 py-4 overflow-y-auto no-scrollbar ${keyboardAware ? 'min-h-0' : 'max-h-[60vh]'}`}>
+                <div className="px-6 py-4 min-h-0 max-h-[60vh] overflow-y-auto overscroll-contain no-scrollbar">
                     {children}
                 </div>
                 {footer ? (

@@ -1,3 +1,4 @@
+import UserSpacePanel from '../components/user/UserSpacePanel';
 
 import React, { useRef, useState } from 'react';
 import { useOS } from '../context/OSContext';
@@ -6,12 +7,14 @@ import { migrateDataUrlToRef } from '../utils/blobRef';
 import LifeRecordPanel from '../components/lifeRecord/LifeRecordPanel';
 import PerCharAvatarPicker from '../components/user/PerCharAvatarPicker';
 import TokenImg from '../components/os/TokenImg';
+import HomeFigureStudio from '../components/character/HomeFigureStudio';
 import { trackEvent } from '../utils/analytics';
 
 const UserApp: React.FC = () => {
     const { closeApp, userProfile, updateUserProfile, addToast } = useOS();
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [tab, setTab] = useState<'profile' | 'life'>('profile');
+    const [showFigures, setShowFigures] = useState(false);
 
     const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
@@ -28,6 +31,7 @@ const UserApp: React.FC = () => {
         }
     };
 
+    if (showFigures) return <HomeFigureStudio onClose={() => setShowFigures(false)} />;
     return (
         <div className="h-full w-full bg-slate-50 flex flex-col animate-fade-in">
             {/* Header */}
@@ -40,6 +44,7 @@ const UserApp: React.FC = () => {
                     </button>
                     <h1 className="text-lg font-bold text-slate-700 tracking-wide">个人档案</h1>
                 </div>
+                <p className="px-4 pb-2 text-[10px] leading-relaxed text-slate-400">生理期、药盒、记账与锻炼，也可以让角色帮你记。</p>
                 {/* Tab：我的档案 / 生活记录 */}
                 <div className="flex gap-1.5 px-4 pb-2.5">
                     {([['profile', '我的档案'], ['life', '生活记录']] as const).map(([key, label]) => (
@@ -87,7 +92,7 @@ const UserApp: React.FC = () => {
                             </div>
                         </div>
                         <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleAvatarChange} />
-                        <p className="mt-2 text-center text-[10px] text-slate-400">整体头像：所有聊天的默认。想在某个角色那儿换一副面孔？下面「分角色聊天头像」里设。</p>
+                        <p className="mt-2 text-center text-[10px] text-slate-400">整体头像：所有聊天的默认。专属头像与额外信息可在下面「在 TA 面前的我」中设置。</p>
 
                         {/* Name field */}
                         <div className="mt-4">
@@ -104,8 +109,10 @@ const UserApp: React.FC = () => {
                     </div>
                 </div>
 
-                {/* 分角色聊天头像：上面的整体头像是宏观默认，这里可给每个角色的私聊单独换「你」的头像 */}
+                {/* 在 TA 面前的我：按角色设置用户头像与资料补充。 */}
+                <UserSpacePanel />
                 <PerCharAvatarPicker />
+                <button onClick={() => setShowFigures(true)} className="w-full text-left bg-white rounded-2xl p-5 border border-slate-100"><strong className="text-slate-700">我的手办柜</strong><span className="block text-sm text-slate-400 mt-1">Chibi 与 3D 家园形象</span></button>
 
                 {/* About / setting card */}
                 <div className="bg-white rounded-[1.75rem] shadow-[0_10px_30px_-12px_rgba(80,70,120,0.18)] border border-slate-100 p-5">

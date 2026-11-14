@@ -1,3 +1,4 @@
+import { ContextBuilder } from './context';
 import { describe, expect, it } from 'vitest';
 import type { CharacterProfile, Message, StoryTheaterPreset, UserProfile } from '../types';
 import { STORY_PRESET_SIMPLE_CHOICES } from '../components/date/story/StoryPresetMaker';
@@ -16,11 +17,12 @@ import {
     buildStoryPrefillInstruction,
     buildStoryMultiAffinityGuide,
     buildStoryWorldbookScanMessages,
-    buildTheaterWorldbookSlots,
     compileStoryPreset,
     prepareStoryGenerationSettings,
+    reconcileStoryAffinityScores,
     createBlankStoryPreset,
     createStoryTheaterDraft,
+    hasStoryTheaterParticipant,
     dedupeTheaterWorldbooks,
     describeEmptyStoryCompletion,
     describeStoryApiError,
@@ -29,7 +31,7 @@ import {
     getPendingStoryRetryInput,
     isProtectedStoryPrompt,
     isStoryUserLastCompatibilityError,
-    memoryTimestampForCharacter,
+    storyTimelineTimestampForCharacter,
     parseStoryDisplayBlocks,
     parseStoryMiniTheater,
     parseStoryTheaterPreset,
@@ -105,15 +107,18 @@ describe('多人剧情记忆的人称与归属', () => {
 
     it('近期原文显式标出记忆中的你，不把 user 行伪装成当前面具', () => {
         const actor = { id: 'lin', name: '林星' } as CharacterProfile;
+        const ts = new Date('2026-11-03T11:22:33Z').getTime();
         const messages = [
-            { id: 1, charId: 'lin', role: 'user', type: 'text', content: '把伞递给他。', timestamp: 1 },
-            { id: 2, charId: 'lin', role: 'assistant', type: 'text', content: '我接住了。', timestamp: 2 },
+            { id: 1, charId: 'lin', role: 'user', type: 'text', content: '把伞递给他。', timestamp: ts },
+            { id: 2, charId: 'lin', role: 'assistant', type: 'text', content: '<scene_header><time>2026年3月14日 · 星期六 · 23:40</time></scene_header>我接住了。', timestamp: ts },
         ] as Message[];
 
         const result = formatActorRecentMessages(actor, messages, '条条', 'Noir');
         expect(result).toContain('林星 最近携带的专属原文上下文');
-        expect(result).toContain('记忆中的你（条条）：把伞递给他。');
-        expect(result).toContain('林星：我接住了。');
+        expect(result).toContain('- 记忆中的你（条条）：把伞递给他。');
+        expect(result).toContain('- 林星：我接住了。');
+        expect(result).not.toContain('2026');
+        expect(result).not.toContain('<scene_header>');
         expect(result).toContain('不得把下列“记忆中的你”重新解释成当前身份');
     });
 
@@ -371,6 +376,15 @@ describe('剧情预设发送器', () => {
 });
 
 describe('剧情沙盒辅助逻辑', () => {
+    it('allows an existing character mask to start a solo fictional story, but rejects empty or missing participants', () => {
+        const entry = { ...createStoryTheaterDraft(), writesToCharacterMemory: false, characterIds: [], mask: { type: 'character' as const, id: 'solo' } };
+        const characters = [{ id: 'solo', name: '独白角色' }] as CharacterProfile[];
+        expect(hasStoryTheaterParticipant(entry, characters)).toBe(true);
+        expect(hasStoryTheaterParticipant(entry, [])).toBe(false);
+        expect(hasStoryTheaterParticipant({ ...entry, mask: { type: 'user' } }, characters)).toBe(false);
+        expect(hasStoryTheaterParticipant({ ...entry, writesToCharacterMemory: true }, characters)).toBe(false);
+        expect(hasStoryTheaterParticipant({ ...entry, mask: { type: 'user' }, characterIds: ['solo'] }, characters)).toBe(true);
+    });
     it('新虚构剧场默认不读取记忆，真实陪伴强制摘下面具', () => {
         expect(createStoryTheaterDraft(1)).toMatchObject({ openingMode: 'user', writesToCharacterMemory: false, carryCharacterMemory: false, forceUserLastMessage: false, omitSamplingParams: false });
         const normalized = normalizeStoryTheater({
@@ -384,6 +398,12 @@ describe('剧情沙盒辅助逻辑', () => {
         expect(normalized.omitSamplingParams).toBe(false);
         expect(normalized.mask).toEqual({ type: 'user' });
         expect(normalized.carryCharacterMemory).toBe(true);
+        const legacyFictional = normalizeStoryTheater({
+            ...createStoryTheaterDraft(1),
+            writesToCharacterMemory: false,
+            carryCharacterMemory: undefined as unknown as boolean,
+        });
+        expect(legacyFictional.carryCharacterMemory).toBe(false);
         expect(REAL_COMPANION_MEMORY_GUARD).toContain('不得捏造两人曾经发生过的经历');
         expect(REAL_COMPANION_MEMORY_GUARD).toContain('不得添油加醋');
     });
@@ -412,7 +432,7 @@ describe('剧情沙盒辅助逻辑', () => {
     it('用当前轮输入立即触发关键词世界书，并保持最多二十条扫描窗口', () => {
         const history = Array.from({ length: 25 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `旧消息 ${index}` }));
         const scanMessages = buildStoryWorldbookScanMessages(history, '我现在肘击他');
-        const slots = buildTheaterWorldbookSlots([{
+        const payload = ContextBuilder.buildWorldbookRequest({ books: [{
             id: 'elbow',
             title: '肘击规则',
             content: '触发成功',
@@ -420,16 +440,18 @@ describe('剧情沙盒辅助逻辑', () => {
             key: ['肘击'],
             constant: false,
             position: 1,
-        }], scanMessages, '条条', ['苏利']);
+        }], history: scanMessages.map(message => ({ role: message.role || 'user', content: message.content })), userName: '条条', charName: '苏利',
+            render: slots => [{ role: 'system', content: slots.before + slots.after }],
+        });
 
         expect(scanMessages).toHaveLength(20);
         expect(scanMessages.at(-1)).toEqual({ role: 'user', content: '我现在肘击他' });
-        expect(slots.worldAfter).toContain('触发成功');
+        expect(JSON.stringify(payload)).toContain('触发成功');
     });
 
     it('把同一正文映射到每位角色自己的时间锚点', () => {
         const createdAt = new Date('2026-08-01T10:00:00Z').getTime();
-        const output = memoryTimestampForCharacter({
+        const output = storyTimelineTimestampForCharacter({
             id: 's', title: 't', premise: '', characterIds: ['a'], writesToCharacterMemory: true,
             characterMemoryDates: { a: '2020-01-02T03:04' }, carryCharacterMemory: true,
             characterContextLimits: {}, archiveAfter: 40, archiveStrategy: 'summary', archives: [],
@@ -651,6 +673,9 @@ describe('本轮关系备注', () => {
         expect(guard).toContain('生成回复的一方不属于故事人物');
         expect(guard).toContain('旁白中的“你／你的”必须改掉');
         expect(guard).toContain('角色对白里对「条条」说“你”是正常称呼');
+        expect(guard).toContain('剧场时间线锚点');
+        expect(guard).toContain('推进剧情到X天后');
+        expect(guard).toContain('不得覆盖本剧场的时间线');
     });
 
     it('已察觉要求角色在当幕自然反应，未察觉只保留氛围', () => {
@@ -669,5 +694,36 @@ describe('本轮关系备注', () => {
         expect(RELATIONSHIP_TEXTURE_GUIDE).toContain('95—100');
         expect(RELATIONSHIP_TEXTURE_GUIDE).toContain('<relation_fragment>');
         expect(RELATIONSHIP_TEXTURE_GUIDE).toContain('不写散乱 Markdown');
+    });
+
+    it('绝对关系值由前端按上一轮加减 delta，纠正模型把 41 - 1 算成 42', () => {
+        const previous = '<affinity_panel><affinity_person><character_id>lin</character_id><character_name>林星</character_name><c_to_u_score>60</c_to_u_score><u_to_c_score>41</u_to_c_score></affinity_person></affinity_panel>';
+        const generated = '<affinity_panel><affinity_person><character_id>lin</character_id><character_name>林星</character_name><c_to_u_score>64</c_to_u_score><c_to_u_delta>+2</c_to_u_delta><u_to_c_score>42</u_to_c_score><u_to_c_delta>-1</u_to_c_delta></affinity_person></affinity_panel>';
+        const reconciled = reconcileStoryAffinityScores(
+            generated,
+            previous,
+            [{ characterId: 'lin', characterName: '林星', delta: -1, reason: '有些失望' }],
+            [{ id: 'lin', name: '林星' }],
+        );
+        expect(reconciled).toContain('<c_to_u_score>62</c_to_u_score>');
+        expect(reconciled).toContain('<u_to_c_score>40</u_to_c_score>');
+        expect(reconciled).toContain('<u_to_c_delta>-1</u_to_c_delta>');
+        expect(reconciled).not.toContain('<u_to_c_score>42</u_to_c_score>');
+    });
+
+    it('多人关系分别复算，未填写的角色保持上一轮 U→C', () => {
+        const previous = '<affinity_panel><affinity_person><character_id>a</character_id><character_name>A</character_name><c_to_u_score>50</c_to_u_score><u_to_c_score>31</u_to_c_score></affinity_person><affinity_person><character_id>b</character_id><character_name>B</character_name><c_to_u_score>70</c_to_u_score><u_to_c_score>80</u_to_c_score></affinity_person></affinity_panel>';
+        const generated = '<affinity_panel><affinity_person><character_id>a</character_id><character_name>A</character_name><c_to_u_score>49</c_to_u_score><c_to_u_delta>-2</c_to_u_delta><u_to_c_score>34</u_to_c_score><u_to_c_delta>+3</u_to_c_delta></affinity_person><affinity_person><character_id>b</character_id><character_name>B</character_name><c_to_u_score>72</c_to_u_score><c_to_u_delta>+1</c_to_u_delta><u_to_c_score>79</u_to_c_score><u_to_c_delta>-1</u_to_c_delta></affinity_person></affinity_panel>';
+        const reconciled = reconcileStoryAffinityScores(
+            generated,
+            previous,
+            [{ characterId: 'a', characterName: 'A', delta: 3, reason: '更信任了' }],
+            [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }],
+        );
+        expect(reconciled).toContain('<c_to_u_score>48</c_to_u_score>');
+        expect(reconciled).toContain('<u_to_c_score>34</u_to_c_score>');
+        expect(reconciled).toContain('<c_to_u_score>71</c_to_u_score>');
+        expect(reconciled).toContain('<u_to_c_score>80</u_to_c_score>');
+        expect(reconciled).toContain('<u_to_c_delta>+0</u_to_c_delta>');
     });
 });

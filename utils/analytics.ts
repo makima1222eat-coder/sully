@@ -236,6 +236,30 @@ export function trackEvent(
  */
 const reportedScales = new Set<string>();
 
+/** 每次冷启动只选一组，新增 SAR 槽位也参与同一次选择。 */
+const SNAPSHOT_SLOTS = ['data-scale', 'appearance', 'char-settings', 'features', 'sar'] as const;
+export type SnapshotSlot = (typeof SNAPSHOT_SLOTS)[number];
+
+/**
+ * 五组快照随机选一组：数据规模最多 8、外观 36、角色设置 36、功能 33、SAR 10 个属性。
+ * 每次平均约 24 行，避免加宽已有功能事件；未选中的组也不读取数据。
+ * 轮转与上报标记只留在内存，不在用户设备保存统计账本。样本量足够时各组均匀出现；
+ * 跨组关联仍需要同一 session 多次冷启动，不把多组重新合成一条事件。
+ */
+const activeSnapshotSlot: SnapshotSlot =
+  SNAPSHOT_SLOTS[Math.floor(Math.random() * SNAPSHOT_SLOTS.length)];
+
+/**
+ * 这次冷启动轮到的是不是这一组。
+ *
+ * 取数那侧（analyticsSnapshot 的几个 collector，其中两个要读 IndexedDB）也该先问一句
+ * 再动手，没轮到就别白跑。上报函数内部还会再问一次，两处都判不是重复——取数点漏了
+ * 只是白费一次 CPU，上报点漏了就是白发一条事件。
+ */
+export function shouldReportSnapshot(slot: SnapshotSlot): boolean {
+  return activeSnapshotSlot === slot;
+}
+
 /** 记忆条数档位。区间与公告一致。 */
 export function bucketMemoryCount(count: number): string {
   if (count <= 0) return '0';
@@ -331,6 +355,7 @@ export function trackDataScaleOnce(params: {
   persistedStorage: boolean | null;
   standalone: boolean;
 }): void {
+  if (!shouldReportSnapshot('data-scale')) return;
   if (reportedScales.has('data-scale')) return;
   reportedScales.add('data-scale');
   trackEvent('数据规模', {
@@ -363,6 +388,7 @@ export function trackDataScaleOnce(params: {
  * 所有取值都必须是内置预设的 id。用户自己捏的一律传 'custom'，绝不能传他起的名字。
  */
 export function trackCurrentAppearanceOnce(params: Record<string, string>): void {
+  if (!shouldReportSnapshot('appearance')) return;
   if (reportedScales.has('appearance')) return;
   reportedScales.add('appearance');
   trackEvent('当前外观', params);
@@ -403,6 +429,7 @@ export function anyCharToggle(values: Array<boolean | undefined>, defaultOn: boo
 
 /** 每次会话最多一次，报当前活跃角色的选择 + 全部角色的开关汇总。 */
 export function trackCurrentCharSettingsOnce(params: Record<string, string>): void {
+  if (!shouldReportSnapshot('char-settings')) return;
   if (reportedScales.has('char-settings')) return;
   reportedScales.add('char-settings');
   trackEvent('当前角色设置', params);
@@ -419,9 +446,18 @@ export function trackCurrentCharSettingsOnce(params: Record<string, string>): vo
  * 账号名、服务器名一个字都不进这里。
  */
 export function trackCurrentFeaturesOnce(params: Record<string, string>): void {
+  if (!shouldReportSnapshot('features')) return;
   if (reportedScales.has('features')) return;
   reportedScales.add('features');
   trackEvent('当前功能启用', params);
+}
+
+/** SAR / 私聊输入 / 周年赠礼，与其他快照互斥，每会话最多一次。 */
+export function trackCurrentSARFeaturesOnce(params: Record<string, string>): void {
+  if (!shouldReportSnapshot('sar')) return;
+  if (reportedScales.has('sar')) return;
+  reportedScales.add('sar');
+  trackEvent('当前SAR与聊天输入', params);
 }
 
 // ===== 本次会话聊了多少 =====

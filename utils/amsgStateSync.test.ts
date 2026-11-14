@@ -15,6 +15,7 @@ vi.mock('./activeMsgClient', () => ({
     clearClientState: vi.fn().mockResolvedValue({ deleted: 0, toolConfigRestored: true }),
     registerPushSubscription: vi.fn().mockResolvedValue(undefined),
     deleteRemotePushSubscription: vi.fn().mockResolvedValue(undefined),
+    refreshApiCredentialsForPendingTasks: vi.fn().mockResolvedValue({ status: 'ok', updated: 0, failed: 0 }),
     putLlmCredentials: vi.fn().mockResolvedValue(0),
     deleteLlmCredentials: vi.fn().mockResolvedValue(0),
   },
@@ -33,12 +34,14 @@ vi.mock('./activeMsgStore', () => ({
 }));
 
 import {
+  discardAmsgPendingState,
   FLUSH_DEBOUNCE_MS,
   AMSG2_PENDING_SYNC_LS_KEY,
   AMSG2_PENDING_CRED_SYNC_LS_KEY,
   AMSG2_PENDING_TOOL_CONFIG_LS_KEY,
   cancelAllRemoteAmsgTasks,
   wipeAmsgCloudData,
+  wipeAmsgCloudDataForReset,
   flushAmsgState,
   isWorkerUrlCleared,
   markAmsgStateDirty,
@@ -99,6 +102,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   localStorage.removeItem(AMSG2_PENDING_SYNC_LS_KEY);
   localStorage.removeItem(AMSG2_PENDING_TOOL_CONFIG_LS_KEY);
+  localStorage.removeItem('amsg2_pending_tool_config_version');
   localStorage.removeItem(AMSG2_PENDING_CRED_SYNC_LS_KEY);
   localStorage.removeItem(AMSG_INSTANT_CHAT_PENDING_LS_KEY);
   forgetAllCredIds();
@@ -116,6 +120,7 @@ beforeEach(() => {
   (ActiveMsgClient.registerPushSubscription as any).mockResolvedValue(undefined);
   (ActiveMsgClient.deleteRemotePushSubscription as any).mockReset();
   (ActiveMsgClient.deleteRemotePushSubscription as any).mockResolvedValue(undefined);
+  vi.mocked(ActiveMsgClient.refreshApiCredentialsForPendingTasks).mockReset().mockResolvedValue({ status: 'ok', updated: 0, failed: 0 });
   (ActiveMsgClient.putLlmCredentials as any).mockReset();
   (ActiveMsgClient.putLlmCredentials as any).mockResolvedValue(0);
   (ActiveMsgClient.deleteLlmCredentials as any).mockReset();
@@ -490,7 +495,7 @@ describe('工具凭据（tool_config）的重试与底账', () => {
     await vi.advanceTimersByTimeAsync(1);
 
     expect(ActiveMsgClient.syncToolConfig).toHaveBeenCalledTimes(1);
-    expect(ActiveMsgClient.syncToolConfig).toHaveBeenCalledWith(config);
+    expect(ActiveMsgClient.syncToolConfig).toHaveBeenCalledWith(config, expect.objectContaining({ updatedAt: expect.any(Number) }));
     expect(readMark()).toBeNull();
   });
 
@@ -539,7 +544,7 @@ describe('工具凭据（tool_config）的重试与底账', () => {
     await vi.advanceTimersByTimeAsync(1);
 
     expect(ActiveMsgClient.syncToolConfig).toHaveBeenCalledTimes(1);
-    expect(ActiveMsgClient.syncToolConfig).toHaveBeenCalledWith(config);
+    expect(ActiveMsgClient.syncToolConfig).toHaveBeenCalledWith(config, expect.objectContaining({ updatedAt: expect.any(Number) }));
     expect(readMark()).toBeNull();
   });
 
@@ -555,10 +560,8 @@ describe('工具凭据（tool_config）的重试与底账', () => {
     release();
     await vi.advanceTimersByTimeAsync(1);
 
-    expect(readMark()).toBe('1');       // 新的那份还欠着
-    await flushAmsgState('test');
-    await vi.advanceTimersByTimeAsync(1);
-    expect(ActiveMsgClient.syncToolConfig).toHaveBeenLastCalledWith(newer);
+    expect(ActiveMsgClient.syncToolConfig).toHaveBeenCalledTimes(2);
+    expect(ActiveMsgClient.syncToolConfig).toHaveBeenLastCalledWith(newer, expect.objectContaining({ updatedAt: expect.any(Number) }));
     expect(readMark()).toBeNull();
   });
 });
@@ -698,6 +701,77 @@ describe('清空云端数据', () => {
   });
 });
 
+describe('重置全部数据的云端收尾', () => {
+  // 这一组守的是「重置之后云端不会继续跑」。删库把 worker 地址一起带走了，本地再没有
+  // 任何东西够得着那台 worker，所以云端这一步必须排在删库之前、而且结果要如实回报。
+  it('没配过 worker 时一个请求都不发', async () => {
+    (ActiveMsgStore.getGlobalConfig as any).mockResolvedValue({ workerUrl: '' });
+
+    const result = await wipeAmsgCloudDataForReset();
+
+    expect(result).toEqual({ status: 'skipped' });
+    expect(ActiveMsgClient.listAllTasks).not.toHaveBeenCalled();
+    expect(ActiveMsgClient.clearClientState).not.toHaveBeenCalled();
+  });
+
+  it('清干净了回 cleared，而且不补传工具凭据、不重新登记推送', async () => {
+    (ActiveMsgClient.listAllTasks as any).mockResolvedValue([{ uuid: 'u-1' }]);
+    (ActiveMsgClient.clearClientState as any).mockResolvedValue({ deleted: 4, toolConfigRestored: false });
+
+    const result = await wipeAmsgCloudDataForReset();
+
+    expect(result).toEqual({ status: 'cleared' });
+    // 本地紧接着就要删库，补上去的凭据谁也不会再读，登记的推送也没人接得住。
+    expect(ActiveMsgClient.clearClientState).toHaveBeenCalledWith(undefined, { restoreToolConfig: false });
+    expect(ActiveMsgClient.registerPushSubscription).not.toHaveBeenCalled();
+    expect(ActiveMsgClient.deleteRemotePushSubscription).toHaveBeenCalledTimes(1);
+  });
+
+  it('任务清单读不出来算没清干净，把 worker 地址带回去给用户', async () => {
+    (ActiveMsgClient.listAllTasks as any).mockRejectedValue(new Error('decryption failed'));
+
+    const result = await wipeAmsgCloudDataForReset();
+
+    expect(result.status).toBe('failed');
+    if (result.status !== 'failed') throw new Error('unreachable');
+    expect(result.workerUrl).toBe('https://amsg.example.dev');
+    expect(result.detail).toContain('任务清单');
+  });
+
+  it('有任务取消失败也算没清干净（它们会继续到点烧 API 额度）', async () => {
+    (ActiveMsgClient.listAllTasks as any).mockResolvedValue([{ uuid: 'u-1' }, { uuid: 'u-2' }]);
+    (ActiveMsgClient.cancelTask as any)
+      .mockResolvedValueOnce({ uuid: 'u-1', alreadyGone: false })
+      .mockRejectedValueOnce(new Error('offline'));
+
+    const result = await wipeAmsgCloudDataForReset();
+
+    expect(result.status).toBe('failed');
+    if (result.status !== 'failed') throw new Error('unreachable');
+    expect(result.detail).toContain('1 个定时任务');
+  });
+
+  it('角色上下文清不掉算没清干净（那是聊天原文）', async () => {
+    (ActiveMsgClient.clearClientState as any).mockRejectedValue(new Error('boom'));
+
+    const result = await wipeAmsgCloudDataForReset();
+
+    expect(result.status).toBe('failed');
+    if (result.status !== 'failed') throw new Error('unreachable');
+    expect(result.detail).toContain('角色上下文');
+  });
+
+  // 老 worker 上压根没有凭据表，这一步注定失败。拿它当判据会把一批根本没东西可清的人
+  // 堵在重置门口，所以它只记一笔、不拦着重置。
+  it('凭据行删不掉不算没清干净', async () => {
+    (ActiveMsgClient.deleteLlmCredentials as any).mockRejectedValue(new Error('NOT_FOUND'));
+
+    const result = await wipeAmsgCloudDataForReset();
+
+    expect(result).toEqual({ status: 'cleared' });
+  });
+});
+
 // 云端那张凭据表和 tool_config 处境一样：只在保存配置那一刻传一次，丢了没人补。
 // 而它丢了的后果更硬——已排程的任务到点还在用旧 Key，用户只看到「主动消息不来了」。
 describe('LLM 凭据行的后台重传', () => {
@@ -749,6 +823,25 @@ describe('LLM 凭据行的后台重传', () => {
     expect(localStorage.getItem(AMSG2_PENDING_CRED_SYNC_LS_KEY), '传上去了就该销账').toBeNull();
   });
 
+  it('全局换 Key 时角色独立凭据不变，恢复跟随后才更新为全局', async () => {
+    vi.mocked(isLlmCredentialsReady).mockResolvedValue(true);
+    const roleApi = { baseUrl: 'https://role.example/v1', apiKey: 'role-key', model: 'role-model' };
+    vi.mocked(DB.getAllCharacters).mockResolvedValue([{ ...CHAR, dialogueApi: roleApi }] as any);
+    syncAmsgLlmCredentials(API);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ActiveMsgClient.putLlmCredentials).toHaveBeenLastCalledWith([{
+      credId: 'char:char-cred-sync/chat',
+      value: { apiUrl: roleApi.baseUrl + '/chat/completions', apiKey: roleApi.apiKey, primaryModel: roleApi.model },
+    }]);
+    vi.mocked(DB.getAllCharacters).mockResolvedValue([CHAR] as any);
+    syncAmsgLlmCredentials({ ...API });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ActiveMsgClient.putLlmCredentials).toHaveBeenLastCalledWith([{
+      credId: 'char:char-cred-sync/chat',
+      value: { apiUrl: API.baseUrl + '/chat/completions', apiKey: API.apiKey, primaryModel: API.model },
+    }]);
+  });
+
   it('这次保存没动 API → 值没变，不白发一次请求', async () => {
     (isLlmCredentialsReady as any).mockResolvedValue(true);
     rememberCredRows([buildCharChatCredRow(CHAR as any, CHAR.activeMsg2Config as any, API)!]);
@@ -774,6 +867,53 @@ describe('LLM 凭据行的后台重传', () => {
     expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledTimes(2);
   });
 
+  it('同步还在进行时再次切换 API，上一轮结束后立即同步最新配置', async () => {
+    let release!: () => void;
+    vi.mocked(ActiveMsgClient.refreshApiCredentialsForPendingTasks).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { status: 'ok', updated: 1, failed: 0 };
+    });
+    syncAmsgLlmCredentials(API);
+    await vi.advanceTimersByTimeAsync(0);
+    const nextApi = { ...API, apiKey: 'sk-next' };
+    syncAmsgLlmCredentials(nextApi);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ActiveMsgClient.refreshApiCredentialsForPendingTasks).toHaveBeenLastCalledWith(nextApi);
+    expect(localStorage.getItem(AMSG2_PENDING_CRED_SYNC_LS_KEY)).toBeNull();
+  });
+
+  it('旧任务只迁移成功一部分时保留欠账并重试，旧 Worker 也适用', async () => {
+    vi.mocked(ActiveMsgClient.refreshApiCredentialsForPendingTasks)
+      .mockResolvedValueOnce({ status: 'partial', updated: 1, failed: 1 })
+      .mockResolvedValue({ status: 'ok', updated: 2, failed: 0 });
+    syncAmsgLlmCredentials(API);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(localStorage.getItem(AMSG2_PENDING_CRED_SYNC_LS_KEY)).toBe('1');
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(ActiveMsgClient.refreshApiCredentialsForPendingTasks).toHaveBeenCalledTimes(2);
+    expect(localStorage.getItem(AMSG2_PENDING_CRED_SYNC_LS_KEY)).toBeNull();
+  });
+
+  it('恢复备份没有本地凭据底账时，也会为启用角色覆盖 chat 行', async () => {
+    vi.mocked(isLlmCredentialsReady).mockResolvedValue(true);
+    syncAmsgLlmCredentials(API);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledWith([{
+      credId: 'char:char-cred-sync/chat',
+      value: { apiUrl: 'https://api.example.dev/v1/chat/completions', apiKey: 'sk-new', primaryModel: 'gpt-x' },
+    }]);
+  });
+
+  it('升级启动没有欠账标记也会替换旧副 API，并刷新存量任务', async () => {
+    (isLlmCredentialsReady as any).mockResolvedValue(true);
+    primeLedgerWithOldKey();
+    resumePendingAmsgStateSync({ characters: [CHAR], userProfile: {} as any, groups: [], apiConfig: API });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledTimes(1);
+    expect(ActiveMsgClient.refreshApiCredentialsForPendingTasks).toHaveBeenCalledWith(API);
+  });
+
   it('启动补传：上次没传成的按底账重来一次（没给 apiConfig 就跳过这一项）', async () => {
     (isLlmCredentialsReady as any).mockResolvedValue(true);
     primeLedgerWithOldKey();
@@ -786,6 +926,52 @@ describe('LLM 凭据行的后台重传', () => {
     resumePendingAmsgStateSync({ characters: [], userProfile: {} as any, groups: [], apiConfig: API });
     await vi.advanceTimersByTimeAsync(0);
     expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledTimes(1);
+  });
+
+  it('某个角色在云端已停用 → 其余角色照常更新，不无限重试，并点名停用的角色', async () => {
+    vi.mocked(isLlmCredentialsReady).mockResolvedValue(true);
+    const RETIRED = { ...CHAR, id: 'char-retired', name: '小明' } as any as CharacterProfile;
+    vi.mocked(DB.getAllCharacters).mockResolvedValue([CHAR, RETIRED] as any);
+    const retiredError = () => Object.assign(new Error('CLOUD_OWNER_RETIRED'), { code: 'CLOUD_OWNER_RETIRED' });
+    // 服务端整批一个事务：混着停用角色的整批会被拒，单传停用角色也被拒。
+    vi.mocked(ActiveMsgClient.putLlmCredentials).mockImplementation(async (rows) => {
+      if (rows.some((row) => row.credId.startsWith('char:char-retired/'))) throw retiredError();
+      return rows.length;
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // 这个文件跑在 node 环境，没有 window；临时塞一个事件目标接住对账事件。
+    const onConflict = vi.fn();
+    const fakeWindow = new EventTarget();
+    fakeWindow.addEventListener('amsg2-owner-conflict', onConflict);
+    (globalThis as any).window = fakeWindow;
+
+    try {
+      syncAmsgLlmCredentials(API);
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      delete (globalThis as any).window;
+    }
+
+    expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledWith([
+      expect.objectContaining({ credId: 'char:char-cred-sync/chat' }),
+    ]);
+    expect(localStorage.getItem(AMSG2_PENDING_CRED_SYNC_LS_KEY), '重试也过不去，不该留欠账').toBeNull();
+    expect(warn.mock.calls.flat().join(' ')).toContain('小明（char-retired）');
+    expect(onConflict, '要叫对账弹窗出来问用户').toHaveBeenCalledTimes(1);
+    const calls = vi.mocked(ActiveMsgClient.putLlmCredentials).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledTimes(calls);
+  });
+
+  it('不是停用导致的失败 → 照旧整体退避重试，不拆开', async () => {
+    vi.mocked(isLlmCredentialsReady).mockResolvedValue(true);
+    primeLedgerWithOldKey();
+    vi.mocked(ActiveMsgClient.putLlmCredentials).mockRejectedValue(Object.assign(new Error('boom'), { code: 'INTERNAL_ERROR' }));
+
+    syncAmsgLlmCredentials(API);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem(AMSG2_PENDING_CRED_SYNC_LS_KEY)).toBe('1');
   });
 });
 
@@ -814,4 +1000,40 @@ describe('活跃会话租约', () => {
     expect(ActiveMsgClient.syncChatPresence).toHaveBeenCalledTimes(3);
     stopAmsgChatPresence(charId);
   });
+
+  // 从聊天点进见面时，聊天那轮回复可能晚于进见面才结束：它的 stop 不能把见面的心跳停掉。
+  it('见面中的租约标着 date，聊天那边的 stop 停不掉它', async () => {
+    const charId = nextCharId();
+    startAmsgChatPresence(charId, Date.now()); // 聊天那轮回复还在等
+    startAmsgChatPresence(charId, null, 'date'); // 进了见面
+    expect(vi.mocked(ActiveMsgClient.syncChatPresence).mock.calls.at(-1)?.[1]).toMatchObject({ scene: 'date' });
+
+    stopAmsgChatPresence(charId); // 聊天那轮回复结束
+    await vi.advanceTimersByTimeAsync(CHAT_PRESENCE_HEARTBEAT_MS + 100);
+    expect(ActiveMsgClient.syncChatPresence).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(ActiveMsgClient.syncChatPresence).mock.calls.at(-1)?.[1]).toMatchObject({ scene: 'date' });
+
+    stopAmsgChatPresence(charId, 'date'); // 离开见面
+    await vi.advanceTimersByTimeAsync(CHAT_PRESENCE_HEARTBEAT_MS * 3);
+    expect(ActiveMsgClient.syncChatPresence).toHaveBeenCalledTimes(3);
+  });
+});
+
+
+it('停用或恢复角色时丢弃旧重试快照，飞行请求失败也不能重新入队', async () => {
+  const character = charWithAiTask(nextCharId());
+  let rejectUpload!: (error: Error) => void;
+  vi.mocked(ActiveMsgClient.syncCharFirePacks).mockImplementationOnce(() => new Promise((_, reject) => { rejectUpload = reject; }));
+  markAmsgStateDirty(snapshotOf(character));
+  const flushing = flushAmsgState('before-retirement');
+  await vi.advanceTimersByTimeAsync(1);
+  discardAmsgPendingState(character.id);
+  rejectUpload(new Error('旧请求被云端拒绝'));
+  await flushing;
+  await vi.advanceTimersByTimeAsync(IDLE_WINDOW_MS);
+  expect(ActiveMsgClient.syncCharFirePacks).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(localStorage.getItem(AMSG2_PENDING_SYNC_LS_KEY) || '[]')).not.toContain(character.id);
+  markAmsgStateDirty(snapshotOf(character));
+  await flushAmsgState('new-user-change');
+  expect(ActiveMsgClient.syncCharFirePacks).toHaveBeenCalledTimes(2);
 });

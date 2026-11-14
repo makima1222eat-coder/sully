@@ -18,7 +18,7 @@ const profile = (overrides: Partial<NonNullable<CharacterProfile['voiceProfile']
 });
 
 describe('MiniMax parameter versions', () => {
-  it('keeps missing versions on the exact legacy request path', () => {
+  it('keeps legacy acoustic settings while requesting inline audio', () => {
     const vp = profile();
     const payload = buildMiniMaxTtsPayload('你好，回来啦。', vp, { languageBoost: 'ja' });
 
@@ -29,7 +29,8 @@ describe('MiniMax parameter versions', () => {
     expect(payload.voice_setting.english_normalization).toBe(true);
     expect(payload.language_boost).toBe('ja');
     expect(payload.audio_setting).toEqual({ format: 'mp3' });
-    expect(payload.output_format).toBeUndefined();
+    expect(payload.output_format).toBe('hex');
+    expect(payload.stream).toBe(false);
     expect(payload.voice_modify.intensity).not.toBe(60);
   });
 
@@ -46,7 +47,7 @@ describe('MiniMax parameter versions', () => {
     expect(payload.text).toBe('你好，回来啦。');
     expect(payload.text).not.toContain('<#');
     expect(payload.stream).toBe(false);
-    expect(payload.output_format).toBe('url');
+    expect(payload.output_format).toBe('hex');
     expect(payload.audio_setting).toEqual({ format: 'mp3', sample_rate: 32000, bitrate: 128000, channel: 1 });
     expect(payload.language_boost).toBe('Japanese');
     expect(payload.voice_setting).toMatchObject({ speed: 1.8, pitch: 11, emotion: 'calm' });
@@ -62,10 +63,23 @@ describe('MiniMax parameter versions', () => {
     expect(payload.voice_setting.emotion).toBe('happy');
   });
 
+  it('requests inline audio for legacy calls without changing the audio settings', () => {
+    const payload = buildMiniMaxTtsPayload('你好', profile(), { legacyTransport: 'call' });
+    expect(payload.output_format).toBe('hex');
+    expect(payload.stream).toBe(false);
+    expect(payload.audio_setting).toEqual({ format: 'mp3', sample_rate: 32000, bitrate: 128000, channel: 1 });
+  });
+
   it('maps project language codes to official MiniMax values', () => {
     expect(normalizeMiniMaxLanguageBoost('en')).toBe('English');
     expect(normalizeMiniMaxLanguageBoost('ko')).toBe('Korean');
+    expect(normalizeMiniMaxLanguageBoost('yue')).toBe('Chinese,Yue');
     expect(normalizeMiniMaxLanguageBoost('French')).toBe('French');
+  });
+
+  it('uses the official Cantonese enum on both parameter versions', () => {
+    expect(buildMiniMaxTtsPayload('今日去饮茶。', profile(), { languageBoost: 'yue' }).language_boost).toBe('Chinese,Yue');
+    expect(buildMiniMaxTtsPayload('今日去饮茶。', profile({ minimaxParamVersion: 'natural-v2' }), { languageBoost: 'yue' }).language_boost).toBe('Chinese,Yue');
   });
 
   it('separates natural-v2 audio from legacy cache entries', () => {

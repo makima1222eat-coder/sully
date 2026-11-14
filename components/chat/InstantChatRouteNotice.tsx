@@ -5,9 +5,11 @@
  * console 和观察窗里，用户查不到。他能看到的只有本地直连失败时那条读不懂的网络报错，
  * 于是以为是自己网络坏了。线上真实故障里，有人就这么卡了四个小时。
  *
- * 只报两档，都是「用户想上云、实际没上」的情形：
- *   worker-outdated     问到了，那台 Worker 确实跑不动 → 指路去更新
- *   worker-unreachable  这一刻够不着云端 → 别叫人去更新，多半是网络，会自己好
+ * 只报四档，都是「用户想上云、实际没上」的情形：
+ *   worker-outdated              问到了，那台 Worker 确实跑不动 → 指路去更新
+ *   worker-unreachable           这一刻够不着云端 → 别叫人去更新，多半是网络，会自己好
+ *   sar-module-worker-outdated   SAR 模块生效中，那台 Worker 是旧 bundle、拆不了模块回复的信封 → 指路去更新
+ *   sar-module-worker-unverified SAR 模块生效中，这一刻没问到 Worker 版本 → 探到就会自己回去
  *
  * 用户自己关掉的（disabled / char-disabled）、点单流程那种本该留在本地的，一律不出声——
  * 那些是正常行为，报了就成骚扰。
@@ -18,11 +20,19 @@ import { AMSG_INSTANT_CHAT_ROUTE_EVENT, type InstantChatRouteDetail } from '../.
 const NOTICES: Record<string, { title: string; hint: string }> = {
     'worker-outdated': {
         title: '这一轮在本地生成',
-        hint: '云端那台 Worker 跑不动这条路，去设置里更新一下',
+        hint: '云端 Worker 版本较旧，暂不支持即时对话，请去设置里更新一下',
     },
     'worker-unreachable': {
         title: '这一轮在本地生成',
-        hint: '一时连不上云端，网络恢复后会自己回去',
+        hint: '一时连不上云端，网络恢复后会自动恢复',
+    },
+    'sar-module-worker-outdated': {
+        title: '这一轮在本地生成',
+        hint: 'SAR 模块生效中，云端那台 Worker 还是旧版本，去设置里更新一下',
+    },
+    'sar-module-worker-unverified': {
+        title: '这一轮在本地生成',
+        hint: 'SAR 模块生效中，正在确认云端 Worker 版本，确认后会自动恢复',
     },
 };
 

@@ -1,3 +1,7 @@
+import { loadChatInputPreferences } from './chatInputPreferences';
+import { readSARClubState, sarRoomView } from './vrWorld/sarClub';
+import { ANNIVERSARY_SEEN_KEY } from './anniversaryGifts';
+import { readFishingMarketState } from './vrWorld/fishingMarket';
 /**
  * 使用统计 · 会话级快照的收集层。
  *
@@ -36,15 +40,20 @@ import { isStandaloneDisplayMode } from './iosStandalone';
 import { loadMcpServers, getMcpUseNativeTools } from './mcpClient';
 import { getLuckinToken, isLuckinEnabled } from './luckinMcpClient';
 import { getMcdToken, isMcdEnabled } from './mcdMcpClient';
-import { loadInstantConfig } from './instantPushClient';
-import { isPushVapidReady } from './pushVapid';
 import { getPendingTasks, isAmsg2EnabledForChar } from './amsg2Tasks';
-import { ActiveMsgStore } from './activeMsgStore';
+import { ActiveMsgStore, isInstantChatSwitchedOn } from './activeMsgStore';
 import { getVRApi } from './vrWorld/vrApi';
 import { isBuiltinSullyLive2D } from './builtinSullyLive2D';
+import { loadUserLocationConfig } from './userLocationPrivacy';
 
 /** 布尔开关转「开 / 关」，带默认值。 */
 const onOff = (v: boolean | undefined, dflt = false) => ((v ?? dflt) ? '开' : '关');
+
+/** Only the saved switch. Never locate, or report a Key, region or provider response. */
+function realLocationEnabled(): string {
+    try { return onOff(loadUserLocationConfig().enabled); }
+    catch { return '读取失败'; }
+}
 
 /**
  * 收集数据规模。全部是数出来的计数，没有一项来自内容本身——
@@ -94,7 +103,9 @@ export function collectAppearance(
 ): Record<string, string> {
     return {
         // ── 桌面 ──
-        桌面皮肤: theme.skin ?? 'default',
+        桌面皮肤: presetOrCustom(theme.skin ?? 'default', ['default','animalcrossing','mobilegame','tamagotchi','companion','homely']),
+        居家配色: theme.skin === 'homely' ? presetOrCustom(theme.homelyPalette ?? 'apricot', ['apricot','blue','rose','lilac','oat']) : '未使用',
+        居家锁定角色: theme.skin === 'homely' ? onOff(!!theme.homelyLockedCharacterId) : '未使用',
         桌面版本: theme.desktopVariant ?? 'paper',
         深色模式: onOff(theme.darkMode),
         隐藏状态栏: onOff(theme.hideStatusBar),
@@ -126,7 +137,6 @@ export function collectAppearance(
         表情尺寸: theme.chatEmojiSize ?? 'small',
         隐藏侧贴边: onOff(theme.chatSnapToEdge),
         // ── 开关 ──
-        准备中圆点: onOff(theme.chatPendingIndicator, true),
         隐藏情绪栏: onOff(theme.chatHideHeaderBuffs),
         // 白框自定义 CSS 是用户写的代码，只报用没用
         自定义白框CSS: theme.chatChromeCustomCss ? '用了' : '没用',
@@ -195,20 +205,26 @@ export function collectCharSettings(
     const now = Date.now();
     return {
         // ── 开关：默认关的，问有没有人开过 ──
+        '3D家园角色数': bucketFewCount(characters.filter(x => x.home3D?.rooms?.length).length),
         记忆宫殿: anyOn(x => x.memoryPalaceEnabled),
+        聊天显示备注: anyOn(x => x.chatShowRemark === true),
         自动归档: anyOn(x => x.autoArchiveEnabled),
         思考过程: anyOn(x => x.showThinkingChain),
         日程与情绪: anyOn(x => x.scheduleFeatureEnabled),
         HTML卡片: anyOn(x => x.htmlModeEnabled),
         角色级聊天装扮: anyOn(x => x.chatFineTune?.enabled),
+        日常聊天协同: anyOn(x => x.chatCollaborationEnabled),
         自定义时区: anyOn(x => x.customTimezoneEnabled),
         生活记录注入: anyOn(x => x.lifeRecordEnabled),
-        小红书: anyOn(x => x.xhsEnabled),
+        // 叫「角色小红书」而不是「小红书」：功能启用那条里已经有一个「小红书」，问的是
+        // 全局桥接配没配、开没开。同名不同义会在查询侧混成一个 key，两条事件的数字叠在
+        // 一起，谁也说不清看到的是哪个。角色级的加「角色」前缀，跟角色提示音一个路子。
+        角色小红书: anyOn(x => x.xhsEnabled),
         隐藏系统日志: anyOn(x => x.hideSystemLogs),
         见面轻阅读: anyOn(x => x.dateLightReading),
         观测协议: anyOn(x => x.dateObserve?.enabled),
         彼方自主登入: anyOn(x => x.vrState?.enabled),
-        提示音绑白框: anyOn(x => x.chatSoundBound),
+        离开后消息: anyOn(x => x.awayMessage?.enabled),
         // ── 开关：默认开的，问有没有人特意关掉 ──
         时间感知: anyOn(x => x.timeAwarenessEnabled, true),
         见面时间感知: anyOn(x => x.dateTimeAwarenessEnabled, true),
@@ -235,6 +251,14 @@ export function collectCharSettings(
         ),
         // 角色专属提示音同样只分「内置哪个 / 自己弄的」
         角色提示音: presetOrCustom(c.chatSound?.src, Object.keys(BUILTIN_SOUNDS), '没设'),
+        // 只问有没有角色选过粤语；不报角色名，也不拆成可关联的逐角色记录。
+        粤语语音: characters.some(x => [
+            x.chatVoiceLang,
+            x.dateVoiceLang,
+            x.callVoiceLang,
+            x.companionTouchSettings?.voiceLanguage,
+            x.companionTouchSettings?.startup?.voiceLanguage,
+        ].includes('yue')) ? '有人选' : '没人选',
 
         // ── 桌面陪伴与通话形象 ──
         // 「有多少人在用桌面陪伴」不在这里问：「当前外观」的桌面皮肤已经回答了
@@ -264,6 +288,11 @@ interface MemoryPalaceConfigShape {
     embedding?: { apiKey?: string };
     lightLLM?: { apiKey?: string };
     rerank?: { enabled?: boolean; apiKey?: string };
+    featureFlags?: {
+        recallRouter?: boolean;
+        interactionAdaptation?: boolean;
+        deepEngagement?: boolean;
+    };
 }
 
 /** 远程向量（记忆云端同步）配置里我们要看的字段。 */
@@ -360,6 +389,43 @@ function hasLocalJsonConfig(key: string): boolean {
     }
 }
 
+/** 存档内已完成 + 当前未完成的剧情去重；回顾不会增加数量，不收剧情 ID。 */
+function collectSARDialogueCounts(): Record<string, string> {
+    try {
+        const npcs = readFishingMarketState().sarFamiliarity?.npcs;
+        const count = (npc: 'caian' | 'aiven'): string => {
+            const progress = npcs?.[npc];
+            const ids = new Set(Object.keys(progress?.completed || {}));
+            if (progress?.pending?.sceneId) ids.add(progress.pending.sceneId);
+            const n = ids.size;
+            return n === 0 ? '0' : n <= 5 ? '1–5' : n <= 10 ? '6–10' : n <= 20 ? '11–20'
+                : n <= 30 ? '21–30' : n <= 40 ? '31–40' : '41+';
+        };
+        return { 凯恩已触发对话数: count('caian'), 艾文已触发对话数: count('aiven') };
+    } catch {
+        // 坏档或存储不可读不应变成「没玩过」，也不能阻断其他快照。
+        return { 凯恩已触发对话数: '读取失败', 艾文已触发对话数: '读取失败' };
+    }
+}
+
+/** SAR 发布功能单独参与冷启动轮转，不加宽原有功能快照。 */
+export function collectSARFeatureFlags(): Record<string, string> {
+    const input = loadChatInputPreferences();
+    const sar = readSARClubState();
+    return {
+        // ── SAR / 输入习惯 / 周年赠礼：只上报固定状态 ──
+        发送键生成: onOff(input.sendButtonGenerates),
+        回车发送: onOff(input.enterToSend),
+        自动回复: onOff(input.autoReply),
+        SAR角色: sar.npcPreference === 'show' ? '开' : sar.npcPreference === 'hide' ? '关' : '未选择',
+        SAR房间显示: sarRoomView(sar) === 'names-hidden' ? '隐藏名字' : sarRoomView(sar) === 'text-hidden' ? '隐藏文字' : sarRoomView(sar) === 'characters-hidden' ? '隐藏角色' : '全部显示',
+        SAR简易钓鱼: isLocalFlagOn('vr_fishing_simple_mode', 'true') ? '开' : '关',
+        SAR对话配色: isLocalFlagOn('vr_sar_session_theme_v1', 'dark') ? '深色' : '浅色',
+        周年赠礼已阅: isLocalFlagOn(ANNIVERSARY_SEEN_KEY, '1') ? '是' : '否',
+        ...collectSARDialogueCounts(),
+    };
+}
+
 /** OSContext 手上有、这里读不到的那部分状态。 */
 export interface FeatureSources {
     realtimeConfig: RealtimeConfig;
@@ -379,28 +445,37 @@ export interface FeatureSources {
      * Worker 地址和共享密钥本身不进上报。
      */
     amsg2Global: { workerUrl?: string; initializedAt?: number; instantChatEnabled?: boolean };
+    /** 协同 sidecar 只用 count() 取出的行数，不读取窗口标题、消息、文件名或 Blob。 */
+    collaborationUsage: { sessions: number; messages: number; assets: number };
 }
 
 /**
  * 把「现在开着哪些功能」收敛成一份可上报的枚举表。
  *
  * 纯函数 + 直接读 localStorage 两种来源都有：能同步读到的（MCP、点单、QQ 桥、
- * 自习室、推送）在这里自己读，OSContext 只需要传它 state 里那几份。
+ * 自习室）在这里自己读，OSContext 只需要传它 state 里那几份。
  */
 export function collectFeatureFlags(src: FeatureSources): Record<string, string> {
     const rt = src.realtimeConfig;
     const mcpServers = loadMcpServers();
-    const instant = loadInstantConfig();
     const luckinToken = getLuckinToken().length > 0;
     const mcdToken = getMcdToken().length > 0;
     // 「用起来了的角色」= 在面板里把开关打开过的（enabled:true 是用户表过态的真痕迹），
     // 与工具注入门同一个判定。
     const amsg2ActiveChars = src.characters.filter(isAmsg2EnabledForChar);
+    const contextFlags = src.memoryPalaceConfig.featureFlags;
+    const contextEnabledCount = [
+        contextFlags?.recallRouter,
+        contextFlags?.interactionAdaptation,
+        contextFlags?.deepEngagement,
+    ].filter(value => value === true).length;
 
     return {
         // ── 外部服务接入 ──
         // 天气和热点走免鉴权的公共源，没有「配了」这一态，只有开没开。
         天气: rt.weatherEnabled ? '开' : '关',
+        节假日感知: rt.userHolidays?.enabled && rt.userHolidays.countryCode ? '开' : '关',
+        真实定位: realLocationEnabled(),
         // 自备 key 的人走 OpenWeatherMap，留空走 Open-Meteo。只报有没有，不报 key。
         天气自备key: rt.weatherApiKey?.trim() ? '有' : '无',
         热点: rt.newsEnabled ? '开' : '关',
@@ -444,6 +519,16 @@ export function collectFeatureFlags(src: FeatureSources): Record<string, string>
             Boolean(src.remoteVectorConfig.supabaseUrl?.trim() && src.remoteVectorConfig.supabaseAnonKey?.trim()),
             Boolean(src.remoteVectorConfig.enabled),
         ),
+        智能语境: contextEnabledCount === 3 ? '全开' : contextEnabledCount > 0 ? '部分开' : '全关',
+
+        // ── 协同工作 ──
+        // 三个数字都来自 IndexedDB.count()，不会把窗口标题、对话正文或文件名读进统计层。
+        协同工作: src.collaborationUsage.sessions > 0 || src.collaborationUsage.messages > 0 || src.collaborationUsage.assets > 0
+            ? '用过'
+            : '没用过',
+        协同窗口数: bucketFewCount(src.collaborationUsage.sessions),
+        协同消息数: bucketFewCount(src.collaborationUsage.messages),
+        协同文件数: bucketFewCount(src.collaborationUsage.assets),
 
         // ── 模型线路 ──
         // 服务商是枚举，可以报；baseUrl / key / 模型名一律不报。
@@ -453,18 +538,6 @@ export function collectFeatureFlags(src: FeatureSources): Record<string, string>
         API线路预设数: bucketFewCount(src.apiPresetCount),
         自习室独立线路: hasLocalJsonConfig('study_api_config') ? '配了' : '没配',
         彼方独立线路: src.vrIndependentApi ? '配了' : '没配',
-
-        // ── 推送 ──
-        // Instant Push「配了」= 填了 worker 地址，「开」还要 VAPID 也齐（跟
-        // isInstantConfigReady 同口径），否则会把「填了地址但没生成密钥」误报成开着。
-        //
-        // 没报「主动消息 Push 加速」：那一层已经全局下线（proactivePushConfig.ts 的
-        // FORCE_DISABLED，设置面板也藏了），loadPushConfig() 恒返回 enabled=false。
-        // 报出来只会是一片「关」，看着像没人用，其实是被下掉了——这种数据比没有更坏。
-        InstantPush: triState(
-            Boolean(instant.workerUrl?.startsWith('https://')),
-            Boolean(instant.enabled && instant.workerUrl?.startsWith('https://') && isPushVapidReady()),
-        ),
 
         // ── 主动消息 2.0 ──
         // 四态（见 amsg2Stage）：三关里卡在哪一关，要修的引导完全不是一回事。
@@ -478,7 +551,7 @@ export function collectFeatureFlags(src: FeatureSources): Record<string, string>
         '开了2.0的角色数': bucketFewCount(amsg2ActiveChars.length),
         // 聊天主路径搬没搬上云端。只有开/关：配置到哪一步由上面那格四态回答，
         // 这一格问的是「配好了的人里有多少真把聊天切过去了」。
-        即时对话: onOff(src.amsg2Global.instantChatEnabled),
+        即时对话: onOff(isInstantChatSwitchedOn(src.amsg2Global)),
         // 全局开着、却在某几个角色上单独关掉的有多少。角色级开关是「跟随全局」缺省，
         // 只有显式关才落 false——这一格数的就是这种显式关，回答「按角色区分有没有人用」。
         // 一个都没有的话这个开关可以从角色面板收掉。
@@ -494,12 +567,15 @@ export function collectFeatureFlags(src: FeatureSources): Record<string, string>
  * 存在哪、要不要 await。
  */
 export async function collectFeatureFlagsAsync(
-    src: Omit<FeatureSources, 'vrIndependentApi' | 'amsg2Global'>,
+    src: Omit<FeatureSources, 'vrIndependentApi' | 'amsg2Global' | 'collaborationUsage'>,
 ): Promise<Record<string, string>> {
     // 读不出来就当没配。为一条统计去打断启动流程不值得。
-    const [vrIndependentApi, amsg2Global] = await Promise.all([
+    const [vrIndependentApi, amsg2Global, collaborationUsage] = await Promise.all([
         getVRApi().then(cfg => Boolean(cfg)).catch(() => false),
         ActiveMsgStore.getGlobalConfig().catch(() => ({ workerUrl: '' })),
+        import('../features/collaboration/store')
+            .then(module => module.CollaborationStore.getUsageCounts())
+            .catch(() => ({ sessions: 0, messages: 0, assets: 0 })),
     ]);
-    return collectFeatureFlags({ ...src, vrIndependentApi, amsg2Global });
+    return collectFeatureFlags({ ...src, vrIndependentApi, amsg2Global, collaborationUsage });
 }

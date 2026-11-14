@@ -1,3 +1,9 @@
+import CharacterLinkActions from '../components/character/CharacterLinkActions';
+import CharacterApiPanel from '../components/character/CharacterApiPanel';
+import CharacterSettingsSection from '../components/character/CharacterSettingsSection';
+import CharacterStatsPanel from '../components/character/CharacterStatsPanel';
+import { characterRemark } from '../utils/characterRemark';
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { useOS } from '../context/OSContext';
@@ -7,11 +13,15 @@ import Modal from '../components/os/Modal';
 import { processImage } from '../utils/file';
 import { DB } from '../utils/db';
 import { ContextBuilder } from '../utils/context';
-import { formatMessageWithTime, formatMessageForPrompt } from '../utils/messageFormat';
+import { buildSARMemoryBoundaryInstruction, formatMessageWithTime, formatMessageForPrompt } from '../utils/messageFormat';
 import { DEFAULT_ARCHIVE_PROMPTS, MEMORY_SUMMARY_ENGLISH_INSTRUCTION } from '../components/chat/ChatConstants';
 import ImpressionPanel from '../components/character/ImpressionPanel';
 import RoomPlatePanel from '../components/character/RoomPlatePanel';
 import MemoryArchivist from '../components/character/MemoryArchivist';
+import { resolveLinkedArchives, useLinkedArchives } from '../utils/memoryPalace/linkedArchive';
+import { updateStoredMemoryNode } from '../utils/memoryPalace/vectorStore';
+import { MemoryNodeDB } from '../utils/memoryPalace/db';
+import { applyLinkedArchiveDeletion, LINKED_ARCHIVE_DELETED, type LinkedArchiveDeletionDetail } from '../utils/memoryPalace/linkedArchiveDeletion';
 import ChibiStudio, { ChibiShelfPanel } from '../components/character/ChibiStudio';
 import TokenImg from '../components/os/TokenImg';
 import { resolveBlobRefsDeep, migrateDataUrlToRef } from '../utils/blobRef';
@@ -20,12 +30,15 @@ import { safeFetchJson, extractContent } from '../utils/safeApi';
 import { fetchMiniMaxVoices, MiniMaxVoiceItem } from '../utils/minimaxVoice';
 import { resolveMiniMaxApiKey } from '../utils/minimaxApiKey';
 import { normalizeElevenLabsVoiceId, synthesizeSpeechElevenLabsDetailed } from '../utils/elevenLabsTts';
+import { isElevenLabsV4Model } from '../utils/elevenLabsModels';
 import { normalizeUserImpression } from '../utils/impression';
+import { parseGeneratedImpression } from '../utils/impressionGeneration';
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
 import { COMMON_TIMEZONES } from '../utils/timezone';
 import { toMountedWorldbook } from '../utils/worldbook';
 import { stripSensitiveCardFields } from '../utils/characterCard';
 import { shareOrDownloadFile } from '../utils/shareExport';
+import { readShareText } from '../utils/pngShare';
 import { confirmExportSafety } from '../utils/exportGuard';
 import { trackEvent } from '../utils/analytics';
 import { sortCharacterGroups, GROUP_FILTER_UNGROUPED } from '../components/character/CharacterGroupFilter';
@@ -59,6 +72,7 @@ const CharacterCard: React.FC<{
     onDelete: (e: React.MouseEvent) => void;
 }> = ({ char, active, onClick, onDelete }) => (
     <div
+        data-guide={char.id === 'preset-sully-v2' ? 'sully-card' : undefined}
         onClick={onClick}
         className={`relative px-4 py-3.5 rounded-3xl border bg-white transition-colors cursor-pointer group shrink-0 shadow-[0_2px_10px_rgba(140,120,200,0.07)] ${
             active ? 'border-violet-300' : 'border-slate-100 hover:border-violet-200'
@@ -111,11 +125,27 @@ const Character: React.FC = () => {
           return next;
       });
   };
-  const [detailTab, setDetailTab] = useState<'identity' | 'memory' | 'impression' | 'plates' | 'chibi'>(() => launchIntent?.openChibiStudio ? 'chibi' : 'identity');
+  const [detailTab, setDetailTab] = useState<'identity' | 'memory' | 'impression' | 'plates' | 'chibi' | 'stats'>(() => launchIntent?.openChibiStudio ? 'chibi' : 'identity');
   // QQ捏人工坊（手办柜）全屏覆盖层
   const [showChibiStudio, setShowChibiStudio] = useState(() => !!launchIntent?.openChibiStudio);
   const [editingId, setEditingId] = useState<string | null>(() => launchIntent?.charId || null);
   const [formData, setFormData] = useState<CharacterProfile | null>(null);
+  const memoryCharacter = characters.find(character => character.id === formData?.id) || formData;
+  const linkedMemoryEnabled = !!memoryCharacter?.memoryPalaceEnabled;
+  const archiveMemories = useLinkedArchives(formData?.id, formData?.memories, linkedMemoryEnabled);
+  const { memoryPalaceConfig, remoteVectorConfig } = useOS();
+  useEffect(() => {
+      const applyDeletion = (event: Event) => {
+          const detail = (event as CustomEvent<LinkedArchiveDeletionDetail>).detail;
+          if (!detail?.nodeId || !['delete', 'keep'].includes(detail.choice)) return;
+          setFormData(previous => previous?.id === detail.charId
+              ? { ...previous, memories: applyLinkedArchiveDeletion(previous.memories || [], detail.nodeId, detail.choice) }
+              : previous);
+      };
+      window.addEventListener(LINKED_ARCHIVE_DELETED, applyDeletion);
+      return () => window.removeEventListener(LINKED_ARCHIVE_DELETED, applyDeletion);
+  }, []);
+  const [expandedMountedBookIds, setExpandedMountedBookIds] = useState<Set<string>>(new Set());
   const [isCompressing, setIsCompressing] = useState(false);
   // 头像 URL 输入的 draft, 不逐字 commit 到 formData.avatar —— 否则每输入一个字符,
   // 所有引用 char.avatar 的 <img> 都会拿到不完整字符串当相对路径请求根目录,
@@ -129,8 +159,17 @@ const Character: React.FC = () => {
           .catch(() => {});
   }, []);
   useEffect(() => {
-      characterLaunch.consume();
-  }, []);
+      const apply = () => {
+          const intent = characterLaunch.consume();
+          if (!intent) return;
+          if (!characters.some(character => character.id === intent.charId)) { setView('list'); return; }
+          setEditingId(intent.charId); setView('detail');
+          setDetailTab(intent.detailTab || (intent.openChibiStudio ? 'chibi' : 'identity'));
+          setShowChibiStudio(!!intent.openChibiStudio);
+      };
+      apply();
+      return characterLaunch.subscribe(apply);
+  }, [characters]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const cardImportRef = useRef<HTMLInputElement>(null);
   
@@ -511,9 +550,10 @@ const Character: React.FC = () => {
 You are performing monthly memory refinement: compress the ${year}-${month} daily memory fragments in the user message into one concise monthly core memory.
 This is a summarization task, not a role-play conversation. Do not enter chat mode, wait for another message, or return silence. Output the summary itself directly and write it entirely in English.`;
 
+      const sarMemoryBoundary = buildSARMemoryBoundaryInstruction(rawText);
       const systemContent = formattedPrompt
-          ? `${taskPreamble}\n\n### Character perspective (for writing voice only)\n${identityContext}### Detailed rules and output format\n${formattedPrompt}`
-          : `${taskPreamble}\n\n### Character perspective (for writing voice only)\n${identityContext}### Detailed rules\nWrite in the character's first-person voice and output one concise monthly core memory entirely in English.`;
+          ? `${taskPreamble}${sarMemoryBoundary ? `\n\n${sarMemoryBoundary}` : ''}\n\n### Character perspective (for writing voice only)\n${identityContext}### Detailed rules and output format\n${formattedPrompt}`
+          : `${taskPreamble}${sarMemoryBoundary ? `\n\n${sarMemoryBoundary}` : ''}\n\n### Character perspective (for writing voice only)\n${identityContext}### Detailed rules\nWrite in the character's first-person voice and output one concise monthly core memory entirely in English.`;
       const userContent = rawText;
 
       const refineUrl = `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`;
@@ -530,7 +570,7 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
                   ],
                   temperature: 0.3,
               })
-          }, 0);
+          }, 0, 0, { appId: 'character', appName: '神经链接', charId: targetId, charName: formData.name, purpose: '月度核心记忆提炼' });
           const dt = Math.round(performance.now() - t0);
           const summary = extractContent(data);
           if (!summary) {
@@ -561,7 +601,25 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
   };
 
   const handleDeleteMemories = (ids: string[]) => { if (!formData) return; handleChange('memories', (formData.memories || []).filter(m => !ids.includes(m.id))); addToast(`已删除 ${ids.length} 条记忆`, 'success'); };
-  const handleUpdateMemory = (id: string, newSummary: string) => { if (!formData) return; handleChange('memories', (formData.memories || []).map(m => m.id === id ? { ...m, summary: newSummary } : m)); addToast('记忆已更新', 'success'); };
+  const handleUpdateMemory = async (id: string, newSummary: string) => {
+      if (!formData) return;
+      const targetId = formData.id;
+      const memory = formData.memories?.find(item => item.id === id);
+      if (linkedMemoryEnabled && memory?.palaceMemoryId) {
+          const source = await MemoryNodeDB.getById(memory.palaceMemoryId);
+          if (!source || source.charId !== targetId) throw new Error('关联的宫殿记忆已不存在，档案文本仍保留；关闭宫殿后可按传统档案编辑');
+          await updateStoredMemoryNode(memory.palaceMemoryId, { content: newSummary }, memoryPalaceConfig.embedding, remoteVectorConfig);
+      }
+      // In traditional mode an edit becomes an independent archive; re-enabling must not undo it.
+      const update = (memories: MemoryFragment[]) => memories.map(item => item.id === id
+          ? { ...item, summary: newSummary, palaceMemoryId: linkedMemoryEnabled ? item.palaceMemoryId : undefined } : item);
+      if (editingIdRef.current === targetId) setFormData(previous => previous?.id === targetId ? { ...previous, memories: update(previous.memories || []) } : previous);
+      else {
+          const latest = (await DB.getAllCharacters()).find(character => character.id === targetId);
+          if (latest) updateCharacter(targetId, { memories: update(latest.memories || []) });
+      }
+      addToast('记忆已更新', 'success');
+  };
 
   /**
    * 按指定日期强制重新总结：读原始聊天记录（忽略 hideBeforeMessageId），LLM 总结，
@@ -574,6 +632,7 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
    *                        没提供则退回到当前 selectedPromptId
    */
   const handleForceArchiveDate = async (dateStr: string, overridePromptId?: string): Promise<void> => {
+
       if (!apiConfig.apiKey || !formData) { addToast('请先配置 API Key', 'error'); return; }
       const targetId = formData.id;
       try {
@@ -594,8 +653,10 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
           // 模板优先级：override（弹窗现场选）→ 当前 state → 默认 preset
           const effectivePromptId = overridePromptId || selectedPromptId;
           const templateObj = archivePrompts.find(p => p.id === effectivePromptId) || DEFAULT_ARCHIVE_PROMPTS[0];
-          const baseContext = ContextBuilder.buildCoreContext(formData, userProfile);
-          let prompt = baseContext + '\n\n' + MEMORY_SUMMARY_ENGLISH_INSTRUCTION + '\n\n' + templateObj.content;
+          const characterContextInput = { char: formData, user: userProfile };
+          let prompt = MEMORY_SUMMARY_ENGLISH_INSTRUCTION + '\n\n' + templateObj.content;
+          const sarMemoryBoundary = buildSARMemoryBoundaryInstruction(rawLog);
+          if (sarMemoryBoundary) prompt = `${sarMemoryBoundary}\n\n${prompt}`;
           prompt = prompt.replace(/\$\{dateStr\}/g, dateStr);
           prompt = prompt.replace(/\$\{char\.name\}/g, formData.name);
           prompt = prompt.replace(/\$\{userProfile\.name\}/g, userProfile.name);
@@ -604,8 +665,8 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
           const data = await safeFetchJson(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-              body: JSON.stringify({ model: apiConfig.model, messages: [{ role: 'user', content: prompt }], temperature: 0.5, max_tokens: 8000, stream: false }),
-          }, 0);
+              body: JSON.stringify({ model: apiConfig.model, messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'user', content: prompt }])), temperature: 0.5, max_tokens: 8000, stream: false }),
+          }, 0, 0, { appId: 'character', appName: '神经链接', charId: targetId, charName: formData.name, purpose: '单日记忆强制归档' });
           let summary = extractContent(data).replace(/^["']|["']$/g, '');
           if (!summary) throw new Error('空响应');
 
@@ -650,7 +711,7 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
       addToast('核心记忆已删除', 'success');
   };
 
-  const handleExportPreview = () => { if (!formData) return; const mems = formData.memories as any[]; if (!mems || mems.length === 0) { addToast('暂无记忆数据可导出', 'info'); return; } const sortedMemories = [...mems].sort((a, b) => a.date.localeCompare(b.date)); let text = `【角色档案】\nName: ${formData.name}\nExported: ${new Date().toLocaleString()}\n\n`; if (formData.refinedMemories) { text += `=== 核心记忆 ===\n`; Object.entries(formData.refinedMemories).sort().forEach(([k, v]) => { text += `[${k}]: ${v}\n`; }); text += `\n=== 详细日志 ===\n`; } let currentYear = '', currentMonth = ''; sortedMemories.forEach(mem => { const match = mem.date.match(/(\d{4})[-/年](\d{1,2})/); if (match) { const y = match[1], m = match[2]; if (y !== currentYear) { text += `\n[ ${y}年 ]\n`; currentYear = y; currentMonth = ''; } if (m !== currentMonth) { text += `\n-- ${parseInt(m)}月 --\n\n`; currentMonth = m; } } text += `${mem.date} ${mem.mood ? `(#${mem.mood})` : ''}\n${mem.summary}\n\n--------------------------\n\n`; }); setExportText(text); setShowExportModal(true); navigator.clipboard.writeText(text).then(() => addToast('内容已自动复制到剪贴板', 'info')).catch(() => {}); };
+  const handleExportPreview = async () => { if (!formData) return; let mems: MemoryFragment[]; try { mems = linkedMemoryEnabled ? await resolveLinkedArchives(formData.id, formData.memories || [], true) : (formData.memories || []); } catch { addToast("读取关联记忆失败，请重试", "error"); return; } if (!mems || mems.length === 0) { addToast('暂无记忆数据可导出', 'info'); return; } const sortedMemories = [...mems].sort((a, b) => a.date.localeCompare(b.date)); let text = `【角色档案】\nName: ${formData.name}\nExported: ${new Date().toLocaleString()}\n\n`; if (formData.refinedMemories) { text += `=== 核心记忆 ===\n`; Object.entries(formData.refinedMemories).sort().forEach(([k, v]) => { text += `[${k}]: ${v}\n`; }); text += `\n=== 详细日志 ===\n`; } let currentYear = '', currentMonth = ''; sortedMemories.forEach(mem => { const match = mem.date.match(/(\d{4})[-/年](\d{1,2})/); if (match) { const y = match[1], m = match[2]; if (y !== currentYear) { text += `\n[ ${y}年 ]\n`; currentYear = y; currentMonth = ''; } if (m !== currentMonth) { text += `\n-- ${parseInt(m)}月 --\n\n`; currentMonth = m; } } text += `${mem.date} ${mem.mood ? `(#${mem.mood})` : ''}\n${mem.summary}\n\n--------------------------\n\n`; }); setExportText(text); setShowExportModal(true); navigator.clipboard.writeText(text).then(() => addToast('内容已自动复制到剪贴板', 'info')).catch(() => {}); };
   const handleExportMemoryFile = async () => {
       if (!exportText) return;
       try {
@@ -731,6 +792,7 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
   };
   
   const handleBatchSummarize = async () => {
+
         if (!apiConfig.apiKey || !formData) return;
         
         const targetId = formData.id; // LOCK ID
@@ -761,7 +823,7 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
             const newMemories: MemoryFragment[] = [];
 
             await injectMemoryPalace(formData);
-            const baseContext = ContextBuilder.buildCoreContext(formData, userProfile);
+            const characterContextInput = { char: formData, user: userProfile };
 
             for (let i = 0; i < dates.length; i++) {
                 const date = dates[i];
@@ -775,7 +837,9 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
 
                 // Use selected template (same as ChatApp) with variable substitution
                 const templateObj = archivePrompts.find(p => p.id === selectedPromptId) || DEFAULT_ARCHIVE_PROMPTS[0];
-                let prompt = baseContext + '\n\n' + MEMORY_SUMMARY_ENGLISH_INSTRUCTION + '\n\n' + templateObj.content;
+                let prompt = MEMORY_SUMMARY_ENGLISH_INSTRUCTION + '\n\n' + templateObj.content;
+                const sarMemoryBoundary = buildSARMemoryBoundaryInstruction(rawLog);
+                if (sarMemoryBoundary) prompt = `${sarMemoryBoundary}\n\n${prompt}`;
                 prompt = prompt.replace(/\$\{dateStr\}/g, date);
                 prompt = prompt.replace(/\$\{char\.name\}/g, formData.name);
                 prompt = prompt.replace(/\$\{userProfile\.name\}/g, userProfile.name);
@@ -788,11 +852,11 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
                         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                         body: JSON.stringify({
                             model: apiConfig.model,
-                            messages: [{ role: "user", content: prompt }],
+                            messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: prompt }])),
                             max_tokens: 8000,
                             temperature: 0.5
                         })
-                    }, 0);
+                    }, 0, 0, { appId: 'character', appName: '神经链接', charId: targetId, charName: formData.name, purpose: '批量记忆总结' });
                 } catch {
                     // 单天失败软跳过，继续后面的日期（与原 if(response.ok) 的语义一致）
                 }
@@ -851,6 +915,7 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
     };
 
   const handleGenerateImpression = async (type: 'initial' | 'update') => {
+
       if (!formData || !apiConfig.apiKey) {
           addToast('请先配置 API Key', 'error');
           return;
@@ -865,23 +930,24 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
 
           // 构建完整角色上下文（包含人设、世界观、用户档案、精炼记忆等宏观信息）
           await injectMemoryPalace(formData);
-          const fullContext = ContextBuilder.buildCoreContext(formData, userProfile);
+          const characterContextInput = { char: formData, user: userProfile };
 
           let messagesToAnalyze = "";
 
           // 第一层：完整上下文 —— 宏观人格分析的基石
-          messagesToAnalyze += `\n【完整角色上下文 (Full Context - 宏观分析的基石)】:\n${fullContext}\n`;
+          messagesToAnalyze += `\n【完整角色上下文 (Full Context - 宏观分析的基石)】:\n\n`;
 
           // 第二层：最近聊天 —— 仅用于检测近期变化
           // 记忆部分已包含在 buildCoreContext 中（精炼月度总结 + 点亮月份的详细记忆），
           // 与聊天时角色能看到的记忆完全一致，不再额外抓取。
           // 重置模式下大幅减少近期聊天的数量，避免近因偏差
-          const recentMsgs = await DB.getRecentMessagesByCharId(targetId, type === 'initial' ? 15 : 50);
+          const recentMsgs = await loadCharacterContextMessages(formData).then(messages => messages.slice(-(type === 'initial' ? 15 : 50)));
           const msgText = recentMsgs
               .map(m => formatMessageForPrompt(m, charName, boundUser.name))
               .join('\n');
 
           if (msgText) messagesToAnalyze += `\n【最近的聊天记录 (Recent Chats - 仅用于检测近期变化)】:\n${msgText}\n`;
+          const sarMemoryBoundary = buildSARMemoryBoundaryInstruction(messagesToAnalyze);
 
           // 重置时不传旧印象，避免模型锚定在旧内容上
           const normalizedCurrentImpression = normalizeUserImpression(formData.impression);
@@ -900,7 +966,7 @@ This is a summarization task, not a role-play conversation. Do not enter chat mo
 \`\`\`json
 ${currentProfileJSON}
 \`\`\`
-${messagesToAnalyze}
+${messagesToAnalyze}${sarMemoryBoundary ? `\n${sarMemoryBoundary}\n` : ''}
 
 【重要：语气与视角】
 你【就是】"${charName}"。这份档案是你写的【私人笔记】。
@@ -973,19 +1039,15 @@ ${isInitialGeneration ? `
               headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
               body: JSON.stringify({
                   model: apiConfig.model,
-                  messages: [{ role: "user", content: prompt }],
+                  messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: prompt }])),
                   max_tokens: 8000,
                   temperature: 0.5,
                   // 与「设置 → API → 流式输出」保持一致，不在印象功能里强制覆盖用户选择。
                   // 流式响应由 safeResponseJson 拼回完整对象，下游 extractContent 无需改动。
                   stream: apiConfig.stream === true
               })
-          }, 0);
-          let content = extractContent(data);
-
-          content = content.replace(/```json/g, '').replace(/```/g, '').trim();
-          const parsed = normalizeUserImpression(JSON.parse(content));
-          if (!parsed) throw new Error('印象生成结果不完整');
+          }, 0, 0, { appId: 'character', appName: '神经链接', charId: targetId, charName, purpose: '生成用户印象档案' });
+          const parsed = parseGeneratedImpression(data);
 
           if (editingIdRef.current === targetId) {
               handleChange('impression', parsed);
@@ -1003,7 +1065,7 @@ ${isInitialGeneration ? `
       }
   };
 
-  // 真正执行删除。名下有 amsg2 任务的角色 deleteCharacter 会先 await 云端清理，
+  // 真正执行删除。新版 Worker 先停用云端归属，清理操作受理后才放行本地删除，
   // 清不掉返回 cloud-cleanup-failed 且本地未删 → 转进「重试 / 仍然删除」弹窗；
   // force=true 是用户在那个弹窗里选了「仍然删除」，放行本地删除。
   const runDeleteCharacter = async (targetId: string, force = false) => {
@@ -1017,7 +1079,7 @@ ${isInitialGeneration ? `
           }
           setDeleteConfirmTarget(null);
           setCloudCleanupFailTarget(null);
-          addToast('连接已断开', 'success');
+          addToast(result.cloudUnconfirmed ? '本地角色已删除，云端清理未确认，请到设置里的云端数据管理重试。' : result.cloudPending ? '角色已删除，云端清理已受理，可在设置里查看进度。' : '连接已断开', result.cloudUnconfirmed ? 'error' : 'success');
       } finally {
           setIsDeleting(false);
       }
@@ -1068,85 +1130,85 @@ ${isInitialGeneration ? `
 
       const json = JSON.stringify(portableData, null, 2);
       const fileName = `${formData.name || 'Character'}_Card.json`;
-      
-      const result = await shareOrDownloadFile({
-          content: json,
-          fileName,
-          mimeType: 'application/json;charset=utf-8',
-          shareTitle: '导出角色卡',
-      });
-      addToast(result === 'shared' ? '已打开角色卡分享面板' : '角色卡已生成并导出', 'success');
+
+      try {
+          const result = await shareOrDownloadFile({
+              card: { kind: 'character', title: formData.name, previewUrl: /^(data:|blob:|https?:|\/)/.test(portableData.avatar || '') ? portableData.avatar : undefined },
+              content: json,
+              fileName,
+              mimeType: 'application/json;charset=utf-8',
+              shareTitle: '导出角色卡',
+          });
+          if (result === 'cancelled') return;
+          addToast(result === 'shared' ? '已打开角色卡分享面板' : '角色卡已生成并导出', 'success');
+      } catch (error: any) { addToast(error?.message || '角色卡导出失败', 'error'); }
   };
 
-  const handleImportCard = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImportCard = async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
 
-      const reader = new FileReader();
-      reader.onload = async (ev) => {
-          try {
-              const json = ev.target?.result as string;
-              const data: CharacterExportData = JSON.parse(json);
-              
-              if (data.type !== 'sully_character_card') {
-                  throw new Error('无效的角色卡文件');
-              }
+      try {
+          const json = await readShareText(file, 'character');
+          const data: CharacterExportData = JSON.parse(json);
 
-              // 导入侧同样剥离凭据 / 美化 / 语言 / 运行时状态：即便对方给的是旧版
-              // 角色卡（把 API 密钥等私密字段一起打包了），也不会被写进本地角色，
-              // 不会用发卡人的 key / 主题 / 语言偏好覆盖你自己的。清单见 utils/characterCard.ts。
-              const safeData = stripSensitiveCardFields(data);
-
-              // Sync mounted worldbooks into the global worldbook app so they
-              // appear under their original category (or the character's name
-              // as a sensible fallback when the card has no category set).
-              const incomingMounted = (data.mountedWorldbooks || []).map(wb => ({ ...wb }));
-              const fallbackCategory = `${data.name || '导入角色'} 的世界书`;
-              let importedWbCount = 0;
-              for (const wb of incomingMounted) {
-                  if (!wb.id || worldbooks.some(existing => existing.id === wb.id)) continue;
-                  const category = wb.category && wb.category.trim() ? wb.category : fallbackCategory;
-                  wb.category = category;
-                  await addWorldbook({
-                      ...wb,
-                      id: wb.id,
-                      title: wb.title || '未命名设定',
-                      content: wb.content || '',
-                      category,
-                      createdAt: Date.now(),
-                      updatedAt: Date.now(),
-                  });
-                  importedWbCount++;
-              }
-
-              const newChar: CharacterProfile = {
-                  ...safeData,
-                  id: `char-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                  memories: [],
-                  refinedMemories: {},
-                  activeMemoryMonths: [],
-                  mountedWorldbooks: incomingMounted,
-              } as CharacterProfile;
-
-              await DB.saveCharacter(newChar);
-              trackEvent('导入角色卡');
-              // 不要调用 addCharacter()——它不是"刷新"，而是真的新建一个空白
-              // "New Character" 并写进 DB，reload 后就会多出一张空白卡。
-              // 导入的角色已经存进了 DB（上一行），reload 时 OSContext 会从
-              // DB 重新读全部角色，导入的角色自然会出现，无需手动刷新 state。
-              setTimeout(() => window.location.reload(), 500);
-
-              const wbToastSuffix = importedWbCount > 0 ? `，并同步 ${importedWbCount} 本世界书` : '';
-              addToast(`角色 ${newChar.name} 导入成功${wbToastSuffix}`, 'success');
-
-          } catch (err: any) {
-              console.error(err);
-              addToast(err.message || '导入失败', 'error');
-          } finally {
-              if (cardImportRef.current) cardImportRef.current.value = '';
+          if (data.type !== 'sully_character_card') {
+              throw new Error('无效的角色卡文件');
           }
-      };
-      reader.readAsText(file);
+
+          // 导入侧同样剥离凭据 / 美化 / 语言 / 运行时状态：即便对方给的是旧版
+          // 角色卡（把 API 密钥等私密字段一起打包了），也不会被写进本地角色，
+          // 不会用发卡人的 key / 主题 / 语言偏好覆盖你自己的。清单见 utils/characterCard.ts。
+          const safeData = stripSensitiveCardFields(data);
+
+          // Sync mounted worldbooks into the global worldbook app so they
+          // appear under their original category (or the character's name
+          // as a sensible fallback when the card has no category set).
+          const incomingMounted = (data.mountedWorldbooks || []).map(wb => ({ ...wb }));
+          const fallbackCategory = `${data.name || '导入角色'} 的世界书`;
+          let importedWbCount = 0;
+          for (const wb of incomingMounted) {
+              if (!wb.id || worldbooks.some(existing => existing.id === wb.id)) continue;
+              const category = wb.category && wb.category.trim() ? wb.category : fallbackCategory;
+              wb.category = category;
+              await addWorldbook({
+                  ...wb,
+                  id: wb.id,
+                  title: wb.title || '未命名设定',
+                  content: wb.content || '',
+                  category,
+                  createdAt: Date.now(),
+                  updatedAt: Date.now(),
+              });
+              importedWbCount++;
+          }
+
+          const newChar: CharacterProfile = {
+              ...safeData,
+              id: `char-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+              memories: [],
+              refinedMemories: {},
+              activeMemoryMonths: [],
+              mountedWorldbooks: incomingMounted,
+          } as CharacterProfile;
+
+          await DB.saveCharacter(newChar);
+          trackEvent('导入角色卡');
+          // 不要调用 addCharacter()——它不是"刷新"，而是真的新建一个空白
+          // "New Character" 并写进 DB，reload 后就会多出一张空白卡。
+          // 导入的角色已经存进了 DB（上一行），reload 时 OSContext 会从
+          // DB 重新读全部角色，导入的角色自然会出现，无需手动刷新 state。
+          setTimeout(() => window.location.reload(), 500);
+
+          const wbToastSuffix = importedWbCount > 0 ? `，并同步 ${importedWbCount} 本世界书` : '';
+          addToast(`角色 ${newChar.name} 导入成功${wbToastSuffix}`, 'success');
+
+      } catch (err: any) {
+          console.error(err);
+          addToast(err.message || '导入失败', 'error');
+      } finally {
+          if (cardImportRef.current) cardImportRef.current.value = '';
+      }
   };
 
   return (
@@ -1176,7 +1238,7 @@ ${isInitialGeneration ? `
                         <ToolButton label="关闭" title="关闭" onClick={closeApp}>
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.8} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
                         </ToolButton>
-                        <input type="file" ref={cardImportRef} className="hidden" accept=".json" onChange={handleImportCard} />
+                        <input type="file" ref={cardImportRef} className="hidden" accept=".json,.png,application/json,image/png" onChange={handleImportCard} />
                    </div>
                </div>
                <div className="flex-1 overflow-y-auto px-5 pb-20 no-scrollbar flex flex-col gap-3">
@@ -1236,9 +1298,7 @@ ${isInitialGeneration ? `
                                            </div>
                                        );
                                    })}
-                                   <button onClick={handleAddCharacter} className="w-full py-4 rounded-3xl border border-dashed border-violet-300/70 text-violet-400 text-sm bg-white/50 hover:bg-white transition-colors flex items-center justify-center gap-2 shrink-0">
-                                       <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>新建链接
-                                   </button>
+                                   <CharacterLinkActions onCreate={handleAddCharacter} />
                                </>
                            );
                        }
@@ -1260,9 +1320,7 @@ ${isInitialGeneration ? `
                                        }}
                                    />
                                ))}
-                               <button onClick={handleAddCharacter} className="w-full py-4 rounded-3xl border border-dashed border-violet-300/70 text-violet-400 text-sm bg-white/50 hover:bg-white transition-colors flex items-center justify-center gap-2 shrink-0">
-                                   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>新建链接
-                               </button>
+                               <CharacterLinkActions onCreate={handleAddCharacter} />
                                {totalPages > 1 && (
                                    <div className="flex items-center justify-center gap-3 pt-2 shrink-0">
                                        <button onClick={() => setCharPage(Math.max(0, page - 1))} disabled={page === 0}
@@ -1293,14 +1351,15 @@ ${isInitialGeneration ? `
                  <div className="flex flex-col px-5 pt-2 pb-2">
                    <div className="flex justify-between items-center mb-3">
                        <button onClick={handleBack} className="p-2 -ml-2 rounded-full hover:bg-white/60 flex items-center gap-1 text-slate-600"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" /></svg><span className="text-sm font-medium">列表</span></button>
-                       <button onClick={() => { setActiveCharacterId(formData.id); openApp(AppID.Chat); }} className="text-xs px-3 py-1.5 bg-primary text-white rounded-full font-bold shadow-sm shadow-primary/30 flex items-center gap-1 active:scale-95 transition-transform"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3 h-3"><path d="M3.105 2.288a.75.75 0 0 0-.826.95l1.414 4.926H16.5a.75.75 0 0 1 0 1.5H3.693l-1.414 4.926a.75.75 0 0 0 .826.95 28.897 28.897 0 0 0 15.293-7.155.75.75 0 0 0 0-1.114A28.897 28.897 0 0 0 3.105 2.288Z" /></svg>发消息</button>
+                       <button data-guide={formData.id === 'preset-sully-v2' ? 'sully-message' : undefined} onClick={() => { setActiveCharacterId(formData.id); openApp(AppID.Chat); }} className="text-xs px-3 py-1.5 bg-primary text-white rounded-full font-bold shadow-sm shadow-primary/30 flex items-center gap-1 active:scale-95 transition-transform"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3 h-3"><path d="M3.105 2.288a.75.75 0 0 0-.826.95l1.414 4.926H16.5a.75.75 0 0 1 0 1.5H3.693l-1.414 4.926a.75.75 0 0 0 .826.95 28.897 28.897 0 0 0 15.293-7.155.75.75 0 0 0 0-1.114A28.897 28.897 0 0 0 3.105 2.288Z" /></svg>发消息</button>
                    </div>
-                   <div className="flex gap-6 text-sm font-medium text-slate-400 pl-1">
+                   <div className="flex gap-5 overflow-x-auto whitespace-nowrap no-scrollbar [&>button]:shrink-0 text-sm font-medium text-slate-400 pl-1">
                        <button onClick={() => { setDetailTab('identity'); trackEvent('切换角色详情标签页', { tab: 'identity' }); }} className={`pb-2 transition-colors relative ${detailTab === 'identity' ? 'text-slate-800' : ''}`}>设定{detailTab === 'identity' && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-primary rounded-full"></div>}</button>
                        <button onClick={() => { setDetailTab('memory'); trackEvent('切换角色详情标签页', { tab: 'memory' }); }} className={`pb-2 transition-colors relative ${detailTab === 'memory' ? 'text-slate-800' : ''}`}>记忆 ({(formData.memories || []).length}){detailTab === 'memory' && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-primary rounded-full"></div>}</button>
                        <button onClick={() => { setDetailTab('impression'); trackEvent('切换角色详情标签页', { tab: 'impression' }); }} className={`pb-2 transition-colors relative ${detailTab === 'impression' ? 'text-slate-800' : ''}`}>印象{detailTab === 'impression' && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-primary rounded-full"></div>}</button>
                        <button onClick={() => { setDetailTab('plates'); trackEvent('切换角色详情标签页', { tab: 'plates' }); }} className={`pb-2 transition-colors relative ${detailTab === 'plates' ? 'text-slate-800' : ''}`}>门牌{detailTab === 'plates' && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-primary rounded-full"></div>}</button>
                        <button onClick={() => { setDetailTab('chibi'); trackEvent('切换角色详情标签页', { tab: 'chibi' }); }} className={`pb-2 transition-colors relative ${detailTab === 'chibi' ? 'text-slate-800' : ''}`}>手办{detailTab === 'chibi' && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-primary rounded-full"></div>}</button>
+                       <button onClick={() => setDetailTab('stats')} className={`pb-2 transition-colors relative ${detailTab === 'stats' ? 'text-slate-800' : ''}`}>角色统计{detailTab === 'stats' && <div className="absolute bottom-0 left-0 w-full h-0.5 bg-primary rounded-full" />}</button>
                    </div>
                  </div>
                </div>
@@ -1312,13 +1371,20 @@ ${isInitialGeneration ? `
                                    <div className="w-full h-full rounded-[2rem] shadow-md bg-white border-4 border-white overflow-hidden relative"><TokenImg value={formData.avatar} className={`w-full h-full object-cover ${isCompressing ? 'opacity-50 blur-sm' : ''}`} alt="A" /></div>
                                    <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleFileChange} />
                                </div>
-                               <div className="flex-1 space-y-3">
+                               <div className="min-w-0 flex-1 space-y-3">
                                    <input value={formData.name} onChange={(e) => handleChange('name', e.target.value)} className="w-full bg-transparent py-1 text-xl font-medium text-slate-800 border-b border-slate-200" placeholder="名称" />
-                                   <input value={formData.description} onChange={(e) => handleChange('description', e.target.value)} className="w-full bg-transparent py-1 text-sm text-slate-500 border-b border-slate-200" placeholder="描述" />
+                                   <div className="flex min-w-0 items-center gap-2 border-b border-slate-200">
+                                       <input value={characterRemark(formData.description)} onChange={(e) => handleChange('description', e.target.value)} className="min-w-0 flex-1 bg-transparent py-1 text-sm text-slate-500 outline-none focus-visible:ring-1 focus-visible:ring-primary" placeholder="输入备注" aria-label="输入备注" />
+                                       <label title="聊天显示备注" className="relative flex shrink-0 cursor-pointer items-center gap-1.5 py-2 text-[10px] text-slate-400">
+                                           <span>聊天显示</span>
+                                           <input type="checkbox" role="switch" aria-label="聊天显示备注" checked={!!formData.chatShowRemark} onChange={e => handleChange('chatShowRemark', e.target.checked)} className="peer sr-only" />
+                                           <span aria-hidden="true" className="relative h-4 w-7 rounded-full bg-slate-200 transition-colors peer-checked:bg-primary peer-focus-visible:ring-2 peer-focus-visible:ring-primary peer-focus-visible:ring-offset-2 after:absolute after:left-0.5 after:top-0.5 after:h-3 after:w-3 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-3" />
+                                       </label>
+                                   </div>
                                    {/* 头像 URL 入口: 与左侧上传文件平级. 走 draft -> 失焦/回车 commit,
                                        避免逐字 commit 导致所有引用 char.avatar 的 <img> 在打字时疯狂
-                                       请求不完整 URL. https URL 会作为 Instant Push 通知图标传到 worker;
-                                       本地上传 (data URL) 仅本地显示, 不进 push payload (data: 被 0.6+ 拒). */}
+                                       请求不完整 URL. https URL 会作为主动消息的通知图标传到 worker;
+                                       本地上传 (data URL) 仅本地显示, 不进 push payload. */}
                                    <input
                                        type="url"
                                        value={avatarUrlDraft}
@@ -1406,6 +1472,7 @@ ${isInitialGeneration ? `
                                 />
                            </div>
 
+                           <CharacterSettingsSection title="时间感知与时区" summary={formData.customTimezoneEnabled ? formData.customTimezone || '自定义时区' : '跟随本机时区'}>
                            {/* 时间感知 & 时区：三个独立开关，可任意组合（聊天时间感知 / 自定义时区 / 线下时间感知） */}
                            <div className="bg-white rounded-3xl p-4 shadow-sm border border-slate-100 space-y-4">
                                <div>
@@ -1474,6 +1541,9 @@ ${isInitialGeneration ? `
                                </div>
                            </div>
 
+                           </CharacterSettingsSection>
+
+                           <CharacterSettingsSection title="生活记录注入" summary={formData.lifeRecordEnabled ? '已开启' : '未开启'}>
                            {/* 生活记录注入：总开关 + 4 个模块小开关（数据在档案 App「生活记录」里维护） */}
                            <div className="bg-white rounded-3xl p-4 shadow-sm border border-slate-100 space-y-4">
                                <div>
@@ -1502,7 +1572,7 @@ ${isInitialGeneration ? `
                                    {([
                                        ['lifeRecordPeriodEnabled', 'period', '生理期', '经期状态 / 周期预测 + 代记「来了 / 结束了」'],
                                        ['lifeRecordMedEnabled', 'med', '药盒', '今日用药计划与打卡情况 + 代记「吃了 xx 药」'],
-                                       ['lifeRecordExpenseEnabled', 'expense', '记账', '今日支出（与银行 App 打通）+ 代记「花了 xx 钱」'],
+                                       ['lifeRecordExpenseEnabled', 'expense', '记账', '今日收支（与银行 App 打通）+ 代记花费与到账收入'],
                                        ['lifeRecordExerciseEnabled', 'exercise', '锻炼', '今日 / 本周锻炼情况 + 代记「做了 xx 运动」'],
                                    ] as const).filter(([, moduleKey]) => !hiddenLifeModules.includes(moduleKey)).map(([field, , label, desc]) => (
                                        <div key={field} className="flex items-center justify-between gap-3">
@@ -1521,6 +1591,9 @@ ${isInitialGeneration ? `
                                </div>
                            </div>
 
+                           </CharacterSettingsSection>
+
+                           <CharacterSettingsSection title="角色语音音色" summary={formData.voiceProfile?.voiceName || '音色与合成参数'}>
                            <div className="bg-white rounded-3xl p-4 shadow-sm border border-slate-100 space-y-3">
                                <div className="flex items-center justify-between">
                                    <label className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest flex items-center gap-1"><SpeakerHigh size={12} /> 角色语音音色</label>
@@ -1664,7 +1737,11 @@ ${isInitialGeneration ? `
                                        })}
                                        className="w-full accent-primary"
                                    />
-                                   <p className="text-[10px] text-slate-400">越小越慢、越像娓娓道来。1.0 正常；觉得“赶”就拉到 0.85–0.95。MiniMax、鱼声与 ElevenLabs 共用该角色的语速。</p>
+                                   <p className="text-[10px] text-slate-400">
+                                       {apiConfig.ttsProvider === 'elevenlabs' && isElevenLabsV4Model(apiConfig.elevenLabsModel)
+                                           ? '当前 ElevenLabs v4 不支持数值语速，这个值会保留给其他模型。v4 请用 [measured]、[Quick, light, playful pace] 等 Audio Tags 控制节奏。'
+                                           : '越小越慢、越像娓娓道来。1.0 正常；觉得“赶”就拉到 0.85–0.95。MiniMax、鱼声与支持语速参数的 ElevenLabs 模型共用该角色的语速。'}
+                                   </p>
                                </div>
 
                                {(voiceOptions.system.length + voiceOptions.voice_cloning.length + voiceOptions.voice_generation.length) > 0 && (
@@ -1698,6 +1775,10 @@ ${isInitialGeneration ? `
                                )}
                            </div>
 
+                           </CharacterSettingsSection>
+
+                           <CharacterApiPanel key={formData.id} character={formData} onChange={api => handleChange('dialogueApi', api)} />
+
                            {/* Worldbook Section */}
                            <div>
                                <div className="flex justify-between items-center mb-2 px-1">
@@ -1706,17 +1787,30 @@ ${isInitialGeneration ? `
                                 </div>
                                 <div className="space-y-2">
                                    {formData.mountedWorldbooks && formData.mountedWorldbooks.length > 0 ? (
-                                       formData.mountedWorldbooks.map(wb => (
-                                           <div key={wb.id} className="flex items-center justify-between bg-white px-4 py-3 rounded-2xl border border-indigo-50 shadow-sm group">
-                                               <div className="flex items-center gap-2 min-w-0">
-                                                   <BookOpen size={20} className="shrink-0 text-indigo-400" />
-                                                   <div className="flex flex-col min-w-0">
-                                                       <span className="text-sm font-bold text-slate-700 truncate">{wb.title}</span>
-                                                       {wb.category && <span className="text-[9px] text-slate-400">{wb.category}</span>}
-                                                   </div>
+                                       [...formData.mountedWorldbooks.reduce((groups, book) => {
+                                           const category = book.category || '未分类设定 (General)';
+                                           groups.set(category, [...(groups.get(category) || []), book]);
+                                           return groups;
+                                       }, new Map<string, NonNullable<CharacterProfile['mountedWorldbooks']>>())].map(([category, books]) => (
+                                           <details key={category} className="rounded-2xl border border-indigo-50 bg-white overflow-hidden" data-mounted-worldbook-group={category}>
+                                               <summary className="cursor-pointer px-4 py-3 text-xs font-bold text-slate-700 break-words">{category} <span className="font-normal text-slate-400">· {books.length} 条</span></summary>
+                                               <div className="px-4 pb-3">
+                                                   <div className="mb-2 flex justify-end"><button type="button" onClick={() => {
+                                                       const ids = new Set(books.map(book => book.id));
+                                                       setFormData(prev => prev ? { ...prev, mountedWorldbooks: (prev.mountedWorldbooks || []).filter(book => !ids.has(book.id)) } : prev);
+                                                   }} className="py-1 text-[11px] text-rose-400">整组取消挂载</button></div>
+                                                   {books.map(wb => <div key={wb.id} className="flex items-start gap-2 border-t border-slate-100 py-2">
+                                                       <details className="min-w-0 flex-1" onToggle={event => {
+                                                           const open = event.currentTarget.open;
+                                                           setExpandedMountedBookIds(prev => { const next = new Set(prev); if (open) next.add(wb.id); else next.delete(wb.id); return next; });
+                                                       }}>
+                                                           <summary className="cursor-pointer text-xs text-slate-600 break-words">{wb.title}</summary>
+                                                           {expandedMountedBookIds.has(wb.id) && <p className="mt-2 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-slate-500">{wb.content}</p>}
+                                                       </details>
+                                                       <button type="button" aria-label={'取消挂载 ' + wb.title} onClick={() => unmountWorldbook(wb.id)} className="shrink-0 px-2 text-slate-400">×</button>
+                                                   </div>)}
                                                </div>
-                                               <button onClick={() => unmountWorldbook(wb.id)} className="text-slate-300 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity p-1 ml-2">×</button>
-                                           </div>
+                                           </details>
                                        ))
                                    ) : (
                                        <div className="text-center py-4 bg-slate-50 rounded-2xl border border-dashed border-slate-200 text-slate-400 text-xs">
@@ -1744,13 +1838,27 @@ ${isInitialGeneration ? `
                    
                    {detailTab === 'memory' && (
                        <div className="space-y-4 animate-fade-in">
+                           <details className="rounded-2xl border border-slate-100 bg-white shadow-sm">
+                               <summary className="cursor-pointer px-4 py-3 text-xs font-semibold text-slate-600">记忆设置</summary>
+                               <label className="flex items-center justify-between gap-4 border-t border-slate-100 px-4 py-3">
+                               <span className="min-w-0">
+                                   <span className="block text-sm font-semibold text-slate-700">隐藏 RECALL 指令提示</span>
+                                   <span className="mt-1 block text-xs leading-relaxed text-slate-400">聊天时不再提示角色按月份调阅旧版记忆。使用记忆宫殿时可保持开启。</span>
+                               </span>
+                               <span className="shrink-0">
+                                   <input type="checkbox" role="switch" aria-label="隐藏 RECALL 指令提示" checked={formData.hideMonthlyRecallPrompt !== false} onChange={e => handleChange('hideMonthlyRecallPrompt', e.target.checked)} className="peer sr-only" />
+                                   <span aria-hidden="true" className="relative block h-6 w-11 rounded-full bg-slate-200 transition-colors peer-checked:bg-primary peer-focus-visible:ring-2 peer-focus-visible:ring-primary peer-focus-visible:ring-offset-2 after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:shadow-sm after:transition-transform peer-checked:after:translate-x-5" />
+                               </span>
+                               </label>
+                           </details>
                            <div className="flex justify-center gap-2 mb-4">
                                <button onClick={() => { setShowBatchModal(true); trackEvent('打开批量记忆总结弹窗'); }} className="px-4 py-2 bg-white rounded-full text-xs font-semibold text-slate-500 shadow-sm border border-slate-100">批量总结（可指定日期）</button>
                                <button onClick={() => setShowImportModal(true)} className="px-4 py-2 bg-white rounded-full text-xs font-semibold text-slate-500 shadow-sm border border-slate-100">导入/清洗</button>
                                <button onClick={handleExportPreview} className="px-4 py-2 bg-white rounded-full text-xs font-semibold text-slate-500 shadow-sm border border-slate-100">备份</button>
                            </div>
                            <MemoryArchivist
-                               memories={formData.memories || []}
+                               memories={archiveMemories}
+                               linkedMemoryEnabled={linkedMemoryEnabled}
                                refinedMemories={formData.refinedMemories || {}}
                                activeMemoryMonths={formData.activeMemoryMonths || []}
                                charName={formData.name || ''}
@@ -1781,6 +1889,8 @@ ${isInitialGeneration ? `
                    {detailTab === 'chibi' && formData.id && (
                        <ChibiShelfPanel charId={formData.id} onOpen={() => { setShowChibiStudio(true); trackEvent('打开QQ捏人工坊'); }} />
                    )}
+
+                   {detailTab === 'stats' && <CharacterStatsPanel character={formData} user={userProfile} onOpenMemory={() => setDetailTab('memory')} />}
 
                    {detailTab === 'plates' && formData.id && (
                        <RoomPlatePanel charId={formData.id} userName={userProfile.name} />
@@ -2059,7 +2169,7 @@ ${isInitialGeneration ? `
             在这里给出重试或强行放行的选择。 */}
         <Modal
             isOpen={!!cloudCleanupFailTarget}
-            title="云端还有任务没清掉"
+            title="云端清理尚未确认"
             onClose={() => setCloudCleanupFailTarget(null)}
             footer={<div className="flex gap-2 w-full">
                 <button
@@ -2075,9 +2185,9 @@ ${isInitialGeneration ? `
             </div>}
         >
             <p className="text-sm text-slate-600 leading-relaxed py-2">
-                ta 名下还有主动消息 2.0 任务没能在云端取消（可能是断网或 Worker 没响应），角色暂时没有删除。<br/>
+                ta 的云端数据还没能确认清理（可能是断网或 Worker 没响应），本地角色暂时没有删除。<br/>
                 <span className="text-xs text-red-400 font-bold">选「仍然删除」的话，残留的任务之后可能仍会到点推送</span>
-                <span className="text-xs text-slate-400">——届时可去设置里「清除云端状态」兜底。</span>
+                <span className="text-xs text-slate-400">——可以去设置 → 主动消息 2.0 → 云端数据管理继续检查。</span>
             </p>
         </Modal>
     </div>

@@ -28,7 +28,7 @@ const VRoidBetaWarning: React.FC<VRoidBetaWarningProps> = ({
   }, [busy, onCancel]);
 
   return (
-    <div className="fixed inset-0 z-[260] flex items-end justify-center bg-[#05030b]/76 px-4 pb-[max(1rem,var(--safe-bottom))] pt-[max(1rem,var(--safe-top))] backdrop-blur-sm sm:items-center">
+    <div className="sully-stage-dark fixed inset-0 z-[260] flex items-end justify-center bg-[#05030b]/76 px-4 pb-[max(1rem,var(--safe-bottom))] pt-[max(1rem,var(--safe-top))] text-white backdrop-blur-sm sm:items-center">
       <button
         type="button"
         aria-label="关闭 VRoid 测试版说明"
@@ -42,7 +42,7 @@ const VRoidBetaWarning: React.FC<VRoidBetaWarningProps> = ({
         aria-modal="true"
         aria-labelledby="vroid-beta-title"
         tabIndex={-1}
-        className="relative w-full max-w-sm overflow-hidden rounded-[28px] border border-violet-200/20 bg-[#100c1b] text-white shadow-[0_28px_90px_rgba(0,0,0,.58)] outline-none"
+        className="sully-stage-dark relative w-full max-w-sm overflow-hidden rounded-[28px] border border-violet-200/20 bg-[#100c1b] text-white shadow-[0_28px_90px_rgba(0,0,0,.58)] outline-none"
       >
         <div className="h-1 bg-gradient-to-r from-violet-400 via-fuchsia-300 to-amber-200" />
         <div className="px-5 pb-5 pt-5">
@@ -62,7 +62,7 @@ const VRoidBetaWarning: React.FC<VRoidBetaWarningProps> = ({
           <div className="mt-5 border-y border-white/10 py-4 text-[13px] leading-6 text-white/70">
             {projectFile ? (
               <>
-                SullyOS 目前不能直接读取 <strong className="font-semibold text-white">.vroid 工程</strong>。请先在 VRoid Studio 中导出 VRM，再回来选择导出的文件。
+                SullyOS·糯米机 目前不能直接读取 <strong className="font-semibold text-white">.vroid 工程</strong>。请先在 VRoid Studio 中导出 VRM，再回来选择导出的文件。
               </>
             ) : (
               <>

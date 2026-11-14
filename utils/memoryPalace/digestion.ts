@@ -23,6 +23,7 @@
  * 这不是分区域轮流审查，而是一次 LLM 调用，角色作为一个整体去"回想"。
  */
 
+import { readMaintenanceSettings } from './maintenanceMode';
 import type { MemoryNode, Anticipation, PersonalityStyle, EmbeddingConfig, RemoteVectorConfig, PlateRoom, DigestReport, DigestReportSection } from './types';
 import { PLATE_TITLES } from './types';
 import type { LightLLMConfig } from './pipeline';
@@ -247,6 +248,7 @@ async function gatherDigestMaterial(charId: string): Promise<{
 // ─── LLM 统一消化调用 ────────────────────────────────
 
 async function callDigestLLM(
+    charId: string,
     charName: string,
     charPersona: string,
     material: {
@@ -380,7 +382,7 @@ Omit unchanged items. Output only items that changed.`;
                     stream: false,
                 }),
             },
-            2, 120_000, { appName: '记忆宫殿', purpose: '记忆消化' }
+            2, 120_000, { appId: 'memorypalace', appName: '记忆宫殿', charId, charName, purpose: '记忆消化' }
         );
 
         const reply = data.choices?.[0]?.message?.content || '';
@@ -853,6 +855,7 @@ export async function runCognitiveDigestion(
     /** 阶段回调：LLM 调用链较长（审视→回填→整理），让前端能实时告诉用户别走开 */
     onProgress?: (stage: string) => void,
 ): Promise<DigestResult | null> {
+    if (!manualTrigger && readMaintenanceSettings().enabled) return null;
     const trigger: 'auto' | 'manual' = manualTrigger ? 'manual' : 'auto';
 
     // 并发锁：同一角色同时只跑一个消化。链路长（审视→回填→整理），没有锁时
@@ -898,7 +901,7 @@ export async function runCognitiveDigestion(
 
     // LLM 统一消化
     onProgress?.('正在审视记忆…');
-    const actions = await callDigestLLM(charName, charPersona, material, llmConfig, userName);
+    const actions = await callDigestLLM(charId, charName, charPersona, material, llmConfig, userName);
 
     // 执行动作：状态机改现有节点；概括类产出汇集为门牌蒸馏候选
     const { result, plateSubmissions } = await executeActions(actions, charId, material);
@@ -1046,7 +1049,7 @@ Return strict JSON only:
                     stream: false,
                 }),
             },
-            2, 120_000, { appName: '记忆宫殿', charName, purpose: '人格审视' }
+            2, 120_000, { appId: 'memorypalace', appName: '记忆宫殿', charId, charName, purpose: '人格审视' }
         );
 
         const reply = data.choices?.[0]?.message?.content || '';

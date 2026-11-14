@@ -1,3 +1,5 @@
+import {requestBeautyLibrary} from '../../utils/beautyNavigation';
+import {AppID} from '../../types';
 import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
@@ -53,7 +55,7 @@ const CSS_TEMPLATES = [
     },
 ];
 
-const AI_PROMPT = `你是 CSS 设计师，请为 SullyOS 的日程卡片写一段自定义 CSS。
+const AI_PROMPT = `你是 CSS 设计师，请为 SullyOS·糯米机 的日程卡片写一段自定义 CSS。
 只能使用以 .sully-schedule-* 开头的选择器；覆盖内联样式时使用 !important。
 
 可用钩子：
@@ -83,6 +85,7 @@ function defaultDraft(current?: ScheduleCardAppearance): ScheduleCardAppearance 
         textColor: current?.textColor || '#f8f3ff',
         accentColor: current?.accentColor || '#c9a7ff',
         customCss: current?.customCss || '',
+        desktopGlass: current?.desktopGlass ?? false,
     };
 }
 
@@ -98,7 +101,7 @@ export const ScheduleCustomCssStyle: React.FC = () => {
 };
 
 const ScheduleAppearanceButton: React.FC<{ compact?: boolean }> = ({ compact = false }) => {
-    const { theme, updateTheme, addToast } = useOS();
+    const { theme, updateTheme, addToast,openApp } = useOS();
     const [open, setOpen] = useState(false);
     const [draft, setDraft] = useState<ScheduleCardAppearance>(() =>
         defaultDraft(theme.scheduleCardAppearance)
@@ -125,7 +128,7 @@ const ScheduleAppearanceButton: React.FC<{ compact?: boolean }> = ({ compact = f
         ),
         [draft.customCss],
     );
-    const preview = resolveScheduleCardPalette(draft, theme.hue, theme.contentColor || '#ffffff');
+    const preview = resolveScheduleCardPalette(draft, theme.hue, '#ffffff');
 
     const stop: React.MouseEventHandler = event => {
         event.preventDefault();
@@ -175,7 +178,7 @@ const ScheduleAppearanceButton: React.FC<{ compact?: boolean }> = ({ compact = f
                 <div className="sticky top-0 z-10 flex items-center justify-between gap-3 px-5 py-4 bg-[#fbfafc]/95 backdrop-blur border-b border-slate-200/70">
                     <div>
                         <div className="text-[10px] font-bold tracking-[.2em] uppercase text-violet-400">Schedule skin</div>
-                        <h2 className="text-base font-black mt-0.5">日程卡片美化</h2>
+                        <h2 className="text-base font-black mt-0.5">日程卡片美化</h2><button className="text-xs text-violet-600 mt-2" onClick={()=>{setOpen(false);requestBeautyLibrary('schedule');openApp(AppID.Appearance);}}>到外观 App 收藏与分享 ›</button>
                     </div>
                     <button
                         className="w-9 h-9 rounded-full grid place-items-center bg-slate-100 text-slate-500"
@@ -198,7 +201,7 @@ const ScheduleAppearanceButton: React.FC<{ compact?: boolean }> = ({ compact = f
                                 const palette = resolveScheduleCardPalette(
                                     { ...draft, preset: preset.id },
                                     theme.hue,
-                                    theme.contentColor || '#ffffff',
+                                    '#ffffff',
                                 );
                                 return (
                                     <button
@@ -232,6 +235,23 @@ const ScheduleAppearanceButton: React.FC<{ compact?: boolean }> = ({ compact = f
                             </button>
                         </div>
                     </section>
+
+                    {(draft.preset || 'original') !== 'original' && (
+                        <label className="flex items-center justify-between gap-4 rounded-2xl border border-slate-200 bg-white p-4 cursor-pointer">
+                            <span>
+                                <span className="block text-sm font-bold">桌面上用毛玻璃底</span>
+                                <span className="block text-[11px] text-slate-400 mt-1">桌面小组件透出壁纸、文字跟随桌面字色；点开后和房间、聊天里仍用这套配色。</span>
+                            </span>
+                            <input
+                                type="checkbox"
+                                role="switch"
+                                checked={!!draft.desktopGlass}
+                                onChange={event => setDraft(current => ({ ...current, desktopGlass: event.target.checked }))}
+                                className="peer sr-only"
+                            />
+                            <span className="relative shrink-0 w-11 h-6 rounded-full bg-slate-200 transition-colors peer-checked:bg-violet-500 peer-focus-visible:ring-2 peer-focus-visible:ring-violet-300 after:absolute after:top-0.5 after:left-0.5 after:w-5 after:h-5 after:rounded-full after:bg-white after:shadow after:transition-transform peer-checked:after:translate-x-5" />
+                        </label>
+                    )}
 
                     {draft.preset === 'custom' && (
                         <section className="rounded-2xl border border-slate-200 bg-white p-4">

@@ -1269,8 +1269,7 @@ const WorldView: React.FC<{
         setRerollTarget(null); setRerollDir('');
     };
 
-    // 手动把某角色最新一拍补发到「和 ta 的聊天」（保底）：重 roll 后不会自动注入 world_card，
-    // 删掉旧卡片想换上新观测、或当时漏注入时，点这里补一张进上下文与记忆。
+    // 手动补发漏掉的观测卡片；重演会自动原地同步已有卡片。
     const injectBeatToChat = async (charId: string) => {
         if (!latest) { addToast('还没有可发送的观测', 'error'); return; }
         const beat = latest.beats.find(b => b.charId === charId);
@@ -1302,7 +1301,7 @@ const WorldView: React.FC<{
 
     /** 修改世界并刷新（决策/伏笔引爆都走这里）。 */
     const mutateWorld = async (updates: Partial<WorldProfile>) => {
-        await DB.saveWorld({ ...world, ...updates, updatedAt: Date.now() });
+        await DB.updateWorld(world.id, { ...updates, updatedAt: Date.now() });
         onWorldUpdated();
     };
 
@@ -1316,7 +1315,7 @@ const WorldView: React.FC<{
             const fr = { ...world.feedReactions };
             if (comments.length === 0 && !rx.likes) delete fr[target.key];
             else fr[target.key] = { ...rx, comments };
-            await DB.saveWorld({ ...world, feedReactions: fr, updatedAt: Date.now() });
+            await DB.updateWorld(world.id, { feedReactions: fr, updatedAt: Date.now() });
             onWorldUpdated();
             addToast('已删除', 'success');
             return;
@@ -1355,7 +1354,7 @@ const WorldView: React.FC<{
             }
             const updatedEp: WorldEpisode = { ...ep, beats: ep.beats.map(b => b.charId === target.charId ? newBeat : b) };
             await DB.saveWorldEpisode(updatedEp);
-            if (reactionUpdate) await DB.saveWorld({ ...world, feedReactions: reactionUpdate, updatedAt: Date.now() });
+            if (reactionUpdate) await DB.updateWorld(world.id, { feedReactions: reactionUpdate, updatedAt: Date.now() });
             await loadEpisodes();
             if (reactionUpdate) onWorldUpdated();
         } else {
@@ -1465,7 +1464,7 @@ const WorldView: React.FC<{
                     <div className="w-full max-w-[320px] rounded-2xl bg-[#f7f3ea] shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
                         <div className="px-4 pt-4 pb-3">
                             <div className="text-[14px] font-black text-stone-800 flex items-center gap-1.5"><Sparkle size={15} weight="fill" className="text-violet-500" />重演 {rerollTarget.charName} 这一段</div>
-                            <p className="text-[10.5px] text-stone-400 mt-1.5 leading-relaxed">会重新生成 ta 这一轮的演绎。可以给个大致方向（选填），留空就完全重写。</p>
+                            <p className="text-[10.5px] text-stone-400 mt-1.5 leading-relaxed">会替换 ta 这一轮的剧情、发出的私信与群消息、伏笔及关系变化，并同步聊天里的观测卡片。其他人的这一段保持原样。可以给个重写方向（选填）。</p>
                             <textarea value={rerollDir} onChange={e => setRerollDir(e.target.value)} rows={3}
                                 className="mt-2.5 w-full px-3 py-2 rounded-xl bg-white border border-stone-200 text-[12px] text-stone-800 focus:outline-none focus:border-violet-300 resize-none"
                                 placeholder="比如：让 ta 这次主动去找 XX 摊牌 / 心情写得更低落些 / 别提工作的事…" />
@@ -1825,7 +1824,7 @@ const WorldView: React.FC<{
                                     <div key={ep.id} className={`rounded-2xl border overflow-hidden ${t.panel}`}>
                                         <button className="w-full flex items-center gap-2.5 p-3 text-left" onClick={() => setOpenEpisodeId(open ? null : ep.id)}>
                                             <div className="w-8 h-8 rounded-xl shrink-0 flex items-center justify-center font-black text-[11px] text-amber-950" style={{ background: 'linear-gradient(135deg,#ffd76e,#ffb347)' }}>
-                                                {ep.round}
+                                                {ep.observationNumber ?? ep.round}
                                             </div>
                                             <div className="flex-1 min-w-0">
                                                 <div className={`text-[12px] font-black font-serif ${t.textMain}`}>{ep.storyTime}
@@ -1894,9 +1893,11 @@ const WorldView: React.FC<{
 // ============================================================
 // 主组件
 // ============================================================
-const WorldHomeApp: React.FC<{ embedded?: boolean; onFullscreen?: (full: boolean) => void }> = ({ embedded, onFullscreen }) => {
+const WorldHomeApp: React.FC<{ embedded?: boolean; launchWorldId?: string; onLaunchConsumed?: () => void; onFullscreen?: (full: boolean) => void }> = ({ embedded, launchWorldId, onLaunchConsumed, onFullscreen }) => {
     const { closeApp, characters, addToast, apiConfig, apiPresets } = useOS();
     const [worlds, setWorlds] = useState<WorldProfile[]>([]);
+    const [worldsLoaded, setWorldsLoaded] = useState(false);
+    const appliedLaunch = useRef(false);
     const [view, setView] = useState<'list' | 'edit' | 'world'>('list');
     const [activeId, setActiveId] = useState<string | null>(null);
     const [draft, setDraft] = useState<WorldProfile | null>(null);
@@ -1912,8 +1913,16 @@ const WorldHomeApp: React.FC<{ embedded?: boolean; onFullscreen?: (full: boolean
             if (migrateWorldDaySegs(w)) await DB.saveWorld(w).catch(() => {});
         }
         setWorlds(all);
+        setWorldsLoaded(true);
     }, []);
     useEffect(() => { reload(); }, [reload]);
+    useEffect(() => {
+        if (!worldsLoaded || !launchWorldId || appliedLaunch.current) return;
+        appliedLaunch.current = true;
+        if (worlds.some(world => world.id === launchWorldId)) { setActiveId(launchWorldId); setView('world'); }
+        else addToast('这个家园世界已不存在，请重新设置悬浮球槽位', 'error');
+        onLaunchConsumed?.();
+    }, [worldsLoaded, worlds, launchWorldId, addToast, onLaunchConsumed]);
     // 内嵌进「小小窝」时：开始玩（进世界/编辑）就让外层隐去三栏，回列表恢复
     useEffect(() => { if (embedded) onFullscreen?.(view !== 'list'); }, [embedded, view, onFullscreen]);
 
@@ -1931,7 +1940,12 @@ const WorldHomeApp: React.FC<{ embedded?: boolean; onFullscreen?: (full: boolean
     };
 
     const saveWorld = async (w: WorldProfile) => {
-        await DB.saveWorld(w);
+        const existing = worlds.some(item => item.id === w.id);
+        if (existing && draft) {
+            const patch = Object.fromEntries(Object.entries(w).filter(([key, value]) =>
+                JSON.stringify(value) !== JSON.stringify((draft as any)[key]))) as Partial<WorldProfile>;
+            await DB.updateWorld(w.id, patch);
+        } else await DB.saveWorld(w);
         // 调度表对账：所有世界的离线 tick 设置一起重建
         const all = await DB.getWorlds();
         WorldScheduler.reconcile(toTickEntries(all));

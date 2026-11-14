@@ -48,6 +48,8 @@ export interface PlateJobRoom {
 export interface PlateJobInput {
   v: 1;
   charId: string;
+  /** 客户端读取门牌的绝对时间戳；旧任务没有此字段。随结果返回，不依赖短期在飞记号。 */
+  snapshotAt?: number;
   charName: string;
   userName: string;
   /** ContextBuilder.buildCoreContext 的产出；拿不到就是空串，提示词里仍有名字与身份确认段 */
@@ -65,6 +67,12 @@ const isPlateRoomValue = (v: unknown): v is PlateRoom => (PLATE_ROOMS as readonl
 
 const asStringArray = (v: unknown): string[] | null =>
   Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]) : null;
+
+/** 无效或旧版缺失的时间不参与比较，落地侧继续采用保守保护。 */
+const snapshotTimeFields = (value: unknown): { snapshotAt?: number } =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? { snapshotAt: value }
+    : {};
 
 /**
  * 读回 job 输入。形状对不上一律返回 null——worker 那边据此硬失败，
@@ -111,6 +119,7 @@ export function parsePlateJobInput(raw: unknown): PlateJobInput | null {
     identityContext: o.identityContext,
     rooms,
     materials,
+    ...snapshotTimeFields(o.snapshotAt),
   };
 }
 
@@ -133,11 +142,18 @@ export function buildPlateJobMessages(job: PlateJobInput): Array<{ role: 'system
 
 // ─── 结果（worker 写、客户端读） ──────────────────────
 
+export interface PlateConsolidateUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+}
+
 export interface PlateConsolidateResult {
   resultKind: typeof PLATE_CONSOLIDATE_RESULT_KIND;
   v: 1;
   jobId: string;
   charId: string;
+  /** 原样带回客户端读快照的时刻；旧 Worker 的结果可能缺失。 */
+  snapshotAt?: number;
   /** LLM 给出的完整新条目列表（未合并，合并语义留在客户端） */
   items: PlateLLMItem[];
   /**
@@ -147,7 +163,23 @@ export interface PlateConsolidateResult {
    * 不用为每个在飞的 job 在本地留一份待办（页面关掉再打开也不会丢）。
    */
   rooms: Array<{ room: PlateRoom; entryIds: string[] }>;
+  /** 云端执行此次门牌整理时供应商回报的 token 用量；未返回或旧 Worker 时缺失。 */
+  usage?: PlateConsolidateUsage;
 }
+
+const normalizePlateUsage = (value: unknown): PlateConsolidateUsage | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const u = value as Record<string, unknown>;
+  const promptTokens = typeof u.promptTokens === 'number' && Number.isFinite(u.promptTokens)
+    ? u.promptTokens : undefined;
+  const completionTokens = typeof u.completionTokens === 'number' && Number.isFinite(u.completionTokens)
+    ? u.completionTokens : undefined;
+  if (promptTokens === undefined && completionTokens === undefined) return undefined;
+  return {
+    ...(promptTokens !== undefined ? { promptTokens } : {}),
+    ...(completionTokens !== undefined ? { completionTokens } : {}),
+  };
+};
 
 /** 组一条结果。形状由宿主定，`resultKind` 是上游唯一的硬要求。 */
 export function buildPlateConsolidateResult(args: {
@@ -155,7 +187,10 @@ export function buildPlateConsolidateResult(args: {
   charId: string;
   items: PlateLLMItem[];
   rooms: PlateJobRoom[];
+  snapshotAt?: number;
+  usage?: PlateConsolidateUsage;
 }): PlateConsolidateResult {
+  const usage = normalizePlateUsage(args.usage);
   return {
     resultKind: PLATE_CONSOLIDATE_RESULT_KIND,
     v: 1,
@@ -163,6 +198,8 @@ export function buildPlateConsolidateResult(args: {
     charId: args.charId,
     items: args.items,
     rooms: args.rooms.map((r) => ({ room: r.room, entryIds: r.entryIds })),
+    ...snapshotTimeFields(args.snapshotAt),
+    ...(usage ? { usage } : {}),
   };
 }
 
@@ -186,6 +223,11 @@ export function parsePlateConsolidateResult(raw: unknown): PlateConsolidateResul
   const items = o.items.filter(
     (i): i is PlateLLMItem => !!i && typeof i === 'object' && typeof (i as PlateLLMItem).text === 'string',
   );
+  const usage = normalizePlateUsage(o.usage);
 
-  return { resultKind: PLATE_CONSOLIDATE_RESULT_KIND, v: 1, jobId: o.jobId, charId: o.charId, items, rooms };
+  return {
+    resultKind: PLATE_CONSOLIDATE_RESULT_KIND, v: 1, jobId: o.jobId, charId: o.charId, items, rooms,
+    ...snapshotTimeFields(o.snapshotAt),
+    ...(usage ? { usage } : {}),
+  };
 }

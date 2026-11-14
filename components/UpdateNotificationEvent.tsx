@@ -1,3 +1,20 @@
+import DecorationUpdatePopup from './chat/DecorationUpdatePopup';
+import UserHolidayIntro from './settings/UserHolidayIntro';
+import SmallUpdatesPopup, { SMALL_UPDATES_KEY } from './os/SmallUpdatesPopup';
+import { HOLIDAY_NOTICE_KEY, hasChosenHolidayIntro } from '../utils/userHolidays';
+import {DECORATION_UPDATE_KEY} from '../utils/decorationGuide';
+import { SARUpdatePopup } from './os/SARUpdatePopup';
+import { SAR_UPDATE_KEY, SAR_CHANGELOG, sarLaunch } from '../utils/sarUpdate';
+import HomeUpdatePopup from './os/HomeUpdatePopup';
+import { HOME_UPDATE_KEY, HOME_CHANGELOG } from '../utils/homeUpdate';
+import OctoberUpdatePopup from './os/OctoberUpdatePopup';
+import { OCTOBER_UPDATE_KEY } from '../utils/octoberUpdate';
+import { roomLaunch } from '../utils/roomLaunch';
+import NavigationBallNotice, { NAVIGATION_BALL_NOTICE_KEY } from './os/NavigationBallNotice';
+import UserLocationNotice, { USER_LOCATION_NOTICE_KEY } from './os/UserLocationNotice';
+import { requestSettingsFocus } from '../utils/settingsNavigation';
+import UserSpacesUpdatePopup, { USER_SPACES_UPDATE_KEY } from './os/UserSpacesUpdatePopup';
+import RelayUpdatePopup, { RELAY_UPDATE_KEY, shouldOfferRelayNotice } from './os/RelayUpdatePopup';
 /**
  * 全局版本更新提醒。
  *
@@ -7,7 +24,7 @@
 
 import React from 'react';
 import {
-    ArrowRight, BellRinging, ChatTeardropDots, PaperPlaneTilt, Sparkle, VideoCamera,
+    ArrowRight, BellRinging, Briefcase, ChatTeardropDots, FileText, FolderOpen, PaperPlaneTilt, Sparkle, VideoCamera,
 } from '@phosphor-icons/react';
 import { useOS } from '../context/OSContext';
 import { AppID } from '../types';
@@ -29,6 +46,8 @@ export const UPDATE_NOTIFICATION_KEY_2026_07_10 = 'sullyos_update_2026_07_10_see
 export const UPDATE_NOTIFICATION_KEY_2026_08_03 = 'sullyos_update_2026_08_03_amsg2_seen';
 // 本次更新：Live2D 视频通话与陪伴桌面。
 export const UPDATE_NOTIFICATION_KEY_2026_08_10 = 'sullyos_update_2026_08_10_live2d_seen';
+// 本次更新：角色协同工作台。
+export const UPDATE_NOTIFICATION_KEY_2026_08_30 = 'sullyos_update_2026_08_30_collaboration_seen';
 // 例行维护补充：静态网页环境下部分联网功能的数据流说明。
 export const NETWORK_TRANSIT_NOTICE_KEY_2026_08 = 'sullyos_notice_2026_08_network_transit_seen';
 
@@ -45,9 +64,11 @@ export const CHANGELOG_2026_06_26 = 'changelog-2026-06-26';
 export const CHANGELOG_2026_07_10 = 'changelog-2026-07-10';
 export const CHANGELOG_2026_08_03 = 'changelog-2026-08-03';
 export const CHANGELOG_2026_08_10 = 'changelog-2026-08-10';
+export const CHANGELOG_2026_08_30 = 'changelog-2026-08-30';
 
 /** storage 读不出来时当成看过：宁可少弹一次，也别每次开机都糊用户一脸。 */
 const isUpdateSeen = (key: string): boolean => {
+    if (key === HOLIDAY_NOTICE_KEY) return hasChosenHolidayIntro();
     try {
         return !!localStorage.getItem(key);
     } catch {
@@ -70,6 +91,95 @@ interface UpdatePopupProps {
      */
     onExit: () => void;
 }
+
+const COLLABORATION_FEATURES = [
+    { icon: Briefcase, eyebrow: '两种协同模式', text: '保留完整陪伴上下文，或只带核心关系与少量相关记忆。' },
+    { icon: FileText, eyebrow: '真正交付文件', text: '读取 Word / PDF，制作并分享文档，也能把成果交回日常聊天。' },
+    { icon: FolderOpen, eyebrow: '制作、预览、安装', text: '气泡、白框、界面、日记本、角色卡与世界书都能边聊边做。' },
+] as const;
+
+const CollaborationUpdatePopup: React.FC<UpdatePopupProps> = ({ onDone, onExit }) => {
+    const { openApp } = useOS();
+
+    React.useEffect(() => {
+        trackEvent('弹出版本更新提醒', { 版本: CHANGELOG_2026_08_30 });
+    }, []);
+
+    const markSeen = () => markUpdateSeen(UPDATE_NOTIFICATION_KEY_2026_08_30);
+    const handleOpenChat = () => {
+        markSeen();
+        openApp(AppID.Chat);
+        onExit();
+        trackEvent('点立刻体验', { 版本: CHANGELOG_2026_08_30 });
+    };
+    const handleGuide = () => {
+        markSeen();
+        try { sessionStorage.setItem(FAQ_TARGET_SECTION_KEY, CHANGELOG_2026_08_30); } catch { /* 打开手册首页 */ }
+        openApp(AppID.FAQ);
+        onExit();
+        trackEvent('查看更新说明', { 版本: CHANGELOG_2026_08_30 });
+    };
+    const handleDismiss = () => {
+        markSeen();
+        onDone();
+        trackEvent('跳过本次更新说明', { 版本: CHANGELOG_2026_08_30 });
+    };
+
+    return (
+        <div
+            className="collaboration-update-overlay fixed inset-0 z-[9998] flex items-start justify-center overflow-y-auto bg-[#10111a]/75 px-4 backdrop-blur-md"
+            style={{ paddingTop: 'max(1rem, env(safe-area-inset-top))', paddingBottom: 'max(1rem, env(safe-area-inset-bottom))' }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="collaboration-update-title"
+        >
+            <style>{`
+                @keyframes collaborationUpdateIn { from { opacity:0; transform:translateY(22px) scale(.98); } to { opacity:1; transform:none; } }
+                @keyframes collaborationUpdateReveal { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+                .collaboration-update-card{animation:collaborationUpdateIn 440ms cubic-bezier(.2,.8,.2,1) both}
+                .collaboration-update-reveal{animation:collaborationUpdateReveal 380ms ease-out both}
+                @media (prefers-reduced-motion:reduce){.collaboration-update-card,.collaboration-update-reveal{animation:none!important}}
+            `}</style>
+            <section className="collaboration-update-card relative my-auto w-full max-w-[23rem] overflow-hidden rounded-[2rem] bg-[#faf9f6] text-[#20212a] shadow-[0_28px_85px_rgba(0,0,0,.48)] ring-1 ring-white/20">
+                <div className="relative overflow-hidden bg-[#20212a] px-6 pb-7 pt-6 text-white">
+                    <div className="pointer-events-none absolute right-[-4rem] top-[-5rem] h-48 w-48 rounded-full border-[28px] border-[#7772ff]/20" aria-hidden="true" />
+                    <div className="collaboration-update-reveal relative flex items-center justify-between">
+                        <p className="text-[9px] font-bold tracking-[.3em] text-[#aaa6ff]">COLLABORATION · 2026.08.30</p>
+                        <span className="rounded-full border border-[#8e89ff]/40 px-2.5 py-1 text-[9px] font-bold tracking-[.12em] text-[#c5c2ff]">NEW</span>
+                    </div>
+                    <div className="collaboration-update-reveal relative mt-8 max-w-[17rem]" style={{ animationDelay: '90ms' }}>
+                        <p className="mb-2 text-[10px] font-semibold tracking-[.18em] text-[#9f9aff]">陪伴之外，一起把事情做好</p>
+                        <h2 id="collaboration-update-title" className="text-[28px] font-black leading-[1.22] tracking-[-.04em]">角色现在有了<br />自己的协同工作台。</h2>
+                        <p className="mt-3 text-[12px] leading-6 text-[#c9cad2]">还是同一个人，只是把更多注意力放在制作、检查和交付上。</p>
+                    </div>
+                </div>
+
+                <div className="px-6 pb-5 pt-5">
+                    <div className="divide-y divide-[#e3e0d9]">
+                        {COLLABORATION_FEATURES.map(({ icon: Icon, eyebrow, text }, index) => (
+                            <div key={eyebrow} className="collaboration-update-reveal flex items-start gap-3 py-3 first:pt-0" style={{ animationDelay: `${170 + index * 65}ms` }}>
+                                <div className="mt-0.5 grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#ebe9ff] text-[#5650c9]"><Icon size={18} weight="duotone" /></div>
+                                <div><p className="text-[12px] font-extrabold text-[#32303f]">{eyebrow}</p><p className="mt-1 text-[11px] leading-5 text-[#74737b]">{text}</p></div>
+                            </div>
+                        ))}
+                    </div>
+
+                    <div className="collaboration-update-reveal mt-3 border-l-2 border-[#6d67e8] bg-[#f0efff] px-3 py-2.5 text-[11px] leading-5 text-[#555172]" style={{ animationDelay: '370ms' }}>
+                        入口：打开一位角色的 <b>ChatApp</b>，点输入框左侧的 <b>＋</b>，在加号菜单第一页选择 <b>「协同工作」</b>。
+                    </div>
+
+                    <div className="collaboration-update-reveal mt-5" style={{ animationDelay: '430ms' }}>
+                        <button type="button" onClick={handleOpenChat} className="flex w-full items-center justify-center gap-2 rounded-2xl bg-[#25242d] px-5 py-3.5 text-[13px] font-extrabold text-white transition-transform active:scale-[.975]">打开 ChatApp <ArrowRight size={16} weight="bold" /></button>
+                        <div className="mt-1.5 grid grid-cols-2 gap-2">
+                            <button type="button" onClick={handleGuide} className="rounded-xl py-2.5 text-[11px] font-semibold text-[#585465] active:bg-[#efedf0]">查看完整说明</button>
+                            <button type="button" onClick={handleDismiss} className="rounded-xl py-2.5 text-[11px] font-semibold text-[#8b8990] active:bg-[#efedf0]">稍后看看</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    );
+};
 
 const LIVE2D_FEATURES = [
     {
@@ -439,7 +549,7 @@ const NetworkTransitNoticePopup: React.FC<UpdatePopupProps> = ({ onDone, onExit 
                     </p>
                     <div className="rounded-2xl bg-sky-50 px-3.5 py-3 text-[11px] leading-[1.7] text-sky-900 ring-1 ring-sky-100">
                         <p>
-                            这和你平时使用<b>联网搜索、第三方登录或在线音乐</b>时的接口请求相近：只有主动使用对应功能时，当次必要数据才会经过服务端，不会把 SullyOS 的聊天记录或本地资料整体上传。
+                            这和你平时使用<b>联网搜索、第三方登录或在线音乐</b>时的接口请求相近：只有主动使用对应功能时，当次必要数据才会经过服务端，不会把 SullyOS·糯米机 的聊天记录或本地资料整体上传。
                         </p>
                         <p className="mt-1.5">
                             如果你平时能够接受 API 中转站，可以把它作为参照：API 中转站能够接触完整的模型请求与聊天内容；这里的 Worker 只接触对应功能的当次请求，并在转发后不保留请求内容。
@@ -477,13 +587,74 @@ const NetworkTransitNoticePopup: React.FC<UpdatePopupProps> = ({ onDone, onExit 
  * 同时上线好几个功能时，各自值得单独说一次，所以排成队列：关掉一条接着弹下一条，
  * 已读各记各的 key——点掉其中一条不影响另一条还会不会露面。
  */
-const UPDATE_QUEUE: { key: string; render: (props: UpdatePopupProps) => React.ReactNode }[] = [
+const SARUpdateAnnouncement: React.FC<UpdatePopupProps> = ({ onDone, onExit }) => {
+    const { openApp } = useOS();
+    return <SARUpdatePopup onDone={onDone} onVisit={() => {
+        sarLaunch.request(); openApp(AppID.VRWorld); onExit();
+    }} onGuide={() => {
+        try { sessionStorage.setItem(FAQ_TARGET_SECTION_KEY, SAR_CHANGELOG); } catch { /* 手册首页仍可打开 */ }
+        openApp(AppID.FAQ); onExit();
+    }}/>;
+};
+
+const HomeUpdateAnnouncement: React.FC<UpdatePopupProps> = ({ onDone, onExit }) => {
+    const { openApp } = useOS();
+    return <HomeUpdatePopup onDone={onDone} onVisit={() => {
+        roomLaunch.request({ tab: 'home3D' }); openApp(AppID.Room); onExit();
+    }} onGuide={() => {
+        try { sessionStorage.setItem(FAQ_TARGET_SECTION_KEY, HOME_CHANGELOG); } catch { /* 手册首页仍可打开 */ }
+        openApp(AppID.FAQ); onExit();
+    }}/>;
+};
+
+const NavigationBallAnnouncement: React.FC<UpdatePopupProps> = ({ onDone, onExit }) => {
+    const { openApp } = useOS();
+    return <NavigationBallNotice onDone={onDone} onConfigure={() => {
+        requestSettingsFocus('navigation'); openApp(AppID.Settings); onExit();
+    }} />;
+};
+
+const UserLocationAnnouncement: React.FC<UpdatePopupProps> = ({ onDone, onExit }) => {
+    const { openApp } = useOS();
+    return <UserLocationNotice onDone={onDone} onConfigure={() => {
+        requestSettingsFocus('location'); openApp(AppID.Settings); onExit();
+    }} />;
+};
+
+const OctoberUpdateAnnouncement: React.FC<UpdatePopupProps> = ({ onDone }) => <OctoberUpdatePopup onDone={onDone}/>;
+
+const UserSpacesUpdateAnnouncement: React.FC<UpdatePopupProps> = ({ onExit }) => {
+    const { openApp } = useOS();
+    // Finish this launch's queue so older announcements do not cover the new feature.
+    return <UserSpacesUpdatePopup onDone={onExit} onVisit={() => { openApp(AppID.User); onExit(); }} />;
+};
+
+const RelayUpdateAnnouncement: React.FC<UpdatePopupProps> = ({ onDone, onExit }) => {
+    const { openApp } = useOS();
+    return <RelayUpdatePopup onDone={onDone} onVisit={() => {
+        requestSettingsFocus('amsg2'); openApp(AppID.Settings); onExit();
+    }} />;
+};
+
+/** `offered` 返回 false 的这次不弹、也不记已读。 */
+const UPDATE_QUEUE: { key: string; offered?: () => boolean; render: (props: UpdatePopupProps) => React.ReactNode }[] = [
+    { key: RELAY_UPDATE_KEY, offered: () => typeof location === 'undefined' || shouldOfferRelayNotice(location.href), render: props => <RelayUpdateAnnouncement {...props} /> },
+    { key: USER_SPACES_UPDATE_KEY, render: props => <UserSpacesUpdateAnnouncement {...props} /> },
+    { key: OCTOBER_UPDATE_KEY, render: props => <OctoberUpdateAnnouncement {...props} /> },
+    { key: USER_LOCATION_NOTICE_KEY, render: props => <UserLocationAnnouncement {...props} /> },
+    { key: NAVIGATION_BALL_NOTICE_KEY, render: props => <NavigationBallAnnouncement {...props} /> },
+    { key: HOME_UPDATE_KEY, render: props => <HomeUpdateAnnouncement {...props} /> },
+    { key: SMALL_UPDATES_KEY, render: props => <SmallUpdatesPopup onDone={props.onDone} /> },
+    { key: HOLIDAY_NOTICE_KEY, render: props => <UserHolidayIntro {...props} /> },
+    { key: DECORATION_UPDATE_KEY, render: props => <DecorationUpdatePopup onClose={props.onDone}/> },
+    { key: SAR_UPDATE_KEY, render: (props) => <SARUpdateAnnouncement {...props} /> },
     { key: NETWORK_TRANSIT_NOTICE_KEY_2026_08, render: (props) => <NetworkTransitNoticePopup {...props} /> },
     { key: UPDATE_NOTIFICATION_KEY_2026_08_10, render: (props) => <Live2DUpdatePopup {...props} /> },
-    { key: UPDATE_NOTIFICATION_KEY_2026_08_03, render: (props) => <Amsg2UpdatePopup {...props} /> },
 ];
 
-export const shouldShowUpdateNotification = (): boolean => UPDATE_QUEUE.some((entry) => !isUpdateSeen(entry.key));
+const isPending = (entry: (typeof UPDATE_QUEUE)[number]): boolean => !isUpdateSeen(entry.key) && (entry.offered?.() ?? true);
+
+export const shouldShowUpdateNotification = (): boolean => UPDATE_QUEUE.some(isPending);
 
 interface UpdateNotificationControllerProps {
     onClose: () => void;
@@ -492,7 +663,7 @@ interface UpdateNotificationControllerProps {
 export const UpdateNotificationController: React.FC<UpdateNotificationControllerProps> = ({ onClose }) => {
     // 进场时把没看过的挑出来定住。每次渲染重算的话，当前这条一被标记已读就会自己从队列里
     // 消失、直接跳到下一条，用户还没来得及点——推进队列的只能是下面 onDone 那一下。
-    const [pending, setPending] = React.useState(() => UPDATE_QUEUE.filter((entry) => !isUpdateSeen(entry.key)));
+    const [pending, setPending] = React.useState(() => UPDATE_QUEUE.filter(isPending));
     const current = pending[0];
 
     React.useEffect(() => {

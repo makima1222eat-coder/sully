@@ -382,6 +382,10 @@ const StudyApp: React.FC = () => {
             setSelectedChar(char);
         }
     }, [activeCharacterId]);
+    useAppShortcut(ShortcutAppID.Study, intent => {
+        setSelectedChar(characters.find(c => c.id === intent.characterId) || null);
+        setMode('bookshelf');
+    });
 
 
     useEffect(() => {
@@ -584,8 +588,14 @@ For each chapter, provide a title, a brief summary of what it covers, and a diff
                 messages: [{ role: "user", content: prompt }],
                 temperature: 0.5,
                 max_tokens: 8000
-            })
-        });
+            }),
+            __sullyMeta: {
+                appId: 'study',
+                appName: '自习室',
+                ...(selectedChar ? { charId: selectedChar.id, charName: selectedChar.name } : {}),
+                purpose: '拆分教材大纲',
+            },
+        } as RequestInit);
 
         if (!response.ok) throw new Error('API Error');
         const data = await safeResponseJson(response);
@@ -641,6 +651,7 @@ For each chapter, provide a title, a brief summary of what it covers, and a diff
     // [MODIFIED]: buildStudyContext Removed. We now use ContextBuilder directly in handleTeach.
 
     const handleTeach = async (course: StudyCourse, chapterIdx: number, forceRegenerate: boolean = false) => {
+
         if (!selectedChar || !effectiveApi.apiKey) return;
         
         const chapter = course.chapters[chapterIdx];
@@ -693,7 +704,8 @@ Explain this chapter's key concepts to the user based strictly on the Source Mat
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
                 body: JSON.stringify({
                     model: effectiveApi.model,
-                    messages: [{ role: "user", content: prompt }],
+                    messages: isFallback ? [{ role: "user", content: prompt }]
+                        : (await ContextBuilder.buildCharacterRequest({ char: selectedChar, user: userProfile }, [{ role: "user", content: prompt }])),
                     temperature: 0.7,
                     max_tokens: 8000, 
                     safetySettings: [
@@ -702,15 +714,22 @@ Explain this chapter's key concepts to the user based strictly on the Source Mat
                         { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
                         { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
                     ]
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '生成章节讲义',
+                },
+            } as RequestInit);
         };
 
         try {
             // Attempt 1: Full Character Context (The "Soul")
             // [MODIFIED]: Use centralized ContextBuilder with memory enabled
             await injectMemoryPalace(selectedChar, undefined, chapter.title);
-            let baseContext = ContextBuilder.buildCoreContext(selectedChar, userProfile, true);
+            let baseContext = ''; // 角色上下文由 callApi 的统一消息管线装配。
 
             // Append Study Mode specific instructions to the core context
             baseContext += `
@@ -782,6 +801,7 @@ You are now acting as a private tutor for ${userProfile.name}.
     };
 
     const handleAskQuestion = async () => {
+
         if (!userQuestion.trim() || !activeCourse || !selectedChar) return;
         
         const question = userQuestion;
@@ -799,14 +819,15 @@ You are now acting as a private tutor for ${userProfile.name}.
 
             // [MODIFIED]: Use Full Context for Q&A
             await injectMemoryPalace(selectedChar, undefined, question);
-            let baseContext = ContextBuilder.buildCoreContext(selectedChar, userProfile, true);
-            baseContext += `
+            const characterContextInput = { char: selectedChar, user: userProfile, includeDetailedMemories: true };
+
+            const studyInstructions = `
 ### [System: Study Mode Q&A]
 User is asking a question about the study material.
 - **Maintain Personality**: Answer in character.
 `;
 
-            const prompt = `${baseContext}
+            const prompt = `
 ### Source Material
 ${chunkText.substring(0, 8000)}
 
@@ -821,11 +842,18 @@ Answer the question based on the source material. Be helpful and encouraging (in
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
                 body: JSON.stringify({
                     model: effectiveApi.model,
-                    messages: [{ role: "user", content: prompt }],
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'system', content: studyInstructions }, { role: "user", content: prompt }])),
                     temperature: 0.7,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '课堂提问答疑',
+                },
+            } as RequestInit);
             
             const data = await safeResponseJson(response);
             const text = data.choices?.[0]?.message?.content || data.choices?.[0]?.message?.reasoning_content || "（无回答）";
@@ -877,8 +905,15 @@ Note: Use "我" (I) to refer to yourself.
         fetch(`${effectiveApi.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
-            body: JSON.stringify({ model: effectiveApi.model, messages: [{ role: "user", content: summaryPrompt }] })
-        }).then(res => safeResponseJson(res)).then(data => {
+            body: JSON.stringify({ model: effectiveApi.model, messages: [{ role: "user", content: summaryPrompt }] }),
+            __sullyMeta: {
+                appId: 'study',
+                appName: '自习室',
+                charId: selectedChar.id,
+                charName: selectedChar.name,
+                purpose: '结课辅导日记',
+            },
+        } as RequestInit).then(res => safeResponseJson(res)).then(data => {
             const mem = data.choices[0].message.content;
             const newMem = { id: `mem-${Date.now()}`, date: new Date().toLocaleDateString(), summary: `[教学] ${mem}`, mood: 'proud' };
             updateCharacter(selectedChar.id, { memories: [...(selectedChar.memories || []), newMem] });
@@ -1003,8 +1038,15 @@ ${chunkText.substring(0, 10000)}
                     messages: [{ role: "user", content: prompt }],
                     temperature: 0.7,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '生成随堂测验',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1055,6 +1097,7 @@ ${chunkText.substring(0, 10000)}
     };
 
     const submitQuiz = async () => {
+
         if (!quizSession || !selectedChar || !effectiveApi.apiKey) return;
         trackEvent('交卷让老师批改');
         setQuizLoading('正在批改试卷...');
@@ -1086,9 +1129,10 @@ ${chunkText.substring(0, 10000)}
         }).join('\n\n');
 
         await injectMemoryPalace(selectedChar, undefined, quizSession.chapterTitle);
-        let baseContext = ContextBuilder.buildCoreContext(selectedChar, userProfile, true);
+        const characterContextInput = { char: selectedChar, user: userProfile, includeDetailedMemories: true };
 
-        const reviewPrompt = `${baseContext}
+
+        const reviewPrompt = `
 
 ### [System: Quiz Review Mode]
 You just gave ${userProfile.name} a quiz on "${quizSession.chapterTitle}".
@@ -1118,11 +1162,18 @@ ${resultsText}
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
                 body: JSON.stringify({
                     model: effectiveApi.model,
-                    messages: [{ role: "user", content: reviewPrompt }],
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: reviewPrompt }])),
                     temperature: 0.8,
                     max_tokens: 8000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '测验批改评语',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1188,6 +1239,7 @@ ${resultsText}
 
     // Follow-up Q&A on a specific question
     const handleFollowUp = async (questionId: string) => {
+
         if (!followUpInput.trim() || !selectedChar || !effectiveApi.apiKey || !quizSession) return;
         const question = quizSession.questions.find(q => q.id === questionId);
         if (!question) return;
@@ -1198,9 +1250,10 @@ ${resultsText}
         setFollowUpInput('');
 
         await injectMemoryPalace(selectedChar, undefined, userQ);
-        let baseContext = ContextBuilder.buildCoreContext(selectedChar, userProfile, true);
+        const characterContextInput = { char: selectedChar, user: userProfile, includeDetailedMemories: true };
 
-        const prompt = `${baseContext}
+
+        const prompt = `
 
 ### [System: Quiz Follow-up Q&A]
 The user just did a quiz and wants to ask about a specific question they got ${question.isCorrect ? 'right' : 'wrong'}.
@@ -1221,11 +1274,18 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${effectiveApi.apiKey}` },
                 body: JSON.stringify({
                     model: effectiveApi.model,
-                    messages: [{ role: "user", content: prompt }],
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: "user", content: prompt }])),
                     temperature: 0.7,
                     max_tokens: 4000
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'study',
+                    appName: '自习室',
+                    charId: selectedChar.id,
+                    charName: selectedChar.name,
+                    purpose: '错题追问讲解',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API Error: ${response.status}`);
             const data = await safeResponseJson(response);
@@ -1507,7 +1567,7 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                         {selectedChar && (
                             <div className="flex items-center gap-2 mt-2">
                                 <TokenImg value={selectedChar.avatar} className="w-8 h-8 rounded-full object-cover" />
-                                <span className="text-xs text-slate-400">{selectedChar.name} 正在出题...</span>
+                                <span className="text-xs text-slate-400">{selectedChar.name} {quizLoading}</span>
                             </div>
                         )}
                     </div>
@@ -1636,7 +1696,8 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
                             ) : (
                                 <>
                                     <span className="text-3xl">+</span>
-                                    <span className="text-xs font-bold">导入 PDF</span>
+                                    <span className="text-xs font-bold">导入学习资料</span>
+                                    <span className="px-3 text-center text-[10px] leading-relaxed">支持 PDF，让角色陪你讲解、练习</span>
                                 </>
                             )}
                         </button>
@@ -1917,3 +1978,5 @@ Answer in character. Be helpful and clear. If they're confused about a concept, 
 };
 
 export default StudyApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

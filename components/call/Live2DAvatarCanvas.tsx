@@ -1,3 +1,5 @@
+import { canPlayLive2DAction, installLive2DIdlePolicy, live2DPermissionSignature, live2DProceduralRestrictions } from '../../utils/live2dActionPolicy';
+import { revealLive2DAfterPaint } from '../../utils/live2DReveal';
 import React, { useEffect, useRef, useState } from 'react';
 import { Application, Assets, Cache, extensions } from 'pixi.js';
 import { AvatarAutonomy, getViewerEyeContactCompensation } from '../../utils/avatarAutonomy';
@@ -71,6 +73,8 @@ interface Live2DAvatarCanvasProps {
   onLoadingChange?: (loading: boolean, stage?: string) => void;
   onError?: (message: string) => void;
   onReady?: () => void;
+  /** 提供透明背景的当前姿态快照；卸载时清空，供相机贴纸使用。 */
+  onSnapshotReady?: (capture: (() => HTMLCanvasElement) | null) => void;
   touchRequest?: AvatarTouchRequest | null;
   touchImpulseNonce?: number;
   onAvatarTouch?: (hit: AvatarTouchHit) => void;
@@ -317,6 +321,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   onLoadingChange,
   onError,
   onReady,
+  onSnapshotReady,
   touchRequest,
   touchImpulseNonce,
   onAvatarTouch,
@@ -339,10 +344,12 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   const performanceQualityRef = useRef(performanceQuality);
   const actionParameterIdsRef = useRef<Record<string, string[]>>({});
   const actionParameterValuesRef = useRef<Record<string, Live2DActionParameterValue[]>>({});
+  const proceduralRestrictionsRef = useRef(live2DProceduralRestrictions(config));
   const preserveActiveWardrobeRef = useRef(preserveActiveWardrobe);
   const onLoadingChangeRef = useRef(onLoadingChange);
   const onErrorRef = useRef(onError);
   const onReadyRef = useRef(onReady);
+  const onSnapshotReadyRef = useRef(onSnapshotReady);
   const onAvatarTouchRef = useRef(onAvatarTouch);
   const touchRegionsRef = useRef<AvatarTouchRegion[]>(touchRegions ?? config.touchRegions ?? []);
   const onTouchRegionsChangeRef = useRef(onTouchRegionsChange);
@@ -411,7 +418,16 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   useEffect(() => { audioFeedRef.current = audioFeed; }, [audioFeed]);
   useEffect(() => { headMotionLockedRef.current = headMotionLocked; }, [headMotionLocked]);
   useEffect(() => { ambientAutonomyDisabledRef.current = ambientAutonomyDisabled; }, [ambientAutonomyDisabled]);
-  useEffect(() => { configRef.current = config; }, [config]);
+  useEffect(() => {
+    const changed = live2DPermissionSignature(configRef.current.actions) !== live2DPermissionSignature(config.actions);
+    configRef.current = config;
+    proceduralRestrictionsRef.current = live2DProceduralRestrictions(config, actionParameterIdsRef.current);
+    if (changed) {
+      stopPerformanceMotions();
+      modelRef.current?.internalModel?.motionManager?.expressionManager?.resetExpression?.();
+      aiExpressionActiveRef.current = false;
+    }
+  }, [config]);
   useEffect(() => { performanceRef.current = performance; }, [performance]);
   useEffect(() => { touchImpulseNonceRef.current = touchImpulseNonce; }, [touchImpulseNonce]);
   useEffect(() => { performanceQualityRef.current = performanceQuality; }, [performanceQuality]);
@@ -419,6 +435,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
   useEffect(() => { onLoadingChangeRef.current = onLoadingChange; }, [onLoadingChange]);
   useEffect(() => { onErrorRef.current = onError; }, [onError]);
   useEffect(() => { onReadyRef.current = onReady; }, [onReady]);
+  useEffect(() => { onSnapshotReadyRef.current = onSnapshotReady; }, [onSnapshotReady]);
   useEffect(() => { onAvatarTouchRef.current = onAvatarTouch; }, [onAvatarTouch]);
   useEffect(() => { touchRegionsRef.current = touchRegions ?? config.touchRegions ?? []; }, [touchRegions, config.touchRegions]);
   useEffect(() => { onTouchRegionsChangeRef.current = onTouchRegionsChange; }, [onTouchRegionsChange]);
@@ -601,7 +618,8 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
 
   // kind='params' 的自定义参数动作不走引擎的 motion/expression 通道，
   // 而是推进叠加队列，由 applyControls 按攻击-保持-衰减包络逐帧写参数。
-  const triggerAction = (action: Live2DAction, allowDirectedHead = false): Promise<void> => {
+  const triggerAction = (action: Live2DAction, allowDirectedHead = false, manual = false): Promise<void> => {
+    if (!canPlayLive2DAction(configRef.current, action.id, manual)) return Promise.resolve();
     if (action.kind === 'params') {
       const params = headMotionLockedRef.current && !allowDirectedHead
         ? action.params?.filter(param => !isHeadLockParameter(param.id))
@@ -714,7 +732,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         if (directedHead.motionOwnsHead && directedHeadMotionLeaseRef.current) {
           directedHeadMotionLeaseRef.current.channel = 'main';
         }
-        await playAction(model, mix.motions[0]);
+        await triggerAction(mix.motions[0], directedHead.enabled);
       }
       if (!started && !mix.motions[0]) directedHeadMotionLeaseRef.current = null;
     }
@@ -760,7 +778,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
     const action = configRef.current.actions.find(item => item.id === manualAction.id && item.permission !== 'blocked');
     if (action) {
       if (hostRef.current) hostRef.current.dataset.live2dLastAction = action.id;
-      void triggerAction(action, true).catch(error => onErrorRef.current?.(error instanceof Error ? error.message : '动作播放失败'));
+      void triggerAction(action, true, true).catch(error => onErrorRef.current?.(error instanceof Error ? error.message : '动作播放失败'));
     }
   }, [manualAction]);
 
@@ -768,6 +786,9 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
     const host = hostRef.current;
     if (!host) return;
     let disposed = false;
+    let cancelReveal: (() => void) | undefined;
+    let revealed = false;
+    host.dataset.live2dReady = 'false';
     let app: Application | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let internal: any = null;
@@ -850,6 +871,8 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         if (maxFps && maxFps > 0) app.ticker.maxFPS = Math.max(15, Math.min(60, maxFps));
         if (disposed || !app) return;
         app.canvas.className = 'h-full w-full touch-none';
+        app.canvas.style.opacity = '0';
+        app.canvas.style.transition = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'none' : 'opacity 220ms ease-out';
         host.appendChild(app.canvas);
         document.addEventListener('visibilitychange', onDocumentVisibilityChange);
         if (typeof IntersectionObserver !== 'undefined') {
@@ -868,6 +891,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         cleanupPackage = source.cleanup;
         packageTextureUrls = source.textureUrls;
         actionParameterIdsRef.current = source.actionParameterIds;
+        proceduralRestrictionsRef.current = live2DProceduralRestrictions(configRef.current, source.actionParameterIds);
         actionParameterValuesRef.current = source.actionParameterValues;
         if (disposed) {
           releasePackage();
@@ -883,7 +907,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         onLoadingChangeRef.current?.(true, '缓存已就绪，正在创建 Cubism 角色…');
         const cubismStartedAt = window.performance.now();
         const model = await Live2DModel.from(source.settings as any, {
-          idleMotionGroup: 'Idle',
+          idleMotionGroup: '__sully_permission_idle__',
           // Full mip chains add another ~33% GPU allocation per atlas. The
           // model already uses the selected source resolution, so linear
           // sampling without generated mipmaps preserves detail and memory.
@@ -911,6 +935,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           return;
         }
         modelRef.current = model;
+        installLive2DIdlePolicy(model.internalModel.motionManager, () => configRef.current);
         model.eventMode = 'none';
         model.interactiveChildren = false;
         app.stage.eventMode = 'none';
@@ -1275,14 +1300,18 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           const faceIntensity = clamp(direction?.intensity ?? 0.7, 0.2, 1);
           const faceHold = Math.min(1, 0.55 + faceIntensity * 0.45)
             * (speaking ? 1 : Math.exp(-Math.max(0, sinceDirection - 2.8) / 2.6));
-          const faceW = (name: string) => (faceSet.has(name as never) ? faceHold : 0);
+          const restrictions = proceduralRestrictionsRef.current;
+          const faceW = (name: string) => (!restrictions.faces.has(name) && faceSet.has(name as never) ? faceHold : 0);
           const expressionMouthForm = faceW('grin') - faceW('pout');
           const combinedMouthForm = combineLive2DMouthForm(mouthFrame.form, expressionMouthForm);
           const mouthFormSpeed = mouthFrame.source === 'synthetic' ? 0.12 : 0.22;
           for (const id of mouthFormParameterIds) {
             // Add to the expression/motion-authored base. Writing an absolute
             // vowel value here would erase the model's smile or pout.
-            smooth(id, combinedMouthForm, mouthFormSpeed, true);
+            const restricted = restrictions.parameters.has(id)
+              || (restrictions.faces.has('pout') && combinedMouthForm < 0)
+              || (restrictions.faces.has('grin') && combinedMouthForm > 0);
+            smooth(id, restricted ? 0 : combinedMouthForm, mouthFormSpeed, true);
           }
           smooth('ParamCheek', faceW('blush'), 0.18, true);
           // 眉眼系：眯眯笑眼走标准笑眼参数；眉毛用高度/形状/角度组合近似
@@ -1416,7 +1445,7 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
         };
         internal.on('beforeModelUpdate', applyFinalHeadLock);
 
-        app.ticker.add(() => {
+        const updateStage = (instant = false) => {
           if (!app) return;
           if (ambientAutonomyDisabledRef.current && motionStateRef.current === 'idle') {
             const mainManager = internal?.motionManager;
@@ -1472,22 +1501,26 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           const targetY = cameraY + bobY;
           const currentScale = model.scale.x || targetScale;
           const currentY = model.position.y || targetY;
-          model.scale.set(currentScale + (targetScale - currentScale) * 0.08);
+          const blend = instant ? 1 : 0.08;
+          model.scale.set(currentScale + (targetScale - currentScale) * blend);
           model.position.set(
             cameraX + frame.bodyX * 5,
-            currentY + (targetY - currentY) * 0.08,
+            currentY + (targetY - currentY) * blend,
           );
           // `frame.rotation` is also produced by AvatarAutonomy and rotates the
           // entire Live2D display, which visually turns the head even when all
           // head parameters are zero.
           model.rotation = headMotionLockedRef.current || ambientAutonomyDisabledRef.current ? 0 : frame.rotation;
-        });
+        };
+        // First placement must snap to saved framing, never lerp down from Pixi scale=1.
+        app.ticker.add(() => updateStage(!revealed));
+        updateStage(true);
 
         const initialPerformance = performanceRef.current;
         if (initialPerformance) {
           void triggerPerformance(initialPerformance).catch(() => { /* optional */ });
         }
-        host.dataset.live2dReady = 'true';
+        onLoadingChangeRef.current?.(true, '正在准备角色画面…');
         console.info('[live2d] renderer ready', {
           assetId: config.assetId,
           offscreenCount: cubismCoreCompatibility.offscreenCount,
@@ -1496,8 +1529,42 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
           cubismMs: Math.round(cubismMs),
           bootTotalMs: Math.round(window.performance.now() - bootStartedAt),
         });
-        onLoadingChangeRef.current?.(false, '角色已就绪');
-        onReadyRef.current?.();
+        cancelReveal = revealLive2DAfterPaint(() => {
+          if (disposed || !app || host.clientWidth <= 0 || host.clientHeight <= 0) return false;
+          // Resize and render while still hidden, including saved full-body composition.
+          app.resize();
+          fitModel();
+          updateStage(true);
+          app.render();
+          return true;
+        }, () => {
+          if (disposed || !app) return;
+          revealed = true;
+          app.canvas.style.opacity = '1';
+          host.dataset.live2dReady = 'true';
+          onLoadingChangeRef.current?.(false, '角色已就绪');
+          onReadyRef.current?.();
+        }, error => {
+          if (disposed) return;
+          onLoadingChangeRef.current?.(false);
+          onErrorRef.current?.(error instanceof Error ? error.message : '角色画面准备失败，请重新加载');
+        });
+        onSnapshotReadyRef.current?.(() => {
+          if (disposed || !app) throw new Error('Live2D 舞台已关闭');
+          updateStage(true);
+          const width = app.screen.width, height = app.screen.height, resolution = app.renderer.resolution;
+          // Only the still capture renders at higher density; the small live preview stays cheap.
+          try {
+            app.renderer.resize(width, height, 1024 / Math.max(1, width, height));
+            app.render();
+            const snapshot = document.createElement('canvas');
+            snapshot.width = app.canvas.width; snapshot.height = app.canvas.height;
+            const context = snapshot.getContext('2d');
+            if (!context) throw new Error('无法生成 Live2D 快照');
+            context.drawImage(app.canvas as HTMLCanvasElement, 0, 0);
+            return snapshot;
+          } finally { app.renderer.resize(width, height, resolution); }
+        });
 
         model.once('destroy', () => {
           host.removeEventListener('pointermove', onPointerMove);
@@ -1528,6 +1595,9 @@ const Live2DAvatarCanvas: React.FC<Live2DAvatarCanvasProps> = ({
     void boot();
     return () => {
       disposed = true;
+      cancelReveal?.();
+      host.dataset.live2dReady = 'false';
+      onSnapshotReadyRef.current?.(null);
       resizeObserver?.disconnect();
       intersectionObserver?.disconnect();
       document.removeEventListener('visibilitychange', onDocumentVisibilityChange);

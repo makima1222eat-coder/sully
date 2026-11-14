@@ -1,3 +1,4 @@
+import { loadCharacterContextMessages } from './chatContextRange';
 import { APIConfig, CharacterProfile, Message, UserProfile } from '../types';
 import { ContextBuilder } from './context';
 import { DB } from './db';
@@ -187,7 +188,7 @@ const simpleHash = (value: string): string => {
 };
 
 export function createQixiFallbackBundle(contextSignature = '', charLayerColor = QIXI_FALLBACK_CHAR_LAYER_COLOR): QixiMemoryBundle {
-    const emptyScenes = Object.fromEntries(QIXI_SCENE_IDS.map(sceneId => [sceneId, {
+    const emptyScenes = Object.fromEntries(QIXI_SCENE_IDS.map((sceneId): [QixiSceneId, QixiScenePayload] => [sceneId, {
         transitionLines: [],
         sharedObject: '',
         memoryLine: '',
@@ -665,8 +666,9 @@ export async function prepareQixiMemoryBundle(
         userLayerColor?: string;
     } = {},
 ): Promise<QixiMemoryPreparation> {
+
     let messages: Message[] = [];
-    try { messages = await DB.getMessagesByCharId(char.id); } catch { /* fallback below */ }
+    try { messages = await loadCharacterContextMessages(char); } catch { /* fallback below */ }
     const contextSignature = buildContextSignature(messages, char, user);
     const cached = loadQixiMemoryBundle(char.id);
     if (!options.forceRegenerate && cached?.contextSignature === contextSignature) {
@@ -703,7 +705,7 @@ export async function prepareQixiMemoryBundle(
             roomPlatesInjection: recallChar.roomPlatesInjection || '',
         };
         const recent = formatRecentMessages(messages);
-        const roleAndMemoryContext = ContextBuilder.buildCoreContext(memoryChar, user, true);
+
         const endpoint = `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`;
         const requestPhase = async (phase: 'first' | 'second' | 'third', userContent: string) => {
             const data = await safeFetchJson(
@@ -713,10 +715,9 @@ export async function prepareQixiMemoryBundle(
                     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiConfig.apiKey}` },
                     body: JSON.stringify({
                         model: apiConfig.model,
-                        messages: [
-                            { role: 'system', content: roleAndMemoryContext },
+                        messages: (await ContextBuilder.buildCharacterRequest({ char: memoryChar, user }, [
                             { role: 'user', content: userContent },
-                        ],
+                        ])),
                         temperature: 0.68,
                         max_tokens: 32000,
                         // 七夕首轮内容较长。强制使用流式传输，让上游尽早返回响应头/数据片段，
@@ -726,7 +727,17 @@ export async function prepareQixiMemoryBundle(
                 },
                 0,
                 QIXI_PART1_TIMEOUT_MS,
-                { appId: 'special-moments', charId: char.id, purpose: `qixi-dual-layer-part1${phase === 'first' ? 'a' : phase === 'second' ? 'b' : 'c-bridge'}-v19` },
+                {
+                    appId: 'special-moments',
+                    appName: '七夕特别时刻',
+                    charId: char.id,
+                    charName: char.name,
+                    purpose: phase === 'first'
+                        ? '七夕双层记忆·上篇'
+                        : phase === 'second'
+                            ? '七夕双层记忆·中篇'
+                            : '七夕双层记忆·下篇与鹊桥',
+                },
                 {}, // Incremental SSE reader stops on [DONE] even if the proxy keeps the socket open.
             );
             const content = data?.choices?.[0]?.message?.content;

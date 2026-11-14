@@ -1,3 +1,5 @@
+import { ContextBuilder } from '../utils/context';
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useOS } from '../context/OSContext';
@@ -17,7 +19,6 @@ import {
     type LyricStyleCategory,
 } from '../utils/songPrompts';
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
-import { ContextBuilder } from '../utils/context';
 import { safeResponseJson, extractJson } from '../utils/safeApi';
 import { DB } from '../utils/db';
 import { putImageBlob, useBlobRefUrl, resolveRefToDataUrl } from '../utils/blobRef';
@@ -193,6 +194,12 @@ const SongwritingApp: React.FC = () => {
     const [tempLyricStyle, setTempLyricStyle] = useState<LyricCoWritingStyle>('adaptive');
     const [tempLyricStyleCategory, setTempLyricStyleCategory] = useState<LyricStyleCategory>('chinese');
     const [tempCollaboratorId, setTempCollaboratorId] = useState('');
+    useAppShortcut(ShortcutAppID.Songwriting, intent => {
+        if (intent.entryId === 'create') { setTempCollaboratorId(intent.characterId || ''); setView('create'); return; }
+        const target = songs.find(song => song.id === intent.resourceId);
+        setActiveSong(target || null); setLineDrafts({}); setWorkMode('notebook'); setView(target ? 'write' : 'shelf');
+        if (intent.resourceId && !target) addToast('这份乐谱已不存在，请重新设置槽位', 'error');
+    });
     const [partnerGroupId, setPartnerGroupId] = useState(GROUP_FILTER_ALL); // 创作伙伴页的分组筛选
     const [tempCoverStyle, setTempCoverStyle] = useState(COVER_STYLES[0]?.id || 'dawn-blush');
     const [tempTemplate, setTempTemplate] = useState<string>('free');
@@ -435,6 +442,7 @@ const SongwritingApp: React.FC = () => {
     // --- AI Interaction ---
 
     const handleSendToAI = async (userMessage: string, addAsLine: boolean = false, requestedType?: 'inspiration' | 'discussion' | 'feedback') => {
+
         if (!activeSong || !collaborator) return;
         setIsTyping(true);
         setLastTokenUsage(null);
@@ -468,14 +476,14 @@ const SongwritingApp: React.FC = () => {
 
         try {
             // Fetch recent 200 messages for context
-            const recentMessages = await DB.getRecentMessagesByCharId(collaborator.id, 200);
-            const msgContext = recentMessages.slice(-20).map(m => ({
+            const recentMessages = await loadCharacterContextMessages(collaborator);
+            const msgContext = recentMessages.map(m => ({
                 role: m.role === 'user' ? 'user' : 'assistant',
                 content: m.content
             }));
 
             await injectMemoryPalace(collaborator, undefined, `${updatedSong.title || ''} ${userMessage}`.trim() || undefined);
-            const systemPrompt = SongPrompts.buildMentorSystemPrompt(collaborator, userProfile, updatedSong, msgContext);
+            const systemPrompt = (await SongPrompts.buildMentorSystemPrompt(collaborator, userProfile, updatedSong, msgContext));
             let userPrompt = SongPrompts.buildUserMessage(updatedSong, userMessage, currentSection);
             if (requestedType) {
                 const typeHints: Record<string, string> = {
@@ -507,8 +515,15 @@ const SongwritingApp: React.FC = () => {
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: apiMessages, temperature: 0.8, max_tokens: 2000 })
-            });
+                body: JSON.stringify({ model: apiConfig.model, messages: (await ContextBuilder.buildCharacterRequest({ char: collaborator, user: userProfile }, apiMessages)), temperature: 0.8, max_tokens: 2000 }),
+                __sullyMeta: {
+                    appId: 'songwriting',
+                    appName: '写歌',
+                    charId: collaborator.id,
+                    charName: collaborator.name,
+                    purpose: '写歌创作讨论',
+                },
+            } as RequestInit);
 
             if (response.ok) {
                 const data = await safeResponseJson(response);
@@ -805,6 +820,7 @@ const SongwritingApp: React.FC = () => {
     }, [activeSong, lineAtSlot, updateSong]);
 
     const handleGenerateNotebookLine = useCallback(async (slot: LyricSlot) => {
+
         if (!activeSong || !collaborator || generatingSlotIndex !== null) return;
         if (!apiConfig.baseUrl || !apiConfig.apiKey) {
             addToast('请先在设置里配置 AI 模型。', 'error');
@@ -845,7 +861,7 @@ const SongwritingApp: React.FC = () => {
                 undefined,
                 `${snapshot.title} 第${slot.index + 1}句 ${snapshot.lines.map(line => line.content).join(' ')}`.trim(),
             );
-            const systemPrompt = SongPrompts.buildMentorSystemPrompt(collaborator, userProfile, snapshot, []);
+            const systemPrompt = (await SongPrompts.buildMentorSystemPrompt(collaborator, userProfile, snapshot, []));
             const existing = lineAtSlot(snapshot, slot.index);
             const request = [
                 `请为歌词本的第 ${slot.index + 1} 句${existing ? '重新写一个版本' : '写一句歌词'}。`,
@@ -864,14 +880,21 @@ const SongwritingApp: React.FC = () => {
                     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                     body: JSON.stringify({
                         model: apiConfig.model,
-                        messages: [
+                        messages: (await ContextBuilder.buildCharacterRequest({ char: collaborator, user: userProfile }, [
                             { role: 'system', content: systemPrompt },
                             { role: 'user', content: userPrompt + retryInstruction },
-                        ],
+                        ])),
                         temperature: attempt === 0 ? 0.9 : 0.65,
                         max_tokens: 500,
                     }),
-                });
+                    __sullyMeta: {
+                        appId: 'songwriting',
+                        appName: '写歌',
+                        charId: collaborator.id,
+                        charName: collaborator.name,
+                        purpose: '歌词合作填词',
+                    },
+                } as RequestInit);
                 if (!response.ok) throw new Error(`API Error: ${response.status}`);
                 const data = await safeResponseJson(response);
                 const raw = data.choices?.[0]?.message?.content?.trim() || '';
@@ -909,6 +932,7 @@ const SongwritingApp: React.FC = () => {
 
     // --- Completion ---
     const handleComplete = async () => {
+
         if (!activeSong || !collaborator) return;
         if (activeSong.lines.filter(l => !l.isDraft).length === 0) { addToast('歌曲还没有任何歌词', 'error'); return; }
 
@@ -924,21 +948,28 @@ const SongwritingApp: React.FC = () => {
                 `${activeSong.title} ${activeSong.lines.map(line => line.content).join(' ')}`.trim(),
                 userProfile.name,
             );
-            const systemPrompt = SongPrompts.buildCompletionSystemPrompt(collaborator, userProfile);
+            const systemPrompt = (await SongPrompts.buildCompletionSystemPrompt(collaborator, userProfile));
             const prompt = SongPrompts.buildCompletionPrompt(collaborator, userProfile, activeSong);
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: [
+                    messages: (await ContextBuilder.buildCharacterRequest({ char: collaborator, user: userProfile }, [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: prompt },
-                    ],
+                    ])),
                     temperature: 0.7,
                     max_tokens: 500,
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'songwriting',
+                    appName: '写歌',
+                    charId: collaborator.id,
+                    charName: collaborator.name,
+                    purpose: '全曲完稿乐评',
+                },
+            } as RequestInit);
 
             if (response.ok) {
                 const data = await safeResponseJson(response);
@@ -3647,3 +3678,5 @@ const SongwritingApp: React.FC = () => {
 };
 
 export default SongwritingApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

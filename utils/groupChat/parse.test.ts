@@ -1,7 +1,33 @@
 import { describe, it, expect } from 'vitest';
-import { parseDirectorActions, parseSummaryYaml, parseGroupTopicBox } from './parse';
+import { parseDirectorActions, parseSummaryYaml, parseGroupTopicBox, stripSkipMarker } from './parse';
 
 describe('parseDirectorActions', () => {
+    const members = [{id: 'c1', name: '聂廷'}, {id: 'c2', name: '阿.青(二)'}];
+    it('恢复截图中的时间、引用和按姓名发言，并保留逐条气泡', () => {
+        const raw = `<think>聂廷：不要显示思考</think>
+[约 1 分钟前] [聂廷 引用了 Charlie 说的「我不喜欢蒜苗」，并回复了 ↓]
+聂廷：回锅肉不放蒜苗还能叫回锅肉？
+[约 1 分钟前] 聂廷：我买两个不辣的。 [阿.青(二)：收到]
+[聂廷：门反锁给拧开。]`;
+        expect(parseDirectorActions(raw, members)).toEqual([
+            {charId: 'c1', content: '[[QUOTE: 我不喜欢蒜苗]]\n回锅肉不放蒜苗还能叫回锅肉？'},
+            {charId: 'c1', content: '我买两个不辣的。'},
+            {charId: 'c2', content: '收到'},
+            {charId: 'c1', content: '门反锁给拧开。'},
+        ]);
+    });
+    it('无姓名、重名、陌生人、用户和未闭合思考不猜归属', () => {
+        expect(parseDirectorActions('没有标明是谁说的', members)).toEqual([]);
+        expect(parseDirectorActions('<think>聂廷：思考', members)).toEqual([]);
+        expect(parseDirectorActions('聂廷：你好', [...members, {id: 'c3', name: '聂廷'}])).toEqual([]);
+        expect(parseDirectorActions('聂廷：第一行\n第二行\nCharlie：用户话\n用户续行\n路人：不要\n阿.青(二)：最后', members)).toEqual([
+            {charId: 'c1', content: '第一行\n第二行'}, {charId: 'c2', content: '最后'},
+        ]);
+    });
+    it('优先采用结构化输出，正文中的角色名不被拆散', () => {
+        expect(parseDirectorActions('[{"charId":"c1","content":"阿.青(二)：这是引用"}]', members))
+            .toEqual([{charId: 'c1', content: '阿.青(二)：这是引用'}]);
+    });
     it('标准 JSON 数组直接解析', () => {
         const raw = '[{"charId": "c1", "content": "早啊"}, {"charId": "c2", "content": "困死了"}]';
         expect(parseDirectorActions(raw)).toEqual([
@@ -37,6 +63,28 @@ describe('parseDirectorActions', () => {
     it('完全无法解析时返回空数组而不是抛错', () => {
         expect(parseDirectorActions('今天大家聊得很开心。')).toEqual([]);
         expect(parseDirectorActions('')).toEqual([]);
+    });
+
+    it('思考块里打的草稿不会被当成正式发言', () => {
+        const raw = '<thinking>先写个草稿 [{"charId": "c2", "content": "草稿"}] 不行，重写</thinking>\n[{"charId": "c1", "content": "正式"}]';
+        expect(parseDirectorActions(raw)).toEqual([{ charId: 'c1', content: '正式' }]);
+    });
+});
+
+describe('stripSkipMarker（轮流发言模式的输出）', () => {
+    it('剥掉思考块，只留要发的话', () => {
+        expect(stripSkipMarker('<think>该怎么接话呢</think>\n哈哈哈')).toEqual({ skipped: false, content: '哈哈哈' });
+        expect(stripSkipMarker('<thought>想想</thought>好')).toEqual({ skipped: false, content: '好' });
+    });
+
+    it('思考块后面跟着的「名字：」前缀也剥掉；只剩前缀算不说话', () => {
+        expect(stripSkipMarker('<think>嗯</think>\n阿澈：早', '阿澈')).toEqual({ skipped: false, content: '早' });
+        expect(stripSkipMarker('阿澈: [[SKIP]]', '阿澈')).toEqual({ skipped: true, content: '' });
+    });
+
+    it('只有思考块和 [[SKIP]]、或思考块没写完就断了，都算本轮不说话', () => {
+        expect(stripSkipMarker('<thinking>还是算了</thinking>[[SKIP]]')).toEqual({ skipped: true, content: '' });
+        expect(stripSkipMarker('<thinking>想到一半被截断')).toEqual({ skipped: true, content: '' });
     });
 });
 

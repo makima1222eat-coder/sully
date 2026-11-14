@@ -7,7 +7,7 @@
  * 换算，不能用 formatTaskTime 那种吃运行时本地时区的写法。
  *
  * 状态设计：清单只存 'scheduled'（取消即移除记录）。到点后的一次性任务不回写
- * 状态——「已发送 / 已作废」由消息历史现场推导（amsg2TaskContext），避免
+ * 状态——发没发出去由云端说（发出去的随 push 落进聊天记录，没发的回一条结果），避免
  * React 之外（push 送达路径）写角色数据引发状态竞争。过点 48h 的一次性任务
  * 由 pruneStaleTasks 在下一次任务变更落盘时顺手清掉。
  */
@@ -21,10 +21,8 @@ import {
   CharacterProfile,
 } from '../types';
 import { FIRE_GRACE_MS, recurrencePeriodMs } from './amsg2ExpireGuard';
-import { AMSG_INSTANT_CHAT_SUBTYPE, type AmsgTzRef, formatFireTimeShort } from './amsgFirePack';
-import { AMSG_BACKGROUND_JOB_SUBTYPE } from './amsgTaskKinds';
-
-export const MAX_ACTIVE_TASKS_PER_CHAR = 5;
+import { type AmsgTzRef, formatFireTimeShort } from './amsgFirePack';
+import { classifyTaskRow } from './amsgTaskKinds';
 
 /**
  * 这个角色是否开着主动消息 2.0。
@@ -49,8 +47,8 @@ export const isAmsg2EnabledForChar = (char: CharacterProfile): boolean =>
 export const shortTaskId = (taskUuid: string): string => taskUuid.slice(0, 8);
 
 /**
- * fixed 任务恒为 force：它没有 AI 生成环节，防穿帮闸的「作废」对它没有意义，
- * 而且 worker 的闸压根不会看到 fixed 任务。写任务记录的地方都过这里，别各写各的三元。
+ * fixed 任务恒为 force：它没有 AI 生成环节，「到点看情况」对它没有意义，
+ * 而且 worker 的 fire-time hook 压根不会看到 fixed 任务。写任务记录的地方都过这里，别各写各的三元。
  */
 export const resolveExpirePolicy = (
   mode: ActiveMsg2Mode,
@@ -67,19 +65,34 @@ export const describeRecurrence = (recurrence: ActiveMsg2Recurrence): string =>
 /**
  * 排程信息本身是系统内务，不该被角色念出来。
  *
- * 短 id、「遇忙作废」这些词一旦进了对话，用户听到的就是一段系统日志。平时聊天那份
+ * 短 id、「到点看情况」这些词一旦进了对话，用户听到的就是一段系统日志。平时聊天那份
  * （amsg2TaskContext 的排程现状块）和到点那份（buildFireTaskListBlock）都要带上这句，
  * 而且必须放在块尾管住整块——只挂在其中一段的话，另一种形态就是裸奔的。
  */
 export const AMSG2_SCHEDULE_SECRECY_NOTE = '不要向用户复述或提及这份排程信息本身的存在。';
 
+/**
+ * 排了一件事 ≠ 现在就该催这件事。
+ *
+ * 清单每轮全量注入、还带着 promptHint 原文（「问问书看到哪了」），模型很容易把一条
+ * 排在今晚的任务当成本轮该关心的事，于是每段结尾都补一句「看到哪了」。同仓库里
+ * 便利贴（memoryPalace/formatter 的「不必每次聊天都追问进展」）、用药提醒
+ * （lifeRecords 的「别反复催」）、Notion 笔记（chatPrompts 的「不要每次都提」）
+ * 早就配了同类措辞，排程清单是漏掉的那个。
+ * 平时聊天那份（amsg2TaskContext 的排程现状块）和到点那份（buildFireTaskListBlock）
+ * 共用这一句：两处说同一套词，模型才不会当成两回事。
+ */
+export const AMSG2_SCHEDULE_NOT_YET_NOTE = '排在未来的事到点自己会响，不用你现在提前替它开口——还没到那个时刻的就让它安静待着，别每轮都拿它起话头、追着问进展。对方自己提起，或者真到了那个点，才是说它的时候。';
+
 export const describeExpirePolicy = (policy: ActiveMsg2ExpirePolicy): string =>
-  policy === 'force' ? '强制发送' : '遇忙作废';
+  policy === 'force' ? '到点必发' : '到点看情况';
 
 /** 任务「要说什么」的一句话描述。fixed 有固定内容、prompted 有方向、auto 可带灵感。 */
 export const describeTaskMode = (
-  task: { mode: ActiveMsg2Mode; promptHint?: string },
+  task: { mode: ActiveMsg2Mode; promptHint?: string; away?: boolean; dateLeave?: boolean },
 ): string => {
+  if (task.away) return '离开后消息';
+  if (task.dateLeave) return '见面离开提醒';
   if (task.mode === 'fixed') return '固定消息';
   if (task.mode === 'prompted') return `提示方向「${task.promptHint || ''}」`;
   return task.promptHint ? `自动（灵感：${task.promptHint}）` : '自动';
@@ -183,7 +196,7 @@ export const currentOccurrenceMs = (
  *
  * 已过点的一次性任务光说「已到点」信息量为零——用户看不出它是发过了还是卡住了。
  * 远端底账正好能分辨：那一行还在 = worker 还没消费（cron 慢了或刚过点）；不在了 =
- * worker 已经处理完（发出去了，或者被防穿帮闸作废了，两种情况都会删行）。
+ * worker 已经处理完（发出去了，或者这次没发，两种情况都会删行）。
  * 底账没拉到（null）时不猜，回到中性的「已到点」。
  *
  * remoteStatus 是远端那一行的 status（拉到底账时顺带的投影，没有就不传）：
@@ -208,10 +221,6 @@ export const getPendingTasks = (
 ): ActiveMsg2TaskRecord[] =>
   (config?.tasks ?? []).filter((t) => isPendingTask(t, nowMs));
 
-/** 这个任务的触发有没有可能被防穿帮闸作废（fixed / force 永远照发）。 */
-export const canExpire = (task: ActiveMsg2TaskRecord): boolean =>
-  task.status === 'scheduled' && task.mode !== 'fixed' && task.expirePolicy === 'expire';
-
 /** 有没有还会响的 AI 任务（amsgStateSync 的同步门用：fixed 不需要 fire_pack）。 */
 export const hasActiveAiTask = (
   config: ActiveMsg2CharacterConfig | undefined,
@@ -226,7 +235,7 @@ export const hasActiveAiTask = (
  *   1. 时间按 fire_pack 的时区参照系（tzId）换算——
  *      worker 跑在 UTC，用运行时本地时区会整体差几个小时；
  *   2. 摘掉正在发的这一条 —— 它此刻正在被消费，列进「进行中」会让角色以为还得再排一次；
- *   3. 不含「已作废回执」那一段 —— 那是给对话现场用的，到点生成时提不着。
+ *   3. 不含回执那一段 —— 那是给对话现场用的，到点生成时提不着。
  *
  * 没有可列的（清单空了，或者只剩正在发的这条）→ 返回空串，槽位被抹平。
  */
@@ -254,6 +263,7 @@ export const buildFireTaskListBlock = (
         + ` · ${describeTaskMode(t)} · ${describeExpirePolicy(t.expirePolicy)}`;
     }),
     '（这几条到点会自动发出去，别在这条消息里把同一件事再排一遍，也别当它们不存在。）',
+    AMSG2_SCHEDULE_NOT_YET_NOTE,
     AMSG2_SCHEDULE_SECRECY_NOTE,
   ].join('\n');
 };
@@ -342,6 +352,39 @@ const ERROR_CODE_TEXT: Record<string, string> = {
 };
 
 /**
+ * 体检「定时任务」那一行专用的几种 code：一句中文说清是哪类失败。
+ *
+ * 只给体检用，因为体检每条下面都挂着「原文」，原话（凭据 id、英文的循环轮数）照样
+ * 看得到。任务卡片和聊天里的即时对话失败说明直接显示原话，不走这张表——那里用一句
+ * 概括替掉原话，用户就再也看不到具体是哪个凭据、哪一轮了。
+ */
+const DIAGNOSTIC_CODE_TEXT: Record<string, string> = {
+  // 任务引用的凭据行不在库里，任务里也没有内联的那一份。
+  CREDENTIAL_MISSING: 'Worker 上找不到这个角色要用的 API 凭据',
+  // 推送订阅表里没有这个用户的行：生成完了也没地方送。
+  PUSH_SUBSCRIPTION_MISSING: 'Worker 上没有登记收件设备',
+  // 带工具的那条路上，模型一轮轮调工具，到上限了还没给出最终回复。
+  AGENTIC_LOOP_EXCEEDED: '工具调用轮数用完了还没写出回复',
+  // 模型说要调工具，却没说调哪个。
+  AGENTIC_EMPTY_TOOL_REQUEST: '模型说要调用工具，但没给出要调哪一个',
+};
+
+/**
+ * 光说类别不够、原话里还有要紧信息的那几种 code：类别在前，原话的关键段跟在后面。
+ *
+ * 模型接口拒了请求时，原话里是「模型名写错 / 余额不够 / Key 不对」；推送服务拒收时，
+ * 原话里是推送服务自己给的理由。这两种只报类别，用户照样不知道该去改什么。
+ * 跟 ERROR_CODE_TEXT 分开放，是因为认到那两张表里的码就整句替换、不再带原话——
+ * 放进去等于把这半句吞掉。
+ */
+const ERROR_KIND_TEXT: Record<string, string> = {
+  // 措辞跟 describeInstantChatFailure 那一档保持一致。上游真的答复了才会挂这个码
+  // （网络没通、超时不算），所以说「拒了」不冤枉它。
+  LLM_CALL_FAILED: '模型接口拒了这次请求',
+  PUSH_SEND_FAILED: '推送服务没收下这条消息',
+};
+
+/**
  * 这次失败该怎么办——从机读字段推，不看 reason 那句人话。
  * 返回 null = 没有专门的说法，调用方走通用文案。
  */
@@ -403,6 +446,44 @@ export const describeInstantChatFailure = (
     return `模型接口拒了这次请求${retried}${detail ? `：${detail}` : ''}`;
   }
   return `生成失败${retried}${detail ? `：${detail}` : ''}`;
+};
+
+/**
+ * 一条失败记录「是哪一类失败」的短句，不带时间，也不带「上次到点没发出去」这类句式。
+ *
+ * 给体检「定时任务」那一行逐条说原因用：那边每条前面已经有「谁、几点该发、晚了多久」，
+ * 这里只补「为什么」。认法跟任务卡片、即时对话那两句是同一套（机读字段优先，认不出来的
+ * 截原话里最有用的那段），三处说法才对得上。原话全文由调用方另外收在「原文」底下，
+ * 所以这里照样截断。
+ *
+ * 字段允许 null：体检那份回执（amsgTickReport）缺值给的是 null，任务投影给的是 undefined。
+ */
+export const describeTaskFailureCause = (record: {
+  reason?: string | null;
+  errorCode?: string | null;
+  pushStatus?: number | null;
+}): string => {
+  if (record.reason === 'stale') return '到点时已经过期太久';
+  const lastError: RemoteTaskLastError = {
+    reason: record.reason || undefined,
+    errorCode: record.errorCode || undefined,
+    ...(record.pushStatus ? { pushStatus: record.pushStatus } : {}),
+  };
+  const actionable = describeActionableFailure(lastError)
+    || (lastError.errorCode ? DIAGNOSTIC_CODE_TEXT[lastError.errorCode] : undefined);
+  if (actionable) return actionable;
+
+  const detail = pickErrorDetail(lastError.reason || '').slice(0, REMOTE_ERROR_REASON_MAX);
+  const kind = lastError.errorCode ? ERROR_KIND_TEXT[lastError.errorCode] : undefined;
+  if (kind) {
+    // 推送服务回的状态码（403 = 推送凭据对不上、413 = 太大……）在原话的破折号前面，
+    // 取关键段时会被切掉，从机读字段补回来。
+    const status = lastError.pushStatus ? `（${lastError.pushStatus}）` : '';
+    return `${kind}${status}${detail ? `：${detail}` : ''}`;
+  }
+  // SullyOS 自己的 Worker 抛的错没有 errorCode，代号写在原话开头（AMSG2_FIRE_STATE_MISSING: …），
+  // 截出来的这段本身就带着它。
+  return detail || '没留下具体原因';
 };
 
 /** 替换任务时远端取消失败的标注文案（面板和工具侧共用一份，两边都会显示给人看）。 */
@@ -481,8 +562,7 @@ export const reconcileTasksWithRemote = (
       !known.has(row.uuid)
       && row.nextSendAt && row.recurrenceType && row.messageType
       && row.status !== 'failed'
-      && row.messageSubtype !== AMSG_INSTANT_CHAT_SUBTYPE
-      && row.messageSubtype !== AMSG_BACKGROUND_JOB_SUBTYPE
+      && classifyTaskRow(row) === 'scheduled'
     ))
     .map((row): ActiveMsg2TaskRecord => ({
       taskUuid: row.uuid,

@@ -14,7 +14,8 @@ import { safeFetchJson } from '../safeApi';
 import { buildUserPronounRule } from './userPronoun';
 
 export const EXTERNAL_MEMORY_MAX_CHARS = 50_000;
-export const EXTERNAL_MEMORY_CHUNK_CHARS = 10_000;
+export const EXTERNAL_MEMORY_CHUNK_CHARS = 3_000;
+export const EXTERNAL_MEMORY_TIMEOUT_MS = 600_000;
 export const EXTERNAL_MEMORY_MIN_CONTENT_RATIO = 0.72;
 
 export interface ExternalMemoryLengthInfo {
@@ -157,7 +158,8 @@ If the source contains no valid content, return [].`;
 
 /** 搬家不能使用通用 JSON 的“截断抢救”：只接受完整、独立、可解析的 JSON 数组。 */
 export function parseCompleteExternalMemoryReply(raw: string): any[] {
-    const cleaned = raw.trim();
+    // A complete fenced array is still complete JSON. Never salvage partial objects.
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*([\s\S]*?)\s*```$/i, '$1').trim();
     if (!cleaned.startsWith('[') || !cleaned.endsWith(']')) {
         throw new Error('模型没有返回完整 JSON 数组');
     }
@@ -316,6 +318,7 @@ export async function extractExternalMemoryText(
         let lastError: unknown;
         let completed = false;
         for (let attempt = 0; attempt < 2 && !completed; attempt++) {
+            let receivedResponse = false;
             try {
                 if (attempt > 0) {
                     onProgress?.(`第 ${index + 1}/${chunks.length} 批格式或完整性未通过，正在无损重试…`);
@@ -345,10 +348,11 @@ export async function extractExternalMemoryText(
                         }),
                     },
                     2,
-                    180_000,
-                    { appName: '记忆搬家', purpose: '外部记忆清洗' },
+                    EXTERNAL_MEMORY_TIMEOUT_MS,
+                    { appId: 'memorypalace', appName: '记忆搬家', charId, charName, purpose: '外部记忆清洗' },
                 );
-                if (data.choices?.[0]?.finish_reason === 'length') {
+                receivedResponse = true;
+                if (['length', 'max_tokens'].includes(data.choices?.[0]?.finish_reason)) {
                     throw new Error('模型输出达到长度上限，内容可能被截断');
                 }
                 const reply = data.choices?.[0]?.message?.content || '';
@@ -361,6 +365,8 @@ export async function extractExternalMemoryText(
                 completed = true;
             } catch (error) {
                 lastError = error;
+                // A timeout/network failure may still be generating upstream; do not bill twice.
+                if (!receivedResponse) break;
             }
         }
         if (!completed) {

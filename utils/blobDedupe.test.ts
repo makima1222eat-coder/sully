@@ -2,7 +2,10 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { DB, openDB } from './db';
 import { rewriteBlobRefs, rewriteRefsInText, rewriteRefsDeep, collectUnmergeableRefs, buildMergePlan } from './blobDedupe';
 import { REF_SOURCE_STORES, runBlobGc } from './blobGc';
-import { putImageBlob, getBlobForRef, BLOBREF_PREFIX } from './blobRef';
+import { getBlobForRef, BLOBREF_PREFIX } from './blobRef';
+import { blobStore } from './blobStore';
+// Deliberately create distinct legacy aliases. Normal uploads now reuse a content hash.
+const putImageBlob = (blob: Blob) => blobStore.put(blob);
 import { tryAcquireMaintenanceLock, releaseMaintenanceLock } from './maintenanceLock';
 
 // fake-indexeddb 已由 test-setup.ts 注入。
@@ -200,7 +203,7 @@ describe('与孤儿 GC 的配合', () => {
         expect(REF_SOURCE_STORES.length).toBeGreaterThan(0);
         expect([...REF_SOURCE_STORES]).toEqual(
             [
-                'characters', 'messages', 'cc_custom_parts', 'songs', 'gallery', 'assets', 'themes', 'emojis',
+                'daily_schedule', 'characters', 'messages', 'cc_custom_parts', 'songs', 'gallery', 'assets', 'themes', 'emojis',
                 'user_profile', 'social_posts', 'groups', 'character_groups', 'story_theater_masks',
                 'bank_data', 'guidebook', 'life_sim', 'pixel_home_assets',
             ],
