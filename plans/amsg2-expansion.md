@@ -8,8 +8,8 @@
 > |---|---|
 > | `kind → handler` 注册表 | `worker/amsg/src/fireKinds.ts`。分派点在聊天那四道门**之前**，所以后台任务不用传 fire_pack / tool_pack |
 > | 后台任务的通用约定 | `utils/amsgTaskKinds.ts`：`metadata.amsgKind` 标种类、`amsg:job` 命名空间放一次性输入、`messageSubtype: 'job'` 让它们不出现在用户的任务清单里 |
-> | 结果回程 | `ctx.emitResult` → 服务端收件箱 → 客户端上线补收 → `utils/amsgResults.ts` 按 `resultKind` 派活。门牌的结果带 `notification: { show: false }`，只落账本不发推送 |
-> | `clientStateTtl` | 只配在 `amsg:job` 上（3 天）。角色状态那个命名空间绝不能配，配了就是定时把 fire_pack 抹掉 |
+> | 结果回程 | `ctx.emitResult` → 服务端收件箱 → 客户端上线补收 → `utils/amsgResults.ts` 按 `resultKind` 派活。门牌的结果带 `notification: { show: false }`，只落账本不发推送；定时主动消息到点没发时回的 `fire-skipped` 也走这条路 |
+> | `clientStateTtl` | `amsg:job` 保留 3 天，独立即时输入 `amsg:instant-input` 保留 7 天，不可变附件 `amsg:attachments` 保留 30 天，诊断记录按自身期限清理。角色状态命名空间不配 TTL |
 > | 门牌整理 | 提示词/解析/合并抽进零依赖叶子 `utils/memoryPalace/roomPlateCore.ts`，浏览器和 worker 共用；云端那条路在 `roomPlateCloud.ts`，worker 侧在 `worker/amsg/src/plateFire.ts` |
 > | 凭据 | credRefs 加了 `memory` 一档（记忆宫殿副 API）。没配副 API 就不上云，不回落到主 API |
 >
@@ -27,7 +27,9 @@
 >
 > 同一个角色**同时只许一份整理在飞**（`roomPlateCloud` 的在飞记号，localStorage，30 分钟超时放行）。两份先后落地就是拿两份旧快照互相盖，还白烧一次 API。这时候不退回本地跑——本地那一遍同样会跟在飞那份撞车，所以判定是三态：交得出去 / 退回本地 / 这轮跳过（只做送达保证）。`plateCloudGate` 里三道门的顺序有讲究：「这台 worker 认不认识后台任务」排在「有没有在飞的」前面（路断了就该退回本地干活），但探测**问不到**时反过来先看在飞——网络抖一下不等于路断，那时候退本地就是跟云端那份撞车。
 >
-> 结果这条腿有自己的时效：补收不套聊天那两天的窗口（结果晚到本来就是常态），但账本留 28 天，重装 PWA 的用户一接上就会把老结果一次性拉回来，所以账本上记的时间随结果交给 handler，门牌那边超过一周就直接销账丢掉。同一份结果会被送到两次以上（销账那步失败会重放，推送直达那条腿收下之后压根不销账、补收时又来一遍），而落地不是幂等的——合并对每条保留下来的条目 `sourceCount + 1`，那就是门牌面板上的「印证 N 次」。所以本地留一本「哪些 job 已经落过地」的底账，见过的直接销账。结果落地前还要确认**角色还在**：删角色清的是云端那份输入，而结果回来说明 LLM 早跑完了、输入那会儿已经被 worker 删掉，不拦的话会给一个已经不存在的角色重新建出四块门牌。
+> **快照时间随结果一起回来**：在飞记号只管 30 分钟，结果却允许晚到一周——下一轮整理开始时 `plateCloudGate` 会清掉过期的旧记号，之后的提交换成新 job，而旧结果仍可能落地。所以客户端把 `snapshotAt`（读取快照的绝对时间戳）放进 job，Worker 解析后原样带回结果。落地时同 job 的本地记号还在就用记号上的时间，否则用结果带回的时间；合并靠它分清哪些条目是提交之后用户才改的（文本以本地为准），哪些是提交之前就有的（接受云端改写）。两处都没有时间时按「谁都可能被改过」保守保护，不拿另一 job 的时间或结果生成时间代替。仅关页重开、仅经过 30 分钟不会删除记号，清理发生在下一轮整理入口。`snapshotAt` 是可选字段，前端与 Worker 都带上它才生效。
+>
+> 结果这条腿有自己的时效：正文补收已取消两天窗口，结果仍按产物语义判断有效期；账本留 28 天，重装 PWA 的用户一接上就会把老结果一次性拉回来，所以账本上记的时间随结果交给 handler，门牌那边超过一周就直接销账丢掉。同一份结果会被送到两次以上（销账那步失败会重放，推送直达那条腿收下之后压根不销账、补收时又来一遍），而落地不是幂等的——合并对每条保留下来的条目 `sourceCount + 1`，那就是门牌面板上的「印证 N 次」。所以本地留一本「哪些 job 已经落过地」的底账，见过的直接销账。结果落地前还要确认**角色还在**：删角色清的是云端那份输入，而结果回来说明 LLM 早跑完了、输入那会儿已经被 worker 删掉，不拦的话会给一个已经不存在的角色重新建出四块门牌。
 >
 > 后台任务在调度器里的两处「别跟聊天混为一谈」：
 >
@@ -49,6 +51,7 @@
 - 生成 3 秒的东西上云，收益接近零，成本照付。
 - 生成 60 秒、且用户大概率已经切走的，收益最大。
 - 用户必须当场看到下一句才能继续的（通话），上云是负收益。
+- 云端只有异步一种形态（没有同步流式通道），所以先看结果能不能晚点到——必须当场拿到的，直接不考虑上云。
 
 成本那头有三项，按大小排：
 
@@ -222,28 +225,10 @@
 |---|---|---|
 | Web Push | 推 | 主通道，受 3993 字节限制 |
 | outbox 账本 | 拉 | 推送丢失兜底。每条 push 发出**之前**先落一行，客户端落库后 ack |
-| client_state 旁路键 | 拉 | 结果太大或不想用推送时。worker `ctx.writeState` 写、客户端 `readClientStateValue` 取 |
+| 不可变附件 / 旧 client_state 旁路键 | 拉 | 大数据优先用 `ctx.storeAttachment` / `getAttachment`，绑定任务与触发时刻，读取不删、30 天回收；旧引用仍兼容 |
 | 任务状态点名 | 拉 | 判「还在跑 / 已失败 / 行没了」 |
 
 **结果可以晚到的调用点根本不用碰推送**，只用 client_state 拉取就行，代码量减半。`utils/activeMsgRuntime.ts:309` 的 `startLateEmotionPoll` 是完整可抄的样板 —— 含「新一轮到达时旧轮询作废」「跳数用尽按失败收尾」「取回后删云端副本」。
-
----
-
-## Instant Push 下架后
-
-IP 下架不影响这轮上云，反而更简单：`hooks/useChatAI.ts:851` 的分流条件 `instantChatRoute = instantChatOn && !instantChatVeto && !instantPushConfigured` 会少一项，现在被 IP 截胡的那批用户自动落到主动消息 2.0 上。
-
-拆代码时这三处要留意：
-
-| 位置 | 处理 |
-|---|---|
-| `utils/activeMsgRuntime.ts` | **留着。** 它是两条路共用的送达层（收件箱 → 落库），只是日志 tag 叫 `instant-push`、看着像 IP 的文件。别按文件名删，可以顺手改名 |
-| `utils/emotionEvalCore.ts` | **留着。** `worker/instant-push/src/index.ts:26` 和 `worker/amsg/src/emotionEval.ts:28` 都 import 它，是两个 bundle 共用的零依赖叶子 |
-| `utils/activeMsgClient.ts:89` | **搬家。** 主动消息 2.0 从 `instantPushClient` 引了 `copyWorkerBundleToClipboard`，删之前先把它挪出来 |
-
-另外 IP 走了之后，全项目就没有「同步 + SSE 流式」的云端通道了（IP 的 `POST /instant` + SSE 是唯一一条）。上云从此只有异步一种形态 —— 这正好让筛选标准更干净：只看结果能不能晚点到。
-
-请求体 gzip 上行的现成实现也在 IP 那条路上（`utils/instantPushClient.ts:1093` 的 `compressRequest`，实现在 IP 的 client 库 + worker 里）。上游把 gzip 解压做掉之后这份就不用移植了。
 
 ---
 

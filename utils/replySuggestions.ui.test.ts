@@ -63,7 +63,7 @@ it('切换聊天卸载组件时取消未完成的生成请求', async () => {
 it('单聊选项发送显式绕过即时自动回复开关', () => {
     const source = readFileSync('apps/Chat.tsx', 'utf8');
     expect(source).toContain("handleSendText(text, 'text', undefined, true, bubbleIndex > 0)");
-    expect(source).toContain("if (!suppressAutoReply && type === 'text'");
+    expect(source).toContain("finish(!suppressAutoReply && sent === true");
 });
 
 it('部分发送失败重试时不会重复已发送的消息', async () => {

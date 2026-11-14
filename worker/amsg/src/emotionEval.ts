@@ -1,3 +1,4 @@
+import {FRIEND_FEED_MAIN_PROMPT_PREFIX} from '../../../utils/friendFeedReplyFormat';
 /**
  * 即时对话的云端情绪评估。
  *
@@ -9,10 +10,9 @@
  * 大文本（角色的 system prompt、完整对话历史）留成占位符，由本次请求已有的 chat 段
  * 还原回原位。这样上下文不必在请求体里重复发一份，输出又与本地逐字对齐。
  *
- * 还原规则与 instant push worker 的 `runEmotionEval`（worker/instant-push/src/index.ts）
- * **逐字同款**——两边吃的是同一个模板，格式一漂输出就变味。所以内核收敛在
- * utils/emotionEvalCore.ts 这份零依赖叶子里，两个 worker bundle 共用；这里只留
- * amsg 侧特有的部分（评估配置的摘取与红线处理、旁路存储键）。
+ * 还原规则必须与前端生成模板时的约定**逐字同款**——格式一漂输出就变味。内核放在
+ * utils/emotionEvalCore.ts 这份零依赖叶子里；这里只留 amsg 侧特有的部分（评估配置的
+ * 摘取与红线处理、旁路存储键）。
  *
  * 失败绝不连累主回复——用户等的是那句话，情绪只是附赠；跑挂了就带一句短原因回去，
  * 让客户端能照实说明白，而不是丢一句「可查 worker 日志」。
@@ -25,6 +25,7 @@ import {
   requestEmotionEval,
   restoreEvalPrompt as coreRestoreEvalPrompt,
   type EmotionEvalOutcome,
+  tagHomeSecretEval,
 } from '../../../utils/emotionEvalCore';
 
 /** 副 API 凭据的两种长相：任务里内联的 { baseUrl, apiKey, model }，或凭据表里的三件套。 */
@@ -38,6 +39,7 @@ export interface AmsgEmotionEvalApi {
 export interface AmsgEmotionEvalSpec {
   /** 带两个占位符的评估提示词模板。 */
   prompt: string;
+  homeSecretRequestId?: string;
   /**
    * 副 API 凭据（没单独配就是主 API 那一份）。
    *
@@ -161,7 +163,7 @@ export const takeEmotionEvalSpec = (
   return isUsableEvalSpec(spec) ? spec : null;
 };
 
-// 占位符还原 / 打码 / 请求内核在 utils/emotionEvalCore.ts（与 instant-push 共用）。
+// 占位符还原 / 打码 / 请求内核在 utils/emotionEvalCore.ts。
 // re-export 保住既有导入点（本文件历史上就是它们的家）。
 export { restoreEvalPrompt } from '../../../utils/emotionEvalCore';
 
@@ -205,5 +207,12 @@ export const runAmsgEmotionEval = async (
   chatMessages: Array<{ role: string; content: unknown }>,
   charName: string,
   timeoutMs: number = EMOTION_EVAL_TIMEOUT_MS,
-): Promise<AmsgEmotionEvalOutcome> =>
-  requestEmotionEval(api, coreRestoreEvalPrompt(spec.prompt, chatMessages, charName), timeoutMs);
+  signal?: AbortSignal,
+): Promise<AmsgEmotionEvalOutcome> => {
+  // User-comment replies belong to the main generation. Keep its separate task
+  // out of the emotion prompt while retaining the shared history and live context.
+  const emotionMessages = chatMessages.filter(message => !(message.role === 'system'
+    && typeof message.content === 'string' && message.content.startsWith(FRIEND_FEED_MAIN_PROMPT_PREFIX)));
+  const result = await requestEmotionEval(api, coreRestoreEvalPrompt(spec.prompt, emotionMessages, charName), timeoutMs, signal);
+  return result.raw ? {...result, raw: tagHomeSecretEval(result.raw, spec.homeSecretRequestId)} : result;
+};

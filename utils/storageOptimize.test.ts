@@ -58,6 +58,41 @@ async function blobBytes(token: string): Promise<Uint8Array> {
 }
 
 describe('优化资源存储（一次性批量迁移）', () => {
+    it('合并提交前并发清理保留图，不会把正常引用改成缺图', async () => {
+        const keeperId = 'img_100000_1_merge_race';
+        const duplicateId = 'img_200000_1_merge_race';
+        const keeper = `blobref:${keeperId}`;
+        await DB.putBlobAsset(keeperId, dataUrlToBlob(TINY_PNG));
+        await DB.putBlobAsset(duplicateId, dataUrlToBlob(TINY_PNG));
+        await DB.saveAsset('wallpaper', `blobref:${duplicateId}`);
+
+        let entered!: () => void, resume!: () => void;
+        const ready = new Promise<void>(resolve => { entered = resolve; });
+        const gate = new Promise<void>(resolve => { resume = resolve; });
+        const write = DB.putStoreRows.bind(DB);
+        const spy = vi.spyOn(DB, 'putStoreRows').mockImplementation(async (store, rows) => {
+            if (store === 'assets' && rows.some((row: any) => row.id === 'wallpaper' && row.data === keeper)) {
+                entered();
+                await gate; // 已检查保留图存在，尚未提交新引用。
+            }
+            return write(store, rows);
+        });
+        const optimizing = optimizeResourceStorage();
+        let deleting: Promise<void> | undefined;
+        try {
+            await ready;
+            deleting = DB.deleteBlobAsset(keeperId);
+            // 无保护时删除能在暂停点完成；受保护时它等待引用落盘。
+            await Promise.race([deleting, new Promise(resolve => setTimeout(resolve, 100))]);
+        } finally {
+            resume();
+            await Promise.all([optimizing, deleting]).finally(() => spy.mockRestore());
+        }
+        expect(await DB.getAssetRaw('wallpaper')).toBe(keeper);
+        expect(await getBlobForRef(keeper)).not.toBeNull();
+        expect(await blobBytes(keeper)).toEqual(new Uint8Array(await dataUrlToBlob(TINY_PNG).arrayBuffer()));
+    });
+
     it('壁纸 assets 行转成令牌，Blob 字节与原图逐一致', async () => {
         await DB.saveAsset('wallpaper', TINY_PNG);
         const r = await optimizeResourceStorage();
@@ -1136,6 +1171,19 @@ describe('去重：同一张图只留一份 Blob', () => {
 });
 
 describe('记忆向量：压成紧凑形态', () => {
+    it('一键优化同时收敛旧连接小数，不删除边，第二次幂等', async () => {
+        const db = await openDB();
+        await new Promise<void>((resolve, reject) => {
+            const tx = db.transaction('memory_links', 'readwrite');
+            tx.objectStore('memory_links').clear();
+            tx.objectStore('memory_links').put({ id: 'old-link', sourceId: 'm1', targetId: 'm2', type: 'emotional', strength: 0.2789476291284245 });
+            tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
+        });
+        const result = await optimizeResourceStorage();
+        expect(result.linksCompacted).toBe(1);
+        expect(await DB.getRawStoreData('memory_links')).toEqual([{ id: 'old-link', sourceId: 'm1', targetId: 'm2', type: 'emotional', strength: 0.27895 }]);
+        expect((await optimizeResourceStorage()).linksCompacted).toBe(0);
+    });
     /** 直接塞一条旧 number[] 形态的向量（绕开 MemoryVectorDB.save，它会当场转成紧凑形态）。 */
     async function seedLegacyVector(memoryId: string, charId: string, dims: number): Promise<number[]> {
         const vector = Array.from({ length: dims }, (_, i) => (i % 7) / 7 - 0.5);
@@ -1333,7 +1381,7 @@ describe('气泡主题导出：分享文件里不能留令牌', () => {
     // 拿到的是一串死字符串，三张图全空，还没有任何报错。所以导出前必须在深拷贝上跑一遍
     // resolveBlobRefsDeep 把令牌换回内嵌 data URL。
     // 真调一次得把整个工坊界面渲染起来，代价太大，这里用源码锚：改坏导出这条就挂。
-    const themeMakerSrc = readFileSync(new URL('../apps/ThemeMaker.tsx', import.meta.url), 'utf8');
+    const themeMakerSrc = readFileSync(new URL('../components/chat/BubbleMaker.tsx', import.meta.url), 'utf8');
 
     /** 截出 exportSavedTheme 的函数体（到第一处同缩进的收尾 `};` 为止）。 */
     function exportFnBody(): string {

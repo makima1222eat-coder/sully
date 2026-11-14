@@ -1,12 +1,11 @@
 /**
  * 云端情绪评估的共用内核：占位符还原 + 副 API 请求 + 失败文案（先打码后截断）。
  *
- * 两个 worker（amsg 的即时对话路径、instant-push 的 Instant 路径）吃的是前端同一个
- * `buildEmotionEvalPrompt(..., includeContext=false, ...)` 模板，还原与请求逻辑必须
- * **逐字同款**——过去是两份手工同步的副本，d92231a 给报错加 apiKey 打码时只落了一份，
- * 另一份就把副 API key 随 push 带出去了。收敛到这一份叶子后，改哪条规则两边一起动。
+ * amsg worker 的即时对话路径吃的是前端 `buildEmotionEvalPrompt(..., includeContext=false, ...)`
+ * 生成的模板，还原与请求逻辑必须跟模板约定**逐字同款**。报错文案里的 apiKey 一定要先打码
+ * 再截断，否则副 API key 会随 push 带出去。
  *
- * 零浏览器 / 零 worker 运行时依赖（两个 worker bundle 都会把这份代码打进去）。
+ * 零浏览器 / 零 worker 运行时依赖（会被打进 amsg worker bundle）。
  */
 
 /** 副 API 凭据（没单独配就是主 API 那一份）。 */
@@ -14,6 +13,12 @@ export interface EmotionEvalApi { baseUrl: string; apiKey: string; model: string
 
 export const EMOTION_EVAL_SYSTEM_SLOT = '__EMOTION_EVAL_SYSTEM_PROMPT__';
 export const EMOTION_EVAL_HISTORY_SLOT = '__EMOTION_EVAL_HISTORY__';
+
+/** Trusted transport marker keeps the expected task ID even if the model omits its mandatory fields. */
+export const tagHomeSecretEval = (raw: string, requestId?: string): string =>
+  requestId && /^[\w-]+$/.test(requestId) ? `HOME_SECRET_REQUEST:${requestId}\n${raw}` : raw;
+export const homeSecretEvalRequestId = (raw: string): string | undefined =>
+  raw.match(/^HOME_SECRET_REQUEST:([\w-]+)\r?\n/)?.[1];
 
 /** 单次评估请求的上限；副 API 卡住的话，主流程不该跟着一起被扣在这儿。 */
 export const EMOTION_EVAL_TIMEOUT_MS = 120_000;
@@ -81,12 +86,20 @@ export const maskAndSnip = (text: string, apiKey: string): string => {
   return snippet.slice(0, ERROR_SNIPPET_MAX);
 };
 
+/** 评估响应里供应商回报的 token 用量（只取标准入/出两个数）。 */
+export interface EmotionEvalUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+}
+
 /** 一次评估的结局：拿到原文，或者一句能给用户看的短失败原因。 */
 export interface EmotionEvalOutcome {
   /** 评估模型的输出原文；没跑出来时为 null。 */
   raw: string | null;
   /** 没跑出来的原因（人话、一句话）；成功时为 null。 */
   error: string | null;
+  /** 供应商回报的 token 用量；未返回或请求失败时为空。 */
+  usage?: EmotionEvalUsage;
 }
 
 /**
@@ -97,8 +110,12 @@ export const requestEmotionEval = async (
   api: EmotionEvalApi,
   promptContent: string,
   timeoutMs: number = EMOTION_EVAL_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<EmotionEvalOutcome> => {
   const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) return { raw: null, error: null };
+  signal?.addEventListener('abort', abort, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const baseUrl = String(api.baseUrl).replace(/\/+$/, '');
@@ -128,6 +145,17 @@ export const requestEmotionEval = async (
       return { raw: null, error: `副 API HTTP ${res.status}${snippet ? `：${snippet}` : ''}` };
     }
     const data = await res.json() as any;
+    const rawUsage = data?.usage;
+    const promptTokens = typeof rawUsage?.prompt_tokens === 'number' && Number.isFinite(rawUsage.prompt_tokens)
+      ? rawUsage.prompt_tokens : undefined;
+    const completionTokens = typeof rawUsage?.completion_tokens === 'number' && Number.isFinite(rawUsage.completion_tokens)
+      ? rawUsage.completion_tokens : undefined;
+    const usage: EmotionEvalUsage | undefined = (promptTokens !== undefined || completionTokens !== undefined)
+      ? {
+        ...(promptTokens !== undefined ? { promptTokens } : {}),
+        ...(completionTokens !== undefined ? { completionTokens } : {}),
+      }
+      : undefined;
     // 个别中转把全部输出塞进 reasoning_content 而 content 留空——与客户端
     // utils/emotionApply.ts 的 extractAssistantText 同一套兜底。
     const message = data?.choices?.[0]?.message;
@@ -137,10 +165,12 @@ export const requestEmotionEval = async (
       return {
         raw: null,
         error: `评估模型没有输出内容（finish_reason: ${data?.choices?.[0]?.finish_reason ?? '?'}）`,
+        ...(usage ? { usage } : {}),
       };
     }
-    return { raw, error: null };
+    return { raw, error: null, ...(usage ? { usage } : {}) };
   } catch (error) {
+    if (signal?.aborted) return { raw: null, error: null };
     console.warn('[emotion-eval] 评估失败（主流程不受影响）', error);
     // 只带异常名/消息，不带栈：这句要走 push 出门，短一点、也别把内部路径抖出去。
     // 异常消息同样过打码：fetch 异常一般不含请求头，但 URL 解析类错误会回显传入的
@@ -151,5 +181,6 @@ export const requestEmotionEval = async (
     return { raw: null, error: reason };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
   }
 };

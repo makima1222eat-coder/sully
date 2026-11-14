@@ -1,3 +1,4 @@
+import { ContextBuilder, type CharacterContextInput } from '../../utils/context';
 /**
  * Memory Dive Engine (记忆潜行引擎)
  *
@@ -294,9 +295,9 @@ function salvageDialoguesFromText(raw: string): Array<{ speaker: 'character' | '
 export async function callDiveLLM(
   req: DiveLLMRequest,
   apiConfig: APIConfig,
-  charContext: string,
+  charContext: CharacterContextInput,
 ): Promise<DiveLLMResponse> {
-  const prompt = buildDivePrompt(req, charContext);
+  const prompt = buildDivePrompt(req, '');
 
   const data = await safeFetchJson(
     `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`,
@@ -308,7 +309,7 @@ export async function callDiveLLM(
       },
       body: JSON.stringify({
         model: apiConfig.model,
-        messages: [{ role: 'user', content: prompt }],
+        messages: (await ContextBuilder.buildCharacterRequest(charContext, [{ role: 'user', content: prompt }])),
         temperature: 0.8,
         // 中文散文 + JSON 包装极吃 token，给足余量，避免在字符串中间被截断
         max_tokens: 8000,
@@ -317,7 +318,7 @@ export async function callDiveLLM(
       }),
     },
     2, // 最多重试 2 次（覆盖瞬时 5xx / 网络抖动）
-    0, { appName: '记忆潜行', purpose: '探访生成' },
+    0, { appName: '记忆潜行', charId: req.charId, charName: req.charName, purpose: '探访生成' },
   );
 
   const content = extractContent(data);
@@ -839,12 +840,12 @@ function salvageTruncatedRoomScript(raw: string): any | null {
 export async function planRoomVisit(
   params: PlanRoomParams,
   apiConfig: APIConfig,
-  charContext: string,
+  charContext: CharacterContextInput,
   remoteConfig?: RemoteVectorConfig,
-): Promise<{ script: RoomScript; memoryTexts: string[] }> {
+  ): Promise<{ script: RoomScript; memoryTexts: string[] }> {
   const memories = await fetchRoomMemories(params.charId, params.room, 8, remoteConfig);
   const memoryTexts = memories.map(m => m.content);
-  const prompt = buildRoomScriptPrompt(params, memoryTexts, charContext);
+  const prompt = buildRoomScriptPrompt(params, memoryTexts, '');
 
   const data = await safeFetchJson(
     `${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`,
@@ -856,7 +857,7 @@ export async function planRoomVisit(
       },
       body: JSON.stringify({
         model: apiConfig.model,
-        messages: [{ role: 'user', content: prompt }],
+        messages: (await ContextBuilder.buildCharacterRequest(charContext, [{ role: 'user', content: prompt }])),
         temperature: 0.85,
         // 3 beats × 3 choices × (line+reaction+narrator) + intro/close 容易超，
         // 给足余量避免被 max_tokens 截断
@@ -864,7 +865,7 @@ export async function planRoomVisit(
         response_format: { type: 'json_object' },
       }),
     },
-    2, 0, { appName: '记忆潜行', purpose: '剧本生成' },
+    2, 0, { appName: '记忆潜行', charId: params.charId, charName: params.charName, purpose: '剧本生成' },
   );
 
   const content = extractContent(data);
@@ -1022,7 +1023,7 @@ export async function emitDiveEmotion(params: EmitDiveEmotionParams): Promise<vo
           stream: false,
         }),
       },
-      2, 0, { appName: '记忆潜行', purpose: '情绪结算' },
+      2, 0, { appName: '记忆潜行', charId: params.charProfile.id, charName: params.charProfile.name, purpose: '情绪结算' },
     );
 
     const raw = data?.choices?.[0]?.message?.content || '';

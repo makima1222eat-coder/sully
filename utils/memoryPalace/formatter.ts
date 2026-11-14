@@ -15,6 +15,7 @@
 import type { Anticipation, EventBox, MemoryNode, ScoredMemory } from './types';
 import { MemoryNodeDB, EventBoxDB } from './db';
 import { recordRecallReceipt } from './recallReceipts';
+import { memoryContentWithDates } from './relativeTime';
 
 const DEFAULT_MAX_OUTPUT_ITEMS = 15;
 const MAX_LIVE_NODES_PER_BOX = 8; // 单盒最多展开多少条活节点（防止超大盒污染）
@@ -75,8 +76,10 @@ export async function expandAndFormat(
     userName?: string,
     /** 注入上限。rerank 启用时传 15 + topN，让 rerank 额外召回的不被切。 */
     maxOutputItems: number = DEFAULT_MAX_OUTPUT_ITEMS,
+    options?: { omitDates?: boolean },
 ): Promise<string> {
     const MAX_OUTPUT_ITEMS = maxOutputItems;
+    const omitDates = options?.omitDates === true;
     // 0. 加载便利贴置顶记忆（pinnedUntil > now，不占 15 条名额）
     const now = Date.now();
     const allCharNodes = await MemoryNodeDB.getByCharId(charId);
@@ -122,15 +125,15 @@ export async function expandAndFormat(
         const box = await EventBoxDB.getById(boxId);
         if (!box) {
             // box 丢失 → 退化为单条命中
-            renderItems.push(buildStandaloneItem(hit.sample, now));
+            renderItems.push(buildStandaloneItem(hit.sample, now, omitDates));
             continue;
         }
-        const item = await buildBoxItem(box, hit.topScore, localNodeMap, now, hit.guaranteed);
+        const item = await buildBoxItem(box, hit.topScore, localNodeMap, now, hit.guaranteed, omitDates);
         if (item) renderItems.push(item);
     }
 
     for (const r of standaloneItems) {
-        renderItems.push(buildStandaloneItem(r, now));
+        renderItems.push(buildStandaloneItem(r, now, omitDates));
     }
 
     // 3. 排序（finalScore 降序，同分时较新者优先）+ 截断到 MAX_OUTPUT_ITEMS
@@ -226,8 +229,12 @@ export async function expandAndFormat(
         // 早就配了同类措辞，这里补齐。
         output += `(These are things you have been keeping in mind these days. Keeping something in mind does not mean saying it constantly — when the conversation naturally gets there, one passing mention is enough; otherwise let it stay in your heart. Don't chase progress on the same matter every chat, and don't schedule when they should get around to it.)\n`;
         for (const node of pinnedNodes) {
-            const daysLeft = Math.ceil((node.pinnedUntil! - now) / (24 * 60 * 60 * 1000));
-            output += `- [${formatPromptMemoryDate(node.createdAt, now)}] ${node.content} (${daysLeft} days remaining)\n`;
+            if (omitDates) {
+                output += `- ${node.content}\n`;
+            } else {
+                const daysLeft = Math.ceil((node.pinnedUntil! - now) / (24 * 60 * 60 * 1000));
+                output += `- [${formatPromptMemoryDate(node.createdAt, now)}] ${memoryContentWithDates(node)}(${daysLeft} days remaining)\n`;
+            }
         }
         output += `\n`;
         console.log(`📌 [MemoryPalace] 便利贴置顶 ${pinnedNodes.length} 条`);
@@ -272,10 +279,11 @@ export async function expandAndFormat(
 
 // ─── 子渲染：单条独立记忆 ──────────────────────────────
 
-function buildStandaloneItem(r: ScoredMemory, now: number): RenderItem {
+function buildStandaloneItem(r: ScoredMemory, now: number, omitDates = false): RenderItem {
     const node = r.node;
-    const date = formatPromptMemoryDate(node.createdAt, now);
-    const body = `(${date}, importance: ${node.importance})\n${node.content}`;
+    const body = omitDates
+        ? `(importance: ${node.importance})\n${node.content}`
+        : `(${formatPromptMemoryDate(node.createdAt, now)}, importance: ${node.importance})\n${memoryContentWithDates(node)}`;
     return {
         guaranteed: r.recallGuarantee === 'explicit_entity',
         score: r.finalScore,
@@ -296,6 +304,7 @@ async function buildBoxItem(
     localNodeMap: Map<string, MemoryNode>,
     now: number,
     guaranteed: boolean = false,
+    omitDates: boolean = false,
 ): Promise<RenderItem | null> {
     // 加载 summary（如有）
     let summary: MemoryNode | null = null;
@@ -328,16 +337,24 @@ async function buildBoxItem(
     body += '\n';
 
     if (summary) {
-        const sDate = formatPromptMemoryDate(summary.createdAt, now);
-        body += `_Integrated memory_ (${sDate}, importance ${summary.importance}, compressed ${box.compressionCount} times)\n`;
+        if (omitDates) {
+            body += `_Integrated memory_ (importance ${summary.importance}, compressed ${box.compressionCount} times)\n`;
+        } else {
+            const sDate = formatPromptMemoryDate(summary.createdAt, now);
+            body += `_Integrated memory_ (${sDate}, importance ${summary.importance}, compressed ${box.compressionCount} times)\n`;
+        }
         body += `${summary.content}\n`;
     }
 
     if (liveToShow.length > 0) {
         body += summary ? `_New fragments_:\n` : '';
         for (const n of liveToShow) {
-            const d = formatPromptMemoryDate(n.createdAt, now);
-            body += `- [${d}] ${n.content}\n`;
+            if (omitDates) {
+                body += `- ${n.content}\n`;
+            } else {
+                const d = formatPromptMemoryDate(n.createdAt, now);
+                body += `- [${d}] ${memoryContentWithDates(n)}\n`;
+            }
         }
         if (omitted > 0) body += `(${omitted} additional live nodes from this box are not shown)\n`;
     }

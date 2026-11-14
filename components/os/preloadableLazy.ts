@@ -1,4 +1,5 @@
 import React, { lazy } from 'react';
+import { markModuleLoadError } from '../../utils/chunkLoadRecovery';
 
 export type PreloadableLazy = React.LazyExoticComponent<React.ComponentType<any>> & {
   preload: () => Promise<unknown>;
@@ -20,7 +21,8 @@ export const createPreloadableLazy = (
     if (!request) {
       const nextRequest = factory();
       request = nextRequest;
-      void nextRequest.catch(() => {
+      void nextRequest.catch(error => {
+        markModuleLoadError(error);
         if (request === nextRequest) request = null;
       });
     }

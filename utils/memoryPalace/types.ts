@@ -32,6 +32,12 @@ export const ROOM_CONFIGS: Record<MemoryRoom, RoomConfig> = {
     windowsill:  { capacity: null, decayRate: null,   description: '期盼、目标、憧憬' },
 };
 
+/** 检索读到旧档/远程异常房间时沿用提取入口的客厅兜底，不改写原始记录。 */
+export function resolveMemoryScoringRoom(room: unknown): MemoryRoom {
+    return typeof room === 'string' && Object.prototype.hasOwnProperty.call(ROOM_CONFIGS, room)
+        ? room as MemoryRoom : 'living_room';
+}
+
 export const ROOM_LABELS: Record<MemoryRoom, string> = {
     living_room: '客厅',
     bedroom:     '卧室',
@@ -64,6 +70,8 @@ export interface MemoryEntity {
 }
 
 export interface MemoryNode {
+    /** 可选补注的固定说话日期，不是 createdAt 事件日。原文始终不含系统补注。 */
+    relativeTimeAnchor?: { dateKey: string; source: 'message'; messageId?: number };
     id: string;
     charId: string;
     content: string;            // 记忆内容（提取记忆为第三人称叙事，消化衍生记忆为第一人称内心独白）
@@ -207,8 +215,8 @@ export const EVENT_BOX_LIVE_HARD_CAP = 15;
 /** 盒内事件总数（archived + live）达到此值后封盒，之后的相关记忆另开新盒 */
 export const EVENT_BOX_SEAL_THRESHOLD = 12;
 
-/** summary 目标字数区间（prompt 引导，让模型尽量落在区间内）+ 硬上限（超过强制截断兜底）。
- *  目标上界低于硬上限，给「模型数不准字数」留缓冲——模型瞄着上界写、稍微超一点也不会被砍出「……」。 */
+/** summary 目标字数区间 + 二次精简触发线。HARD_MAX 名称为兼容现有引用保留，
+ *  不再是截断线：精简失败或仍超长时完整保存，召回读取全文。 */
 export const EVENT_BOX_SUMMARY_TARGET_MIN_CHARS = 400;
 export const EVENT_BOX_SUMMARY_TARGET_MAX_CHARS = 700;
 export const EVENT_BOX_SUMMARY_HARD_MAX_CHARS = 900;

@@ -1,18 +1,18 @@
 /**
  * 「彼方」自主登入调度器。
  *
- * 复用 proactiveChat.ts 经过验证的稳态定时模式：
+ * 稳态定时模式：
  *   - 前台：单个精确 setTimeout 命中下一个到期时刻（前台计时器准）
  *   - visibilitychange / focus：回到前台时立刻补火 + 重排（后台节流会延迟）
  *   - 主线程 20s 轮询：最后兜底，防止精确计时器被后台节流卡死
  *
- * 但用**独立的存储键**（vr_schedules / vr_last_fire），和主动发消息
- * (proactive_schedules) 各自独立、互不挤占触发。
+ * 排程存在独立的存储键（vr_schedules / vr_last_fire）。
  *
- * 说明：v1 不接 Service Worker / Cloudflare 云端唤醒（那套 channel 与
- * proactive 强绑定）。前台精确计时 + 可见性补火已能覆盖"用户打开 App 时
- * 角色按时登入"的核心诉求；云端加速可后续叠加。
+ * 不接 Service Worker / Cloudflare 云端唤醒：前台精确计时 + 可见性补火已能覆盖
+ * "用户打开 App 时角色按时登入"的核心诉求。
  */
+
+import type { VRSARActivity } from '../../types';
 
 export interface VRSchedule {
     charId: string;
@@ -82,7 +82,7 @@ function removeLastFire(charId: string) {
     saveLastFire(m);
 }
 
-let triggerCallback: ((charId: string, room?: string, letterId?: string, manual?: boolean) => void | Promise<void>) | null = null;
+let triggerCallback: ((charId: string, room?: string, letterId?: string, manual?: boolean, sarActivity?: VRSARActivity) => void | Promise<void>) | null = null;
 let visibilityListener: (() => void) | null = null;
 let focusListener: (() => void) | null = null;
 let mainThreadTimer: ReturnType<typeof setInterval> | null = null;
@@ -177,7 +177,7 @@ function detachListeners() {
 
 export const VRScheduler = {
     /** 注册触发回调（应用启动时调一次）。 */
-    onTrigger(callback: (charId: string, room?: string, letterId?: string, manual?: boolean) => void | Promise<void>) {
+    onTrigger(callback: (charId: string, room?: string, letterId?: string, manual?: boolean, sarActivity?: VRSARActivity) => void | Promise<void>) {
         triggerCallback = callback;
         attachListeners();
         checkOverdue();
@@ -295,9 +295,12 @@ export const VRScheduler = {
     },
 
     /** 立刻触发一次（UI 上"现在去逛逛"按钮用），不影响计划。room 可指定房间，省略则随机；letterId 可指定要回复的来信。 */
-    triggerNow(charId: string, room?: string, letterId?: string) {
+    triggerNow(charId: string, room?: string, letterId?: string, sarActivity?: VRSARActivity) {
         setLastFire(charId, Date.now());
         schedulePreciseTimer();
-        if (triggerCallback) void triggerCallback(charId, room, letterId, true);
+        if (triggerCallback) {
+            if (sarActivity) void triggerCallback(charId, room, letterId, true, sarActivity);
+            else void triggerCallback(charId, room, letterId, true);
+        }
     },
 };

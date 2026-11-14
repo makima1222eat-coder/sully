@@ -222,7 +222,7 @@ const CallSetupGuide: React.FC<CallSetupGuideProps> = ({
                 {avatarSource === 'model'
                   ? '导入 Live2D 后会自动进入动作与衣橱设置。衣橱动作强制仅手动；VRM 目前仍是测试功能。'
                   : avatarSource === 'date'
-                    ? '见面立绘使用静态表情管线，不会调用 Live2D 动作；服装仍由你手动选择。'
+                    ? '见面立绘会随通话情绪切换静态立绘，不会触发 Live2D 动作；服装仍由你手动选择。'
                     : '单张 PNG / GIF 不切换表情；需要情绪表情时可选择见面立绘。'}
               </p>
             </>
@@ -270,7 +270,7 @@ const CallSetupGuide: React.FC<CallSetupGuideProps> = ({
             type="button"
             disabled={fakeImageMissing}
             onClick={() => step === 'model' ? onStepChange('camera') : onStart()}
-            className="flex min-h-12 items-center justify-center gap-2 rounded-2xl px-4 text-[13px] font-semibold text-white transition active:scale-[.98] disabled:opacity-40"
+            className="keep-white flex min-h-12 items-center justify-center gap-2 rounded-2xl px-4 text-[13px] font-semibold text-white transition active:scale-[.98] disabled:opacity-40"
             style={{ background: `linear-gradient(100deg, ${accentColor}c8, ${accentColor})`, boxShadow: `0 10px 28px ${accentColor}2f` }}
           >
             {step === 'model' ? '下一步：设置我的镜头' : fakeImageMissing ? '先选择静态图片' : '按这个方案接通'} <ArrowRight size={15} weight="bold" />

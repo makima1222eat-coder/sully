@@ -1,8 +1,10 @@
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 import React, { useState, useEffect, useRef } from 'react';
 import { useOS } from '../context/OSContext';
 import { DB } from '../utils/db';
 import { BankFullState, BankTransaction, SavingsGoal, ShopStaff, BankGuestbookItem, DollhouseState } from '../types';
+import { isExpense, parseLedgerAmount } from '../utils/bankLedger';
 import { safeResponseJson } from '../utils/safeApi';
 import { injectMemoryPalace } from '../utils/memoryPalace/pipeline';
 import Modal from '../components/os/Modal';
@@ -71,6 +73,7 @@ const BankApp: React.FC = () => {
     
     // Tabs: 'game' (Shop) | 'manage' (Menu) | 'report' (Finance)
     const [activeTab, setActiveTab] = useState<'game' | 'manage' | 'report'>('game');
+    useAppShortcut(ShortcutAppID.Bank, intent => setActiveTab((intent.entryId || 'game') as typeof activeTab));
     
     // UI Modals
     const [showAddTxModal, setShowAddTxModal] = useState(false);
@@ -84,6 +87,7 @@ const BankApp: React.FC = () => {
     // Forms
     const [txAmount, setTxAmount] = useState('');
     const [txNote, setTxNote] = useState('');
+    const [txType, setTxType] = useState<'expense' | 'income'>('expense');
     const [goalName, setGoalName] = useState('');
     const [goalTarget, setGoalTarget] = useState('');
 
@@ -247,7 +251,7 @@ const BankApp: React.FC = () => {
             // Find yesterday's expenses to calculate AP
             const yesterdayStr = addLocalDays(today, -1);
 
-            const yesterTx = txs.filter(t => t.dateStr === yesterdayStr);
+            const yesterTx = txs.filter(t => t.dateStr === yesterdayStr && isExpense(t));
             let gainedAP = 0;
 
             if (yesterTx.length > 0) {
@@ -286,7 +290,7 @@ const BankApp: React.FC = () => {
             addToast(`新的一天！获得 ${totalNewAP} AP (预算结余: ${gainedAP})`, 'success');
         }
 
-        const todayTx = txs.filter(t => t.dateStr === today);
+        const todayTx = txs.filter(t => t.dateStr === today && isExpense(t));
         const spent = sumMoney(todayTx.map(t => t.amount));
         const appeal = calculateAppeal(currentState.shop.staff.length, currentState.shop.unlockedRecipes);
 
@@ -306,16 +310,17 @@ const BankApp: React.FC = () => {
     // --- Transactions ---
 
     const handleAddTransaction = async () => {
-        if (!txAmount || isNaN(parseFloat(txAmount)) || !txNote.trim()) {
-            addToast('请填写金额和内容哦', 'error');
+        const amount = parseLedgerAmount(txAmount);
+        if (amount === null || !txNote.trim()) {
+            addToast('请填写大于零的金额（最多两位小数）和内容哦', 'error');
             return;
         }
         
-        const amount = parseFloat(txAmount);
         const today = getLocalDateKey();
         
         const newTx: BankTransaction = {
             id: `tx-${Date.now()}`,
+            type: txType,
             amount,
             category: 'general',
             note: txNote,
@@ -327,7 +332,7 @@ const BankApp: React.FC = () => {
         trackEvent('记一笔账');
 
         const cur = stateRef.current;
-        const newSpent = roundMoney(cur.todaySpent + amount);
+        const newSpent = roundMoney(cur.todaySpent + (txType === 'expense' ? amount : 0));
         const newState = { ...cur, todaySpent: newSpent };
         stateRef.current = newState;
         setState(newState);
@@ -339,7 +344,7 @@ const BankApp: React.FC = () => {
         setTxAmount('');
         setTxNote('');
 
-        if (newSpent > cur.config.dailyBudget) {
+        if (txType === 'expense' && newSpent > cur.config.dailyBudget) {
             addToast('⚠️ 警报：今日预算已超支！明天可能没有 AP 了...', 'info');
         } else {
             addToast('记账成功', 'success');
@@ -355,7 +360,7 @@ const BankApp: React.FC = () => {
         const cur = stateRef.current;
         let newSpent = cur.todaySpent;
         const today = getLocalDateKey();
-        if (tx.dateStr === today) {
+        if (tx.dateStr === today && isExpense(tx)) {
             newSpent = Math.max(0, roundMoney(cur.todaySpent - tx.amount));
         }
 
@@ -506,6 +511,7 @@ const BankApp: React.FC = () => {
 
     // --- Guestbook Logic (Gossip & Drama) ---
     const handleRefreshGuestbook = async () => {
+
         const COST = 40;
         if (stateRef.current.shop.actionPoints < COST) {
             addToast(`AP 不足 (需 ${COST})。去省钱吧！`, 'error');
@@ -525,14 +531,15 @@ const BankApp: React.FC = () => {
 
             // 2. Build Context
             await injectMemoryPalace(randomChar);
-            const charContext = ContextBuilder.buildCoreContext(randomChar, userProfile, true);
-            const recentMsgs = await DB.getMessagesByCharId(randomChar.id);
+            const characterContextInput = { char: randomChar, user: userProfile, includeDetailedMemories: true };
+
+            const recentMsgs = await loadCharacterContextMessages(randomChar);
             const chatSnippet = recentMsgs.slice(-10).map(m => m.content.substring(0, 50)).join(' | ');
 
             const previousGuestbook = (current.shop.guestbook || []).slice(0, 10).map(g => `${g.authorName}: ${g.content}`).join('\n');
 
             // 3. Prompt
-            const prompt = `${charContext}
+            const prompt = `
 ### Scenario: Visiting User's Savings App Café Guestbook
 ${userProfile.name} has a savings/budgeting app (记账App). Inside the app there's a virtual café mini-game, similar to how Alipay has "蚂蚁庄园" or how friends visit each other's farms in QQ Farm.
 You are visiting this virtual café as a friend/player.
@@ -561,8 +568,9 @@ ${previousGuestbook}
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: 'user', content: prompt }] })
-            });
+                body: JSON.stringify({ model: apiConfig.model, messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'user', content: prompt }])) }),
+                __sullyMeta: { appId: 'bank', appName: '银行', charId: randomChar.id, charName: randomChar.name, purpose: '咖啡馆访客留言' },
+            } as RequestInit);
 
             if (response.ok) {
                 const data = await safeResponseJson(response);
@@ -1036,6 +1044,7 @@ ${previousGuestbook}
                 </button>
             }>
                 <div className="space-y-5">
+                    <label className="block text-sm text-[#5D4037]">类型 <select aria-label="收支类型" value={txType} onChange={e => setTxType(e.target.value as 'expense' | 'income')} className="ml-2 rounded-xl p-3 bg-[#FDF6E3]"><option value="expense">支出</option><option value="income">收入</option></select></label>
                     <div>
                         <label className="text-xs font-bold text-[#A1887F] uppercase tracking-wider mb-2 block">金额</label>
                         <div className="relative">
@@ -1055,7 +1064,7 @@ ${previousGuestbook}
                             value={txNote}
                             onChange={e => setTxNote(e.target.value)}
                             className="w-full bg-[#FDF6E3] border-2 border-[#E8DCC8] rounded-2xl px-4 py-4 text-base font-medium text-[#5D4037] focus:border-[#FF7043] outline-none transition-colors"
-                            placeholder="买什么了？"
+                            placeholder={txType === 'income' ? '收入来源（工资 / 奖金…）' : '买什么了？'}
                         />
                     </div>
                 </div>
@@ -1176,3 +1185,5 @@ ${previousGuestbook}
 };
 
 export default BankApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

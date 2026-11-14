@@ -18,8 +18,10 @@ import {
     type DiaryPreview,
     type FeishuDiaryPreview,
 } from './realtimeFetchCore';
+import { formatFeishuWriteFailure } from './feishuDiagnostics';
 import {
     fetchWeatherWithFallback,
+    normalizeFreeWeatherSource,
     generateWeatherAdvice as generateWeatherAdviceCore,
     checkSpecialDates as checkSpecialDatesCore,
     clearGeocodeCache,
@@ -41,6 +43,7 @@ import {
     type NewsRegion,
 } from './realtimeWorldCore';
 import { getLocalDateKey } from './localDate';
+import { browserHolidayCache, deviceTimeZone, getUserHolidayReminder, type UserHolidayConfig } from './userHolidays';
 
 // 两份环境无关叶子，amsg worker 共用同一份，这里的 Manager 方法委托过去；
 // 类型与常量原样 re-export，既有 import 路径不用改：
@@ -55,9 +58,12 @@ export {
 } from './realtimeWorldCore';
 
 export interface RealtimeConfig {
+    userHolidays?: UserHolidayConfig;
     // 天气配置
     weatherEnabled: boolean;
-    weatherApiKey: string;  // OpenWeatherMap API Key（可选；留空走免 key 的 Open-Meteo）
+    weatherApiKey: string;  // OpenWeatherMap API Key（可选；留空走所选免费源）
+    weatherFreeSource?: import('./weatherSources').FreeWeatherSource;
+    weatherCities?: Record<string, string>; // Per-character override; missing/blank inherits weatherCity.
     weatherCity: string;    // 城市名 (如 "北京"、"Beijing"，Open-Meteo 支持中文)
 
     // 新闻配置
@@ -103,6 +109,7 @@ export interface RealtimeConfig {
 export const defaultRealtimeConfig: RealtimeConfig = {
     weatherEnabled: false,
     weatherApiKey: '',
+    weatherFreeSource: 'open-meteo',
     weatherCity: 'Beijing',
     newsEnabled: false,
     newsApiKey: '',
@@ -129,14 +136,14 @@ export const defaultRealtimeConfig: RealtimeConfig = {
 };
 
 // 缓存
-let weatherCache: { data: WeatherData | null; timestamp: number } = { data: null, timestamp: 0 };
+const weatherCache = new Map<string, {data: WeatherData; timestamp: number}>();
 let newsCache: { key: string; data: NewsItem[]; timestamp: number } = { key: '', data: [], timestamp: 0 };
 
 
 export const RealtimeContextManager = {
 
     /**
-     * 获取天气信息。填了 OpenWeatherMap key 优先走 OWM，失败或没填 key 时回落免费的 Open-Meteo。
+     * 获取天气信息。OWM（有 key 时）→ 所选免费源 → 另一免费源，缓存按城市、Key 与首选源隔离。
      */
     fetchWeather: async (config: RealtimeConfig): Promise<WeatherData | null> => {
         if (!config.weatherEnabled || !config.weatherCity) {
@@ -147,17 +154,20 @@ export const RealtimeContextManager = {
         const cacheMs = config.cacheMinutes * 60 * 1000;
 
         // 检查缓存
-        if (weatherCache.data && (now - weatherCache.timestamp) < cacheMs) {
-            return weatherCache.data;
+        const key = JSON.stringify([config.weatherCity.trim(), config.weatherApiKey?.trim(), normalizeFreeWeatherSource(config.weatherFreeSource)]);
+        const cached = weatherCache.get(key);
+        if (cached && (now - cached.timestamp) < cacheMs) {
+            return cached.data;
         }
 
-        const weather = await fetchWeatherWithFallback(config.weatherCity, config.weatherApiKey);
+        const weather = await fetchWeatherWithFallback(config.weatherCity, config.weatherApiKey, config.weatherFreeSource);
         if (!weather) {
             return null;
         }
 
         // 更新缓存
-        weatherCache = { data: weather, timestamp: now };
+        if (weatherCache.size >= 100) weatherCache.delete(weatherCache.keys().next().value!);
+        weatherCache.set(key, { data: weather, timestamp: now });
 
         return weather;
     },
@@ -438,7 +448,7 @@ export const RealtimeContextManager = {
         tz: string | undefined,
         // includeTime=false：角色关掉了「时间感知」。天气/新闻还要，但当前时间和今日节日
         // 属于时间感知的范畴，这个开关关着就不该从这一段里漏出去。
-        opts: { includeTime: boolean },
+        opts: { includeTime: boolean; userLocation?: Promise<string> },
     ): Promise<string> => {
         const includeTime = opts.includeTime;
 
@@ -457,7 +467,7 @@ export const RealtimeContextManager = {
         const newsPool = config.newsEnabled ? await RealtimeContextManager.fetchNews(config) : [];
         const picks = pickRandomNews(newsPool, REALTIME_NEWS_PICK_COUNT);
 
-        const fullContext = renderRealtimeWorldBlock({ timeLine, specialDates, weather, news: picks });
+        const fullContext = renderRealtimeWorldBlock({ timeLine, specialDates, weather, news: picks, userLocationText: await opts.userLocation });
 
         // ── F12 探针：本轮真正注入 prompt 的热点 + 文本量（评估 token 用）──
         try {
@@ -474,11 +484,18 @@ export const RealtimeContextManager = {
         return fullContext;
     },
 
+    getUserHoliday: (config: RealtimeConfig, userName?: string): Promise<string> => getUserHolidayReminder(
+        config.userHolidays ? { ...config.userHolidays, timeZone: deviceTimeZone() } : undefined,
+        browserHolidayCache,
+        Date.now(),
+        userName,
+    ),
+
     /**
      * 清除缓存
      */
     clearCache: () => {
-        weatherCache = { data: null, timestamp: 0 };
+        weatherCache.clear();
         newsCache = { key: '', data: [], timestamp: 0 };
         clearGeocodeCache();
     },
@@ -1399,7 +1416,7 @@ export const FeishuManager = {
             const tables = data.data?.items || [];
             const targetTable = tables.find((t: any) => t.table_id === tableId);
             if (targetTable) {
-                return { success: true, message: `连接成功! 数据表: ${targetTable.name}` };
+                return { success: true, message: `读取连接成功！数据表: ${targetTable.name}。注意：这里不创建测试记录，新增记录权限会在角色首次写日记时验证。` };
             } else {
                 const tableNames = tables.map((t: any) => `${t.name}(${t.table_id})`).join(', ');
                 return { success: false, message: `多维表格中未找到表 ${tableId}。可用表: ${tableNames || '无'}` };
@@ -1459,9 +1476,9 @@ export const FeishuManager = {
             if (!response.ok) {
                 try {
                     const errJson = JSON.parse(text);
-                    return { success: false, message: `写入失败: ${errJson.msg || errJson.error || response.status}` };
+                    return { success: false, message: formatFeishuWriteFailure(response.status, errJson) };
                 } catch {
-                    return { success: false, message: `写入失败: ${response.status}` };
+                    return { success: false, message: formatFeishuWriteFailure(response.status, { error: text }) };
                 }
             }
 
@@ -1632,6 +1649,9 @@ export interface XhsNote {
     author: string;
     authorId: string;
     xsecToken?: string;
+    xsecSource?: string;
+    url?: string;
+    platform?: 'xhs' | 'rednote';
     coverUrl?: string;
     type?: string;  // 'normal' | 'video'
     comments?: {

@@ -1,3 +1,6 @@
+import { deduplicateVoiceText } from './voiceTextDedup';
+import { splitInlineThinking } from './assistantThinking';
+import {extractFriendFeedReplyTags} from './friendFeedReplyFormat';
 /**
  * 共享 sanitize 工具 — 零依赖纯字符串处理.
  *
@@ -28,11 +31,18 @@ const stripLiteralBackslashN = (t: string): string => t.replace(/\\n/g, '\n');
 const stripInnerVoiceLines = (t: string): string =>
   t.replace(/^[ \t]*[\[【]\s*心声\s*[\]】][:：]?[ \t]*.*$/gm, '').replace(/\n{3,}/g, '\n\n');
 
-/** 源标签 `[聊天]/[通话]/[约会]` 及英文版 `[Chat]/[Call]/[Date]/[Story: …]` → 换行 (保留分隔语义)
- *  英文形态是 buildMessageHistory 英文化后的历史前缀, 模型同样会模仿漏出 (含小写 [chat]). */
-const stripSourceTags = (t: string): string => t
-  .replace(/\s*\[(?:聊天|通话|约会|Chat|Call|Date)\]\s*/gi, '\n')
-  .replace(/\s*\[(?:Story|剧情)[:：][^\]\n]{0,80}\]\s*/gi, '\n');
+/**
+ * 历史来源标签 → 换行（保留分隔语义）。
+ *
+ * 历史原文只会注入 `[聊天]/[通话]/[约会]`，但模型偶尔会在模仿时把标签做成
+ * 中英混写（线上实例如 `[聊chat]`），甚至直接翻成 `[chat]`。这些仍然是内部
+ * 元数据，不该作为角色正文展示。只对白名单中的三组来源词做容错，避免吞掉普通
+ * 方括号内容。
+ */
+export const stripLeakedSourceTags = (t: string): string => t.replace(
+  /\s*\[\s*(?:聊\s*(?:天|chat)|chat|通\s*(?:话|call)|call|约\s*(?:会|date)|date)\s*\]\s*/giu,
+  '\n',
+).replace(/\s*\[(?:Story|剧情)[:：][^\]\n]{0,80}\]\s*/gi, '\n');
 
 /** 4 种时间格式: 带括号 ISO / 行首裸 ISO / 中文 12h / 英文 12h */
 const stripTimestamps = (t: string): string =>
@@ -57,7 +67,7 @@ const stripRoleNamePrefix = (t: string): string => t.replace(/^[\w一-龥]+:\s*/
  * 保持跟 chatParser.sanitize 原版字节对齐 — 不含 READ_NOTE / XHS_x (那些只在 notification 路径剥).
  */
 const stripBusinessTagsForBubble = (t: string): string =>
-  t
+  extractFriendFeedReplyTags(extractFriendFeedReplyTags(t).text,'HOME_VISIT_REPLY').text
     .replace(/\[\[(?:ACTION|RECALL|SEARCH|DIARY|READ_DIARY|FS_DIARY|FS_READ_DIARY|DIARY_START|DIARY_END|FS_DIARY_START|FS_DIARY_END|MUSIC_ACTION)[:\s][\s\S]*?\]\]/g, '')
     // `[[记录:...]]` 整个命名空间 —— 历史渲染形态 (utils/transferFormat.ts:formatTransferRecord),
     // 模型复读历史会抄出来。能还原成动作的 (记录:TRANSFER) 在上游 chatParser / worker classifier
@@ -143,10 +153,7 @@ const collapseWhitespace = (t: string): string => t.replace(/\n{3,}/g, '\n\n').t
 // ─── notification 专用 helper ──────────────────────────────────────────────
 
 /** `<think|thinking|thought>...</...>` 整块, 含未闭合兜底 */
-const stripThinkBlocks = (t: string): string =>
-  t
-    .replace(/<(think|thinking|thought)>[\s\S]*?<\/\1>/gi, '')
-    .replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, '');
+const stripThinkBlocks = (t: string): string => splitInlineThinking(t).content;
 
 /** `[[INNER_STATE:...]]` */
 const stripInnerState = (t: string): string => t.replace(/\[\[INNER_STATE:\s*[\s\S]*?\]\]/g, '');
@@ -258,6 +265,7 @@ function repairPairedTag(
  *  3. 开标签属性: <语音emotion=…> 少空格、全角引号 “” / 全角等号 ＝ → 规范属性
  *  4. 配对修复: 有开无闭 → 末尾补闭合 (语音的闭合会插在末尾完整 <字幕> 块之前);
  *     孤儿闭合 (无开) / 嵌套多余开标签 / 自闭合空标签 → 删除
+ *  5. 字幕嵌在语音块里: <语音>台词<字幕>中文</字幕></语音> → <语音>台词</语音>\n<字幕>中文</字幕>
  */
 export function normalizeVoiceTags(t: string): string {
   if (!/[语語]音|字幕/.test(t)) return t; // fast path
@@ -276,6 +284,16 @@ export function normalizeVoiceTags(t: string): string {
   // 4. 配对扫描: 先修语音 (闭合避让末尾字幕块), 再修字幕
   result = repairPairedTag(result, /<\/?[语語]音[^>]*>/g, tok => (/語/.test(tok) ? '語音' : '语音'), true);
   result = repairPairedTag(result, /<\/?字幕[^>]*>/g, () => '字幕', false);
+  // 5. 字幕写进了语音块里: 挪到 </语音> 后面, 否则中文会被当成台词朗读、转文字面板显示两遍
+  result = result.replace(/(<[语語]音[^>]*>)([\s\S]*?)(<\/[语語]音>)/g, (block, open: string, inner: string, close: string) => {
+    const subtitles: string[] = [];
+    const speech = inner.replace(/<字幕>([\s\S]*?)<\/字幕>/g, (_m, sub: string) => {
+      if (sub.trim()) subtitles.push(sub.trim());
+      return '';
+    });
+    if (subtitles.length === 0) return block;
+    return `${open}${speech.trim()}${close}\n<字幕>${subtitles.join('\n')}</字幕>`;
+  });
   return result;
 }
 
@@ -391,8 +409,8 @@ export function sanitizeForNotification(text: string): string {
   result = stripChineseDate(result);
   result = stripRoleNamePrefix(result);
   result = stripSystemLogLeak(result);
-  // 7. 源标签 [聊天] 等 + 【心声】行
-  result = stripSourceTags(result);
+  // 7. 源标签 [聊天] 等
+  result = stripLeakedSourceTags(result);
   result = stripInnerVoiceLines(result);
   // 8. 内部状态 / 业务标签 / 引用
   result = stripInnerState(result);
@@ -433,7 +451,7 @@ export function sanitizeForBubble(
   result = normalizeVoiceTags(result);
   result = normalizeTranslationTags(result);
   // 2. 源标签 / 时间戳 / 系统日志 leak / 业务标签
-  result = stripSourceTags(result);
+  result = stripLeakedSourceTags(result);
   result = stripTimestamps(result);
   result = stripSystemLogLeak(result);
   result = stripMarkdownHeaders(result);
@@ -450,6 +468,7 @@ export function sanitizeForBubble(
   // 5. 老翻译标记
   result = stripLegacyTrans(result);
   // 6. 收尾
+  result = deduplicateVoiceText(result);
   result = collapseWhitespace(result);
   return result;
 }
@@ -507,7 +526,7 @@ export function sanitizeIntoSegments(text: string): Segment[] {
   // Phase 1: 全文 suppress
   let cleaned = stripLiteralBackslashN(text);
   cleaned = stripThinkBlocks(cleaned);
-  cleaned = normalizeVoiceTags(cleaned); // 语音标签自愈 — Phase 1.5 的配对保护靠它兜底
+  cleaned = deduplicateVoiceText(normalizeVoiceTags(cleaned)); // 语音标签自愈 — Phase 1.5 的配对保护靠它兜底
   cleaned = normalizeTranslationTags(cleaned); // 翻译标签自愈 — 同上, Phase 1.5 的 <翻译> 原子保护靠它命中
 
   // Phase 1.5: 原子语义块交给 amsg-instant 标准 protected-block splitter 识别,
@@ -553,7 +572,7 @@ export function sanitizeIntoSegments(text: string): Segment[] {
   cleaned = stripTimestamps(cleaned);
   cleaned = stripChineseDate(cleaned);
   cleaned = stripRoleNamePrefix(cleaned);
-  cleaned = stripSourceTags(cleaned);
+  cleaned = stripLeakedSourceTags(cleaned);
   // 注意: 这里**不**剥 stripQuotes — 引用要带到客户端让 Step 7 配 aiReplyTarget.
   // sanitizeTextForBanner 单独剥引用给 notification.
   //

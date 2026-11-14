@@ -1,13 +1,24 @@
+import FirstUseGuide from './FirstUseGuide';
+import DeploymentNotice from './os/DeploymentNotice';
+import { useDeploymentNotice } from '../hooks/useDeploymentNotice';
+import FeedbackInvitation from './FeedbackInvitation';
+import BeautyRepoInvitation from './share/BeautyRepoInvitation';
+import { useFirstUseGuideStep } from '../utils/firstUseGuide';
+import AnniversaryGiftPopup from './os/AnniversaryGiftPopup';
+import { shouldShowAnniversaryGift, markAnniversaryGiftSeen } from '../utils/anniversaryGifts';
 
 
 
 import React, { useState, useEffect, useMemo, useRef, Suspense } from 'react';
 import { IMPORT_IN_PROGRESS_KEY, useOS } from '../context/OSContext';
 import StatusBar from './os/StatusBar';
+import { SARModuleMonitor } from './sar/SARModuleMonitor';
 import Launcher from '../apps/Launcher';
 import CompanionLockChrome from './os/CompanionLockChrome';
 import { loadCompanionFrameStyle } from './os/companionFrameStyles';
 import { createPreloadableLazy, type PreloadableLazy } from './os/preloadableLazy';
+import { setVisibleTimeout } from '../utils/visibleTimeout';
+import { isUserSpaceArrival, finishUserSpaceTransition, cancelUserSpaceTransition } from '../utils/userSpaceTransition';
 
 // 按需懒加载各 App —— 切到对应 App 时才下载/解析其代码块，首屏只加载 Launcher 与外壳，
 // 大体积 App（MemoryPalace / VRWorld / Songwriting 等）不再压在主包里。
@@ -23,7 +34,7 @@ const Settings = lazyApp(() => import('../apps/Settings'));
 const Character = lazyApp(() => import('../apps/Character'));
 const Chat = lazyApp(() => import('../apps/Chat'));
 const GroupChat = lazyApp(() => import('../apps/GroupChat'));
-const ThemeMaker = lazyApp(() => import('../apps/ThemeMaker'));
+const ThemeMaker = lazyApp(() => import('./chat/LegacyBubbleMakerEntry'));
 const Appearance = lazyApp(() => import('../apps/Appearance'));
 const Gallery = lazyApp(() => import('../apps/Gallery'));
 const DateApp = lazyApp(() => import('../apps/DateApp'));
@@ -32,6 +43,8 @@ const JournalApp = lazyApp(() => import('../apps/JournalApp'));
 const ScheduleApp = lazyApp(() => import('../apps/ScheduleApp'));
 const RoomApp = lazyApp(() => import('../apps/RoomApp'));
 const CheckPhone = lazyApp(() => import('../apps/CheckPhone'));
+const FriendFeedApp = lazyApp(() => import('../apps/FriendFeedApp'));
+const FriendFeedNotification = React.lazy(() => import('./os/FriendFeedNotification'));
 const SocialApp = lazyApp(() => import('../apps/SocialApp'));
 const StudyApp = lazyApp(() => import('../apps/StudyApp'));
 const FAQApp = lazyApp(() => import('../apps/FAQApp'));
@@ -80,6 +93,7 @@ const APP_BY_ID: Partial<Record<AppID, PreloadableLazy>> = {
   [AppID.Gallery]: Gallery, [AppID.Date]: DateApp, [AppID.User]: UserApp,
   [AppID.Journal]: JournalApp, [AppID.Schedule]: ScheduleApp, [AppID.Room]: RoomApp,
   [AppID.CheckPhone]: CheckPhone, [AppID.Social]: SocialApp, [AppID.Study]: StudyApp,
+  [AppID.FriendFeed]: FriendFeedApp,
   [AppID.FAQ]: FAQApp, [AppID.Game]: GameApp, [AppID.Worldbook]: WorldbookApp,
   [AppID.Novel]: NovelApp, [AppID.Bank]: BankApp, [AppID.XhsStock]: XhsStockApp,
   [AppID.XhsFreeRoam]: XhsFreeRoamApp, [AppID.Browser]: BrowserApp, [AppID.Songwriting]: SongwritingApp,
@@ -96,9 +110,6 @@ import { Like520Controller, shouldShowLike520Popup } from './Like520Event';
 import { QixiLaunchPopup } from './QixiLaunchPopup';
 import { shouldShowQixiLaunchPopup } from '../utils/qixiLaunchPopup';
 import { UpdateNotificationController, shouldShowUpdateNotification } from './UpdateNotificationEvent';
-import { WorkerUpdateReminderController, shouldShowWorkerUpdateReminder, rearmWorkerUpdateReminder } from './WorkerUpdateReminderEvent';
-import { InstantPushSunsetController, shouldShowInstantPushSunsetNotice } from './InstantPushSunsetEvent';
-import { loadInstantConfig, probeInstantWorkerVersion } from '../utils/instantPushClient';
 import { BackupReminderController } from './BackupReminderEvent';
 import { shouldShowBackupReminder, markBackupReminderShown, daysSinceLastBackup } from '../utils/backupReminder';
 import { formatBytes } from '../utils/format';
@@ -110,8 +121,10 @@ import { StatusBar as CapStatusBar, Style as StatusBarStyle } from '@capacitor/s
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Capacitor } from '@capacitor/core';
 import { isIOSStandaloneWebApp, resolveStatusBarMode } from '../utils/iosStandalone';
+import { canHideShellBackdropWhenSettled, useReducedBlur } from '../utils/blurPolicy';
 import AppErrorBoundary from './os/AppErrorBoundary';
 import GlobalMiniPlayer from './os/GlobalMiniPlayer';
+import NavigationBall from './os/NavigationBall';
 import PersonaSimIndicator from './os/PersonaSimIndicator';
 import DreamSimIndicator from './os/DreamSimIndicator';
 import ErrorDialog from './os/ErrorDialog';
@@ -273,17 +286,20 @@ const DisclaimerPopup: React.FC<{ onAccept: () => void }> = ({ onAccept }) => (
       {/* Header */}
       <div className="pt-7 pb-3 px-6 text-center">
         <img src="https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/1f4e2.png" alt="announcement" className="w-8 h-8 mb-2" />
-        <h2 className="text-lg font-extrabold text-slate-800">免责声明</h2>
-        <p className="text-[11px] text-slate-400 mt-1">Disclaimer · 手抓糯米机 (SullyOS)</p>
+        <h2 className="text-lg font-extrabold text-slate-800">使用与授权说明</h2>
+        <p className="text-[11px] text-slate-400 mt-1">Usage & License · SullyOS·糯米机</p>
       </div>
 
       {/* Content */}
       <div className="px-6 pb-4 max-h-[55vh] overflow-y-auto no-scrollbar space-y-3">
         <p className="text-[13px] text-slate-600 leading-relaxed">
-          本项目「手抓糯米机 (SullyOS)」是一个<strong className="text-slate-800">完全开源、免费</strong>的软件，仅供个人学习、研究与技术交流使用。
+          本项目「SullyOS·糯米机」是一个<strong className="text-slate-800">源码可见、免费使用</strong>的项目。源码供学习与参考，不代表授予二改、再分发或官方服务的访问权限。
         </p>
+        <p className="text-[13px] text-slate-600 leading-relaxed">二改授权通过官方 DC 社区提供，具体范围以社区授权说明为准。社区不定期开放；未经另行许可，不得对外分发原版、修改版或整合包。</p>
+        <p className="text-[13px] text-slate-600 leading-relaxed">官方服务受后端容量限制，请勿向社区外转发访问入口、邀请信息或下载资源，也请勿自行组织对外推广。二改授权不包含共享官方后端资源。</p>
+        <p className="text-[13px] text-slate-600 leading-relaxed">完整规则以随版本提供的源码许可与社区授权说明为准；旧版本既有许可及第三方许可分别适用。</p>
         <ul className="text-[12px] text-slate-500 leading-relaxed space-y-1.5 list-none">
-          <li className="flex gap-2"><span className="shrink-0">•</span><span>本软件不提供任何明示或暗示的担保，作者不对使用本软件产生的任何后果承担责任。</span></li>
+          <li className="flex gap-2"><span className="shrink-0">•</span><span>在法律允许的范围内，本软件按现状提供，不附带保证；法律规定不得排除或限制的责任除外。</span></li>
           <li className="flex gap-2"><span className="shrink-0">•</span><span>用户应自行承担使用本软件的一切风险，包括但不限于数据丢失、设备损坏等。</span></li>
           <li className="flex gap-2"><span className="shrink-0">•</span><span>本软件生成的任何 AI 内容均不代表作者立场，用户需自行判断内容的准确性与合规性。</span></li>
           <li className="flex gap-2"><span className="shrink-0">•</span><span>禁止将本软件用于任何违反当地法律法规的用途。</span></li>
@@ -390,20 +406,20 @@ const ImportRecoveryPopup: React.FC<{
 // （loading spinner 闪烁反模式）。所以前 ~220ms 一律渲染空（无感），只有真的慢才浮现。
 // 刻意「零动画开销」：之前那套呼吸/涟漪/上升微尘的持续动画在 iOS 上会引起卡顿，且预热命中后
 // 这屏几乎不出现 —— 收益小、代价大。现在只一次性淡入一个静态柔光点（无 infinite 动画），
-// 透明底让外壳虚化壁纸透出来。真卡住（>15s）才换成可点的刷新/返回兜底，避免低端设备
-// 仍在正常解析单个大模块时被 7 秒阈值过早判死。
+// 透明底让外壳虚化壁纸透出来。前台累计等待 >15s 才显示刷新/返回兜底；
+// 这只是慢加载提示，不代表 import 已经失败或死锁。
 const AppLoadingFallback: React.FC<{ onReturn?: () => void; animationEnabled?: boolean }> = ({ onReturn, animationEnabled = true }) => {
   const [show, setShow] = useState(false);
   const [stalled, setStalled] = useState(false);
   useEffect(() => {
     const t = animationEnabled ? setTimeout(() => setShow(true), 220) : null;
-    // 卡死逃生口：iOS standalone PWA 从后台恢复 / 弱网时，动态 import 可能既不 resolve 也不 reject，
-    // Suspense 会永远停在这一屏（不报错 → 错误边界不触发 → 不会自动刷新），用户狂点中心光点却毫无反应。
-    // 超过 STALL_MS 仍未加载完 → 把「看着像按钮其实不是」的光点换成真正可点的「刷新/返回」按钮，
-    // 既明确告诉用户该点哪里，又把静默卡死变成一键可恢复。只动占位 UI，不碰 import 逻辑。
-    const stall = setTimeout(() => { setStalled(true); trackEvent('App 加载卡死超时'); }, 15_000);
-    return () => { if (t) clearTimeout(t); clearTimeout(stall); };
+    return () => { if (t) clearTimeout(t); };
   }, [animationEnabled]);
+  useEffect(() => setVisibleTimeout(() => {
+    setStalled(true);
+    // 保留历史事件名，但只计前台等待；切后台/锁屏时间不再算作加载卡死。
+    trackEvent('App 加载卡死超时');
+  }, 15_000), []);
   if (stalled) {
     return (
       <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900/95 text-white p-6 text-center space-y-4" style={{ animation: 'appLoadIn 320ms ease-out both' }}>
@@ -420,6 +436,11 @@ const AppLoadingFallback: React.FC<{ onReturn?: () => void; animationEnabled?: b
           >
             刷新恢复
           </button>
+          {import.meta.env.MODE !== 'capacitor' && (
+            <a href={`${import.meta.env.BASE_URL}recover.html`} className="w-full px-4 py-2 bg-slate-700 rounded-full text-xs font-bold">
+              检查更新并修复
+            </a>
+          )}
           {onReturn && (
             <button
               type="button"
@@ -448,9 +469,46 @@ const AppLoadingFallback: React.FC<{ onReturn?: () => void; animationEnabled?: b
   );
 };
 
+const AppEnterStage: React.FC<{
+  appId: AppID;
+  onSettled: (appId: AppID) => void;
+  children: React.ReactNode;
+}> = ({ appId, onSettled, children }) => {
+  useEffect(() => {
+    if (appId === AppID.Launcher) {
+      onSettled(AppID.Launcher);
+      return;
+    }
+    const timer = window.setTimeout(() => onSettled(appId), 260);
+    return () => window.clearTimeout(timer);
+  }, [appId, onSettled]);
+
+  return (
+    <div
+      className="w-full h-full"
+      style={{ animation: 'appEnterFade 200ms ease-out both' }}
+      onAnimationEnd={(e) => {
+        if (e.target === e.currentTarget) onSettled(appId);
+      }}
+    >
+      <style>{`@keyframes appEnterFade{from{opacity:0}to{opacity:1}}`}</style>
+      {children}
+    </div>
+  );
+};
+
 const PhoneShell: React.FC = () => {
-  const { theme, isLocked, unlock, activeApp, closeApp, openApp, virtualTime, isDataLoaded, toasts, unreadMessages, characters, handleBack, suspendedCall, resumeCall, activeCharacterId, errorDialog, dismissError } = useOS();
+  const { theme, isLocked, unlock, activeApp, closeApp, openApp, virtualTime, isDataLoaded, toasts, unreadMessages, characters, groups, handleBack, suspendedCall, resumeCall, suspendedDate, resumeDate, activeCharacterId, errorDialog, dismissError, sysOperation } = useOS();
   const useIOSStandaloneLayout = isIOSStandaloneWebApp();
+  const reducedBlur = useReducedBlur();
+  const deploymentNotice = useDeploymentNotice();
+  const [settledApp, setSettledApp] = useState<AppID>(activeApp);
+
+  useEffect(() => {
+    if (activeApp === AppID.Launcher) {
+      setSettledApp(AppID.Launcher);
+    }
+  }, [activeApp]);
 
   // 三档顶部状态栏：安全显示 / 紧凑显示 / 隐藏。旧存档仍由 hideStatusBar 兼容解析。
   // compact 把时间放进 safe-area，本体顶栏只让出 max(safe-area, 1.5rem)，避免顶部再多一整行。
@@ -461,7 +519,18 @@ const PhoneShell: React.FC = () => {
   }, [statusBarMode]);
 
   // 冷启动「世界入场」是否已结束。结束前由 BootSequence 接管整屏（同时取代旧的黑屏 spinner）。
-  const [bootDone, setBootDone] = useState(false);
+  const [spaceArrival] = useState(isUserSpaceArrival);
+  const [bootDone, setBootDone] = useState(spaceArrival);
+  useEffect(() => {
+    if (!spaceArrival) return;
+    if (deploymentNotice.blocked) {
+      if (deploymentNotice.source !== 'checking') cancelUserSpaceTransition();
+      return;
+    }
+    if (!isDataLoaded) return;
+    if (isLocked) unlock();
+    else finishUserSpaceTransition();
+  }, [spaceArrival, isDataLoaded, isLocked, deploymentNotice.blocked, deploymentNotice.source, unlock]);
   const bootAnimationEnabled = theme.bootAnimationEnabled !== false;
   useEffect(() => {
     // 本次启动一旦选择跳过，就记为已经完成；用户稍后重新打开开关时不在桌面中途补播。
@@ -472,7 +541,7 @@ const PhoneShell: React.FC = () => {
   // 每次严格等待当前 chunk 下载 + 解析完成，再空一拍取下一个。用户一按屏幕或进入 App，
   // 立刻取消所有尚未开始的任务；已经在飞的一个 import 无法中止，但最多只会与目标 App 并行一个。
   useEffect(() => {
-    if (!bootDone || !isDataLoaded || activeApp !== AppID.Launcher) return;
+    if (deploymentNotice.blocked || !bootDone || !isDataLoaded || activeApp !== AppID.Launcher) return;
     if (!shouldUseIdleAppPreload() || idlePreloadCursor >= APP_IDLE_PRELOAD_ORDER.length) return;
 
     let stoppedByInteraction = false;
@@ -543,7 +612,7 @@ const PhoneShell: React.FC = () => {
       window.removeEventListener('pointerdown', stopForInteraction, { capture: true });
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [activeApp, bootDone, isDataLoaded]);
+  }, [activeApp, bootDone, isDataLoaded, deploymentNotice.blocked]);
 
   // Disclaimer popup for first-time users
   const [showDisclaimer, setShowDisclaimer] = useState(() => {
@@ -553,6 +622,17 @@ const PhoneShell: React.FC = () => {
       return true;
     }
   });
+
+  useEffect(() => {
+    if (!isDataLoaded) return;
+    try {
+      if (localStorage.getItem(DISCLAIMER_KEY)) {
+        setShowDisclaimer(false);
+      }
+    } catch { /* ignore */ }
+  }, [isDataLoaded]);
+
+  const startupNoticesBlocked = deploymentNotice.blocked || showDisclaimer;
 
   const handleAcceptDisclaimer = () => {
     try {
@@ -573,15 +653,15 @@ const PhoneShell: React.FC = () => {
   const showImportRecoveryPrompt = !!importRecoveryMarker;
 
   useEffect(() => {
-    if (showDisclaimer || importRecoveryDismissed || importRecoveryMarker) return;
+    if (startupNoticesBlocked || importRecoveryDismissed || importRecoveryMarker) return;
     const marker = getPendingImportMarker();
     if (marker) setImportRecoveryMarker(marker);
-  }, [showDisclaimer, importRecoveryDismissed, importRecoveryMarker]);
+  }, [startupNoticesBlocked, importRecoveryDismissed, importRecoveryMarker]);
 
   // 使用统计：导入中断提醒弹出来时报一次。只带「失败/中断」和阶段这两个固定枚举，
   // marker 里的报错正文、备份文件名、当前文件名、各种进度数字一概不带。
   useEffect(() => {
-    if (showDisclaimer || !showImportRecoveryPrompt) return;
+    if (startupNoticesBlocked || !showImportRecoveryPrompt) return;
     const phase = importRecoveryMarker?.phase;
     // phase 是 marker 里的字符串，只认这五个已知值，其余一律归 other，避免把未知原文发出去。
     const stage = phase === 'parsing' || phase === 'assets' || phase === 'database' || phase === 'settings' || phase === 'error'
@@ -593,7 +673,7 @@ const PhoneShell: React.FC = () => {
       中断类型: hasError ? '导入失败' : '导入被中断',
       中断阶段: getImportPhaseLabel(phase),
     });
-  }, [showDisclaimer, showImportRecoveryPrompt, importRecoveryMarker]);
+  }, [startupNoticesBlocked, showImportRecoveryPrompt, importRecoveryMarker]);
 
   const handleReimportFromRecovery = () => {
     setImportRecoveryDismissed(true);
@@ -604,6 +684,22 @@ const PhoneShell: React.FC = () => {
 
   // 「致用户的一封信」已下线：常量置 false，保留变量让下面弹窗链的条件继续成立（恒真/恒不显示）。
   const showAuthorLetter = false;
+
+  // Ta-da 周年赠礼先于更新公告，等基础启动提示、开机动画与解锁完成。
+  const [showAnniversaryGift, setShowAnniversaryGift] = useState(false);
+  const anniversaryAsked = useRef(false);
+  const firstUseGuideActive = useFirstUseGuideStep() !== null;
+  const anniversaryBlocked = firstUseGuideActive || startupNoticesBlocked || showImportRecoveryPrompt || showAuthorLetter;
+  // 待展示也占住顺序，避免同一轮 effects 同时开启赠礼和更新公告。
+  // Complete setup before promotional/release popups; disclaimer/recovery still have priority.
+  const anniversaryHasPriority = firstUseGuideActive || showAnniversaryGift || (!anniversaryAsked.current && shouldShowAnniversaryGift());
+  useEffect(() => {
+    if (anniversaryAsked.current || anniversaryBlocked || !isDataLoaded || isLocked || (!bootDone && bootAnimationEnabled)) return;
+    if (shouldShowAnniversaryGift()) {
+      anniversaryAsked.current = true;
+      setShowAnniversaryGift(true);
+    }
+  }, [anniversaryBlocked, isDataLoaded, isLocked, bootDone, bootAnimationEnabled]);
 
   // 本次版本首映：数据就绪且解锁后出现一次，避免按钮打开的 App 被锁屏挡在背后。
   const [showUpdateNotification, setShowUpdateNotification] = useState(false);
@@ -618,13 +714,13 @@ const PhoneShell: React.FC = () => {
 
   useEffect(() => {
     if (updateNoticeAsked.current) return;
-    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification) return;
+    if (anniversaryHasPriority || startupNoticesBlocked || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification) return;
     if (!isDataLoaded || isLocked) return;
     if (shouldShowUpdateNotification()) {
       updateNoticeAsked.current = true;
       setShowUpdateNotification(true);
     }
-  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, isDataLoaded, isLocked]);
+  }, [anniversaryHasPriority, startupNoticesBlocked, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, isDataLoaded, isLocked]);
 
   // 七夕特别活动推送：严格按北京时间 2026-08-19 判断，用户处理后永久不再弹。
   // 排在版本更新之后、日常维护提醒之前；按钮只带到「特别时光」，不替用户选择角色。
@@ -632,76 +728,35 @@ const PhoneShell: React.FC = () => {
   const qixiLaunchAsked = useRef(false);
   useEffect(() => {
     if (qixiLaunchAsked.current) return;
-    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification) return;
+    if (anniversaryHasPriority || startupNoticesBlocked || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification) return;
     if (!isDataLoaded || isLocked) return;
     if (shouldShowQixiLaunchPopup()) {
       qixiLaunchAsked.current = true;
       setShowQixiLaunchPopup(true);
     }
-  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, isDataLoaded, isLocked]);
+  }, [anniversaryHasPriority, startupNoticesBlocked, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, isDataLoaded, isLocked]);
 
   // 520 特别活动弹窗（2026-05-20 当天，且没被 dismiss / completed）
   // 一次性：用户点过任何按钮就标记 dismissed，下次刷新不再出现；
   // API 配置改成弹窗内嵌，配完直接进活动，不再需要把弹窗暂存让位给 Settings。
   const [showLike520Popup, setShowLike520Popup] = useState(false);
   useEffect(() => {
-    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showQixiLaunchPopup) return;
+    if (anniversaryHasPriority || startupNoticesBlocked || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showQixiLaunchPopup) return;
     if (!isDataLoaded) return;
     if (shouldShowLike520Popup()) setShowLike520Popup(true);
-  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showQixiLaunchPopup, isDataLoaded]);
-
-  // Instant Push 下线通知 — 只对现在开着它的人弹，每天最多一次。
-  // 排在 Worker 更新提醒前面：这两条都只找同一批人，而「这功能要没了」比
-  // 「去把它更新到最新版」重要，同一天里先说前者。
-  const [showInstantPushSunset, setShowInstantPushSunset] = useState(false);
-  useEffect(() => {
-    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showQixiLaunchPopup || showLike520Popup) return;
-    if (!isDataLoaded) return;
-    if (shouldShowInstantPushSunsetNotice()) setShowInstantPushSunset(true);
-  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showQixiLaunchPopup, showLike520Popup, isDataLoaded]);
-
-  // Worker 后端更新提醒 — 只对启用了 Instant Push 的用户弹，且当前 worker 版本未确认过
-  const [showWorkerUpdateReminder, setShowWorkerUpdateReminder] = useState(false);
-  useEffect(() => {
-    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showQixiLaunchPopup || showLike520Popup || showInstantPushSunset) return;
-    if (!isDataLoaded) return;
-    if (shouldShowWorkerUpdateReminder()) setShowWorkerUpdateReminder(true);
-  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showQixiLaunchPopup, showLike520Popup, showInstantPushSunset, isDataLoaded]);
-
-  // 部署漂移自检：启动后异步 GET {workerUrl}/version（每 24h 最多一次）。
-  // 常量比对只能发现「前端更新了」，发现不了「用户 seen 过但实际没部署 / 部署的是更老的包」——
-  // 前端托管自动更新、worker 停在用户上次贴代码那天，这种漂移正是 instant 各类
-  // 「时灵时不灵」反馈的温床。确认 worker 有应答且版本不对（reachable && !ok）才重新
-  // 武装提醒；网络不通/没配不算数，贪睡窗口照常生效，不会轰炸。
-  useEffect(() => {
-    if (!isDataLoaded) return;
-    const cfg = loadInstantConfig();
-    if (!cfg.enabled || !cfg.workerUrl) return;
-    const PROBE_AT_KEY = 'sullyos_worker_version_probe_at';
-    try {
-      const last = Number(localStorage.getItem(PROBE_AT_KEY) || 0);
-      if (Date.now() - last < 86_400_000) return;
-    } catch { /* ignore */ }
-    void probeInstantWorkerVersion(cfg).then((r) => {
-      try { localStorage.setItem(PROBE_AT_KEY, String(Date.now())); } catch { /* ignore */ }
-      if (!r.ok && r.reachable) {
-        rearmWorkerUpdateReminder();
-        if (shouldShowWorkerUpdateReminder()) setShowWorkerUpdateReminder(true);
-      }
-    }).catch(() => { /* 探测失败不打扰 */ });
-  }, [isDataLoaded]);
+  }, [anniversaryHasPriority, startupNoticesBlocked, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showQixiLaunchPopup, isDataLoaded]);
 
   // 「该备份啦」提醒 — local-first 数据只在本机，隔 N 天（默认 7，可在设置里改）没导出就弹一次
   const [showBackupReminder, setShowBackupReminder] = useState(false);
   useEffect(() => {
-    if (showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showQixiLaunchPopup || showLike520Popup || showInstantPushSunset || showWorkerUpdateReminder) return;
+    if (anniversaryHasPriority || startupNoticesBlocked || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || showQixiLaunchPopup || showLike520Popup) return;
     if (!isDataLoaded || isLocked) return;
     if (shouldShowBackupReminder()) {
       setShowBackupReminder(true);
       // 只报「从未备份 / 已过期」这一个二选一，不报具体天数、也不报用户设的提醒间隔。
       trackEvent('弹出该备份啦提醒', { state: daysSinceLastBackup() == null ? '从未备份' : '已过期' });
     }
-  }, [showDisclaimer, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showQixiLaunchPopup, showLike520Popup, showInstantPushSunset, showWorkerUpdateReminder, isDataLoaded, isLocked]);
+  }, [anniversaryHasPriority, startupNoticesBlocked, showImportRecoveryPrompt, showAuthorLetter, showUpdateNotification, showQixiLaunchPopup, showLike520Popup, isDataLoaded, isLocked]);
 
   const dismissBackupReminder = () => {
     markBackupReminderShown();
@@ -763,17 +818,17 @@ const PhoneShell: React.FC = () => {
 
       // Re-arm before navigating inside the OS so another quick swipe is safe too.
       armGuard();
-      handleBack();
+      if (!deploymentNotice.blocked) handleBack();
     };
 
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, [activeApp, handleBack]);
+  }, [activeApp, handleBack, deploymentNotice.blocked]);
 
   // Capacitor Native Handling
   useEffect(() => {
     const initNative = async () => {
-        if (Capacitor.isNativePlatform()) {
+        if (!deploymentNotice.blocked && Capacitor.isNativePlatform()) {
             try {
                 await CapStatusBar.setOverlaysWebView({ overlay: true });
                 await CapStatusBar.hide();
@@ -796,6 +851,7 @@ const PhoneShell: React.FC = () => {
             try {
                 await CapApp.removeAllListeners();
                 CapApp.addListener('backButton', ({ canGoBack }) => {
+                    if (deploymentNotice.blocked) return;
                     if (isLocked) {
                         CapApp.exitApp();
                     } else {
@@ -813,7 +869,7 @@ const PhoneShell: React.FC = () => {
             CapApp.removeAllListeners().catch(() => {});
         }
     };
-  }, [activeApp, isLocked, closeApp, handleBack]);
+  }, [activeApp, isLocked, closeApp, handleBack, deploymentNotice.blocked]);
 
   // Force scroll to top when app changes to prevent "push up" glitches on iOS
   useEffect(() => {
@@ -826,7 +882,7 @@ const PhoneShell: React.FC = () => {
     const wallpaper = theme.wallpaper;
     const backgroundValue = !wallpaper
       ? '#0f1115'
-      : (wallpaper.startsWith('http') || wallpaper.startsWith('data:') || wallpaper.startsWith('blob:'))
+      : (wallpaper.startsWith('http') || wallpaper.startsWith('data:') || wallpaper.startsWith('blob:') || wallpaper.startsWith('./') || wallpaper.startsWith('/'))
         ? `url(${wallpaper})`
         : wallpaper;
 
@@ -841,7 +897,7 @@ const PhoneShell: React.FC = () => {
   // 冷启动：先放「世界入场」cinematic（数据没就绪时它持续呼吸等待，绝不出现 spinner）。
   // BootSequence 在「数据就绪 + 停留够时长」后推进退场，再交还控制权给下方的锁屏/桌面。
   if (!bootDone && bootAnimationEnabled) {
-    return <BootSequence dataReady={isDataLoaded} wallpaper={theme.wallpaper} onDone={() => setBootDone(true)} />;
+    return <BootSequence dataReady={isDataLoaded} wallpaper={theme.wallpaper} style={theme.bootAnimationStyle} onDone={() => setBootDone(true)} />;
   }
 
   // 兜底：理论上 bootDone 时数据已就绪；万一未就绪（极端慢）退化为最简静态深色屏，不闪 spinner。
@@ -849,8 +905,18 @@ const PhoneShell: React.FC = () => {
     return <div className="w-full h-full" style={{ background: '#05060f' }} />;
   }
 
+  // Before the lock screen and all startup prompts. The dialog's own mount starts
+  // the countdown, so neither the boot animation nor native identity lookup counts.
+  if (deploymentNotice.blocked) {
+    return <div className="w-full h-full" style={{ background: '#05060f' }}>
+      {deploymentNotice.source === 'checking'
+        ? <p role="status" className="p-6 text-center text-sm text-slate-300">正在确认版本来源…</p>
+        : deploymentNotice.source !== 'official' && <DeploymentNotice source={deploymentNotice.source} onAccept={deploymentNotice.accept} />}
+    </div>;
+  }
+
   const getBgStyle = (wp: string) => {
-      const isUrl = wp.startsWith('http') || wp.startsWith('data:') || wp.startsWith('blob:');
+      const isUrl = wp.startsWith('http') || wp.startsWith('data:') || wp.startsWith('blob:') || wp.startsWith('./') || wp.startsWith('/');
       return isUrl ? `url(${wp})` : wp;
   };
 
@@ -918,13 +984,13 @@ const PhoneShell: React.FC = () => {
                    <span>🍃</span><span>无人岛生活</span><span>🍃</span>
                </div>
            ) : (
-               <div className="text-lg tracking-widest opacity-90 mt-2 uppercase text-xs font-bold">SullyOS Simulation</div>
+               <div className="text-lg tracking-widest opacity-90 mt-2 uppercase text-xs font-bold">SullyOS·糯米机 Simulation</div>
            )}
         </div>}
 
         {!companionLockFrame && unreadCount > 0 && (
             <div className="absolute top-[40%] left-4 right-4 animate-slide-up">
-                <div className="bg-white/20 backdrop-blur-md rounded-2xl p-4 shadow-lg border border-white/10 flex items-center gap-4">
+                <div className={`rounded-2xl p-4 shadow-lg border flex items-center gap-4 ${reducedBlur ? 'bg-slate-900/70 border-white/20' : 'bg-white/20 backdrop-blur-md border-white/10'}`}>
                     <div className="w-10 h-10 rounded-xl bg-green-500 flex items-center justify-center text-white shrink-0 shadow-sm">
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6"><path fillRule="evenodd" d="M4.804 21.644A6.707 6.707 0 0 0 6 21.75a6.721 6.721 0 0 0 3.583-1.029c.774.182 1.584.279 2.417.279 5.322 0 9.75-3.97 9.75-9 0-5.03-4.428-9-9.75-9s-9.75 3.97-9.75 9c0 2.409 1.025 4.587 2.674 6.192.232.226.277.428.254.543a3.73 3.73 0 0 1-.814 1.686.75.75 0 0 0 .44 1.223ZM8.25 10.875a1.125 1.125 0 1 0 0 2.25 1.125 1.125 0 0 0 0-2.25ZM10.875 12a1.125 1.125 0 1 1 2.25 0 1.125 1.125 0 0 1-2.25 0Zm4.875-1.125a1.125 1.125 0 1 0 0 2.25 1.125 1.125 0 0 0 0-2.25Z" clipRule="evenodd" /></svg>
                     </div>
@@ -964,6 +1030,7 @@ const PhoneShell: React.FC = () => {
       case AppID.Schedule: return <ScheduleApp />;
       case AppID.Room: return <RoomApp />; 
       case AppID.CheckPhone: return <CheckPhone />;
+      case AppID.FriendFeed: return <FriendFeedApp />;
       case AppID.Social: return <SocialApp />;
       case AppID.Study: return <StudyApp />; 
       case AppID.FAQ: return <FAQApp />; 
@@ -998,24 +1065,48 @@ const PhoneShell: React.FC = () => {
   // 自理名单见 utils/safeAreaApps.ts（迁移一个 App = 把它加进名单 + 顶栏用 --chrome-top 自己让位）。
   // TODO(safe-area-A): 把剩余「未迁移」App 逐个改为自理安全区后，移除外壳这层兜底，实现全屏无色条。
   const shellPadsSafeArea = shellHandlesSafeArea(activeApp);
+  const activeCharacter = characters.find(c => c.id === activeCharacterId);
+  const hasCustomChatChromeCss = Boolean(
+    theme.chatChromeCustomCss ||
+      (activeApp === AppID.Chat && activeCharacter?.chromeCustomCss) ||
+      (activeApp === AppID.GroupChat && groups.some(g => Boolean(g.chromeCustomCss))),
+  );
+  const shellBackdropHidden =
+    activeApp !== AppID.Launcher &&
+    settledApp === activeApp &&
+    canHideShellBackdropWhenSettled(activeApp, {
+      hasCustomChatChromeCss,
+      iosStandalone: useIOSStandaloneLayout,
+    });
 
   return (
-    <div className="relative w-full h-full overflow-hidden bg-gradient-to-br from-pink-200 via-purple-200 to-indigo-200 text-slate-900 font-sans select-none overscroll-none">
+    <div className="sully-phone-shell relative w-full h-full overflow-hidden bg-gradient-to-br from-pink-200 via-purple-200 to-indigo-200 text-slate-900 font-sans select-none overscroll-none">
        {/* Optimized Background Layer */}
        {/* 壁纸底层：进 App 时只柔和虚化/压暗作背景，不再做缩放「过场」——
-          进 App 的过渡感统一交给 App 容器的淡入（见下方 animate-fade-in 包裹层）。 */}
+          进 App 的过渡感统一交给 App 容器的淡入（见下方 animate-fade-in 包裹层）。
+          虚化直接落在静态壁纸层上，上层叠纯色柔光遮罩；不透明全屏 App 淡入稳定后隐藏底层纹理。 */}
        <div
-         className="absolute inset-0 bg-cover bg-center transition-all duration-500 ease-[cubic-bezier(0.25,0.1,0.25,1)]"
+         className="sully-shell-wallpaper absolute inset-0 bg-cover bg-center transition-opacity duration-500 ease-[cubic-bezier(0.25,0.1,0.25,1)]"
          style={{
              backgroundImage: bgImageValue,
-             filter: activeApp !== AppID.Launcher ? 'blur(10px)' : 'none',
-             opacity: activeApp !== AppID.Launcher ? 0.6 : 1,
+             filter: activeApp === AppID.Launcher || reducedBlur || shellBackdropHidden ? 'none' : 'blur(24px)',
+             opacity: activeApp === AppID.Launcher ? 1 : reducedBlur ? 0.25 : 0.6,
+             visibility: shellBackdropHidden ? 'hidden' : undefined,
              backfaceVisibility: 'hidden',
              contain: useIOSStandaloneLayout ? undefined : 'strict'
          }}
        />
        
-       <div className={`absolute inset-0 transition-all duration-500 ${activeApp === AppID.Launcher ? 'bg-transparent' : 'bg-white/50 backdrop-blur-3xl'}`} />
+       <div
+         className={`sully-shell-wash absolute inset-0 transition-colors duration-500 ${
+           activeApp === AppID.Launcher
+             ? 'bg-transparent'
+             : reducedBlur
+               ? 'bg-slate-50/95'
+               : 'bg-white/55'
+         }`}
+         style={shellBackdropHidden ? { visibility: 'hidden' } : undefined}
+       />
        
        {/* 外壳安全区两种策略：
           - 未迁移 App：外壳铺满 body（含 --app-height 多出的 +safe-bottom 溢出区），用 padding 让位安全区，
@@ -1030,19 +1121,19 @@ const PhoneShell: React.FC = () => {
             : { bottom: 'var(--standalone-safe-area-bottom, 0px)' }
         }
       >
+          <FirstUseGuide />
           {/* App Container */}
           <div className="flex-1 relative overflow-hidden" style={{ contain: useIOSStandaloneLayout ? undefined : 'layout style paint' }}>
             <AppErrorBoundary onCloseApp={closeApp} resetKey={`${activeApp}:${activeCharacterId || 'none'}`}>
-              <Suspense fallback={<AppLoadingFallback onReturn={closeApp} animationEnabled={theme.appLoadingAnimationEnabled !== false} />}>
+              <Suspense fallback={<AppLoadingFallback key={activeApp} onReturn={closeApp} animationEnabled={theme.appLoadingAnimationEnabled !== false} />}>
                 {/* 统一「淡入」过渡：每次切换 App 时 key 变化 → 重新挂载并淡入，
                     让所有 App 都像个人档案那样「渐变进去」，而非瞬间咚一下。
                     关键：只动 opacity、不做 scale/translate —— 否则会把整棵（常含大量头像图片的）
                     App 子树栅格化进 transform 图层，角色列表类 App 首帧会卡顿一下（停顿一秒）。
                     时长也压短，进重 App 时不至于多等。 */}
-                <div key={activeApp} className="w-full h-full" style={{ animation: 'appEnterFade 200ms ease-out both' }}>
-                  <style>{`@keyframes appEnterFade{from{opacity:0}to{opacity:1}}`}</style>
+                <AppEnterStage key={activeApp} appId={activeApp} onSettled={setSettledApp}>
                   {renderApp()}
-                </div>
+                </AppEnterStage>
               </Suspense>
             </AppErrorBoundary>
           </div>
@@ -1051,20 +1142,35 @@ const PhoneShell: React.FC = () => {
               错误指示器、系统调试终端与开关无关、始终在。 */}
           <StatusBar />
           
-          {/* Overlays: Suspended Call Bar */}
+          {/* 通话条跟随安全区和状态栏高度，避免被灵动岛遮挡；无安全区时保留原来的顶部间距。 */}
           {suspendedCall && activeApp !== AppID.Call && (
             <button
               onClick={resumeCall}
-              className="absolute top-7 left-0 w-full z-[55] flex items-center justify-center gap-2 bg-emerald-500 text-white text-xs font-bold py-1.5 animate-pulse cursor-pointer active:bg-emerald-600 transition-colors"
+              className="absolute left-0 w-full z-[55] flex items-center justify-center gap-2 bg-emerald-500 text-white text-xs font-bold py-1.5 animate-pulse cursor-pointer active:bg-emerald-600 transition-colors"
+              style={{ top: 'max(1.75rem, calc(var(--chrome-top, 1.5rem) + 0.25rem))' }}
             >
               <span className="w-2 h-2 rounded-full bg-white animate-ping" />
               <span>通话中 · {suspendedCall.charName}</span>
               <span className="opacity-70">点击返回</span>
             </button>
           )}
+          {/* 挂起的见面：和通话条同一个位置，两条都在时排在通话条下面。 */}
+          {suspendedDate && activeApp !== AppID.Date && (
+            <button
+              onClick={resumeDate}
+              className="absolute left-0 w-full z-[55] flex items-center justify-center gap-2 bg-rose-400 text-white text-xs font-bold py-1.5 cursor-pointer active:bg-rose-500 transition-colors"
+              style={{ top: `calc(max(1.75rem, calc(var(--chrome-top, 1.5rem) + 0.25rem))${suspendedCall && activeApp !== AppID.Call ? ' + 1.75rem' : ''})` }}
+            >
+              <span>见面中 · {suspendedDate.charName}</span>
+              <span className="opacity-70">点击返回</span>
+            </button>
+          )}
 
           {/* Overlays: Global Mini Player (when music is playing in background) */}
           <GlobalMiniPlayer />
+          <NavigationBall />
+          {isDataLoaded&&!isLocked&&<Suspense fallback={null}><FriendFeedNotification/></Suspense>}
+          {!isLocked && <SARModuleMonitor />}
 
           {/* Overlays: 人格模拟生成全局指示条 */}
           <PersonaSimIndicator />
@@ -1094,6 +1200,12 @@ const PhoneShell: React.FC = () => {
        />
 
        {/* First-time disclaimer popup */}
+       {!anniversaryBlocked && !isLocked && showAnniversaryGift && (
+         <AnniversaryGiftPopup onClose={() => {
+           markAnniversaryGiftSeen();
+           setShowAnniversaryGift(false);
+         }} />
+       )}
        {showDisclaimer && <DisclaimerPopup onAccept={handleAcceptDisclaimer} />}
 
        {/* Interrupted import recovery reminder */}
@@ -1111,38 +1223,33 @@ const PhoneShell: React.FC = () => {
        )}
 
        {/* 见面 · 剧情首映：解锁后一次性出现 */}
-       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && showUpdateNotification && (
+       {!anniversaryHasPriority && !showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && showUpdateNotification && (
          <UpdateNotificationController onClose={() => setShowUpdateNotification(false)} />
        )}
 
        {/* 七夕特别活动推送（北京时间 2026-08-19，当天至多出现一次） */}
-       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && showQixiLaunchPopup && (
+       {!anniversaryHasPriority && !showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && showQixiLaunchPopup && (
          <QixiLaunchPopup onClose={() => setShowQixiLaunchPopup(false)} />
        )}
 
        {/* 520 特别活动弹窗（2026-05-20 当天，一次性） */}
-       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showQixiLaunchPopup && showLike520Popup && (
+       {!anniversaryHasPriority && !showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showQixiLaunchPopup && showLike520Popup && (
          <Like520Controller
            onClose={() => setShowLike520Popup(false)}
          />
        )}
 
-       {/* Instant Push 下线通知（仅现在开着它的用户，每天最多一次） */}
-       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showQixiLaunchPopup && !showLike520Popup && showInstantPushSunset && (
-         <InstantPushSunsetController
-           onClose={() => setShowInstantPushSunset(false)}
-         />
-       )}
+       <FeedbackInvitation
+         ready={isDataLoaded && !isLocked && (bootDone || !bootAnimationEnabled)}
+         blocked={activeApp !== AppID.Launcher || !!suspendedCall || !!suspendedDate || !!errorDialog || sysOperation.status !== 'idle' || anniversaryHasPriority || showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || shouldShowUpdateNotification() || showQixiLaunchPopup || showLike520Popup || showBackupReminder}
+       />
 
-       {/* Worker 后端更新提醒（仅启用 Instant Push 的用户，每个 worker 版本一次） */}
-       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showQixiLaunchPopup && !showLike520Popup && !showInstantPushSunset && showWorkerUpdateReminder && (
-         <WorkerUpdateReminderController
-           onClose={() => setShowWorkerUpdateReminder(false)}
-         />
-       )}
-
+       <BeautyRepoInvitation
+         ready={isDataLoaded && !isLocked && (bootDone || !bootAnimationEnabled)}
+         blocked={activeApp !== AppID.Launcher || !!suspendedCall || !!suspendedDate || !!errorDialog || sysOperation.status !== 'idle' || anniversaryHasPriority || showDisclaimer || showImportRecoveryPrompt || showAuthorLetter || showUpdateNotification || shouldShowUpdateNotification() || showQixiLaunchPopup || showLike520Popup || showBackupReminder}
+       />
        {/* 「该备份啦」提醒（local-first 数据只在本机，隔 N 天没导出弹一次） */}
-       {!showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showQixiLaunchPopup && !showLike520Popup && !showInstantPushSunset && !showWorkerUpdateReminder && showBackupReminder && (
+       {!anniversaryHasPriority && !showDisclaimer && !showImportRecoveryPrompt && !showAuthorLetter && !showUpdateNotification && !showQixiLaunchPopup && !showLike520Popup && showBackupReminder && (
          <BackupReminderController
            onDismiss={dismissBackupReminder}
            onGoBackup={goBackupFromReminder}

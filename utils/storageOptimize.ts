@@ -1,9 +1,11 @@
-// 「优化资源存储」：一个按钮还三笔存储上的债。
+// 「优化资源存储」：转换旧图片和向量，合并重复引用，并整理连接精度。
 //
 //   一、把已接入令牌链路的面里仍以 base64（data:image）落库的存量图片，批量转成
 //       blobref 令牌 + Blob 二进制（省掉 base64 的 ~33% 膨胀）。
 //   二、把「同一张图在库里存了好几份 Blob」收敛成一份。
 //   三、把还停留在 number[] 形态的记忆向量压成 Float32 原始字节（每维 ~20 字节 → 4 字节）。
+//   四、把记忆连接权重收敛为五位小数，不删连接。主要缩短备份 JSON，
+//       不把 Number 的小数位减少当成 IndexedDB 磁盘节省来报告。
 //
 // 第一笔债的由来：这些面平时靠惰性迁移——哪个消费点读到 data: 才顺手转（加载壁纸、
 // 进小屋……），从不打开的内容会一直躺着多占空间；导入 v2 老备份也会重新带进一批 base64。
@@ -99,6 +101,7 @@ import { blobStore } from './blobStore';
 import { collectUnmergeableRefs, buildMergePlan, rewriteBlobRefs } from './blobDedupe';
 import { creatorPartToBlobRefs } from './creatorPartsBlob';
 import { tryAcquireMaintenanceLock, releaseMaintenanceLock, currentMaintenanceHolder } from './maintenanceLock';
+import { withSharedAssetLock } from './sharedAssetLock';
 import type { AppearancePreset, ChatTheme, CharacterProfile, CustomCreatorPart, Emoji, GalleryImage, Message, SongSheet } from '../types';
 
 /** 本工具会写的表。守卫测试断言它 ⊆ blobGc 的 REF_SOURCE_STORES（转出的 Blob 必须在 GC 视野内）。 */
@@ -172,6 +175,9 @@ export interface OptimizeResult {
     vectorsCompacted: number;
     /** 向量压缩失败的原因；null = 这轮没出问题。开机那次是静默 warn 的，这里必须报出来 */
     vectorError: string | null;
+    /** Rounded weights only; no edges are removed and no disk saving is inferred. */
+    linksCompacted: number;
+    linkError: string | null;
 }
 
 export async function optimizeResourceStorage(
@@ -180,12 +186,13 @@ export async function optimizeResourceStorage(
     if (!tryAcquireMaintenanceLock('优化资源存储')) {
         throw new Error(`另一项存储维护（${currentMaintenanceHolder()}）正在进行，请稍后再试。`);
     }
-    try {
+    const run = async (): Promise<OptimizeResult> => {
         const result: OptimizeResult = {
             converted: 0, uniqueBlobs: 0, bytesBefore: 0, bytesAfter: 0, failed: 0,
             failureReasons: {},
             mergedDuplicates: 0, reclaimableBytes: 0, skippedGroups: 0, scanUnavailable: false,
             vectorsCompacted: 0, vectorError: null,
+            linksCompacted: 0, linkError: null,
         };
         // 当前正在处理哪个面（tick 时更新）。失败原因带上它才知道是哪张表出的事。
         let currentFace = '开始前';
@@ -752,7 +759,20 @@ export async function optimizeResourceStorage(
             result.vectorError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
         }
 
+        try {
+            const { MemoryLinkDB } = await import('./memoryPalace/db');
+            result.linksCompacted = await MemoryLinkDB.compactStrengths((changed, scanned) => {
+                onProgress?.({ label: '整理记忆连接精度', done: scanned, total: scanned });
+            });
+        } catch (e) {
+            result.linkError = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        }
         return result;
+    };
+    try {
+        // 扫描得到的保留图可能暂时无人引用。直到迁移/合并引用全部落盘前，
+        // 不能让换图清理或另一页面的 GC 把它删掉；共享池锁跨标签页协调。
+        return await withSharedAssetLock('exclusive', run);
     } finally {
         releaseMaintenanceLock();
     }

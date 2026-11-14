@@ -61,3 +61,14 @@ describe('群公共话题盒批处理', () => {
         expect(prompt).toContain('客观视角');
     });
 });
+
+
+it('关闭群时间感知后，话题盒整理也不附加收发时间', () => {
+    const batch = messages(1);
+    batch[0].content = '明天八点见';
+    const on = buildGroupTopicPrompt(group, batch, [], '用户');
+    const off = buildGroupTopicPrompt({ ...group, timeAwarenessEnabled: false }, batch, [], '用户');
+    expect(on).toMatch(/\[[^\]\n]+\] 用户: 明天八点见/);
+    expect(off).toContain('群聊原文：\n用户: 明天八点见');
+    expect(off).not.toMatch(/\[[^\]\n]+\] 用户: 明天八点见/);
+});

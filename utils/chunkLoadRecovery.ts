@@ -16,6 +16,17 @@
 const RELOAD_MARK_KEY = 'sullyos_chunk_reload_at';
 const RELOAD_COOLDOWN_MS = 60_000;
 
+export type ChunkAutoReloadResult = 'reloading' | 'offline' | 'cooldown' | 'storage-unavailable';
+
+// EOF 本身不能证明是 chunk：JSON / 用户脚本也会报语法错误。
+// 只为懒加载 Promise 的拒绝记录来源，保留原 Error 和堆栈（也兼容 frozen Error）。
+const moduleLoadErrors = new WeakSet<object>();
+export const markModuleLoadError = (error: unknown): void => {
+    if (error !== null && typeof error === 'object') moduleLoadErrors.add(error);
+};
+
+const INCOMPLETE_MODULE_RE = /^(?:Unexpected EOF|Unexpected end of (?:input|script))\.?$/i;
+
 /** 各浏览器动态 import / chunk 加载失败的报错指纹 (Safari / Chrome / Firefox / webpack 风格) */
 const CHUNK_ERROR_RE = new RegExp(
     [
@@ -23,6 +34,8 @@ const CHUNK_ERROR_RE = new RegExp(
         'Failed to fetch dynamically imported module', // Chrome
         'error loading dynamically imported module',   // Firefox
         'Failed to load module script',                 // MIME/网络层失败
+        'not a valid JavaScript MIME type',             // Safari: 'text/html' is not a valid JavaScript MIME type
+        'server responded with a MIME type of ["\']?text/html', // Chromium: SPA fallback returned HTML for a module
         'Unable to preload CSS',                        // Vite __vitePreload CSS 依赖失败
         'ChunkLoadError',
         'Loading chunk \\S+ failed',
@@ -34,24 +47,29 @@ export const isChunkLoadError = (err: unknown): boolean => {
     const msg = err instanceof Error
         ? `${err.name}: ${err.message}`
         : typeof err === 'string' ? err : '';
-    return CHUNK_ERROR_RE.test(msg);
+    if (CHUNK_ERROR_RE.test(msg)) return true;
+    return err instanceof Error
+        && moduleLoadErrors.has(err)
+        && err.name === 'SyntaxError'
+        && INCOMPLETE_MODULE_RE.test(err.message.trim());
 };
 
 /**
  * 尝试自动整页刷新来恢复 chunk 加载失败。
- * 返回 true = 已发起刷新 (页面即将消失); false = 冷却期内/存储不可用, 调用方应展示手动刷新按钮。
+ * 明确离线时保留当前页面，不消耗冷却额度；联网后由用户手动重试。
+ * 返回发起刷新或阻止刷新的原因，调用方据此展示手动恢复提示。
  */
-export const tryAutoReloadForChunkError = (): boolean => {
-    let allowed = false;
+export const tryAutoReloadForChunkError = (): ChunkAutoReloadResult => {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return 'offline';
     try {
         const last = parseInt(sessionStorage.getItem(RELOAD_MARK_KEY) || '0', 10) || 0;
-        allowed = Date.now() - last >= RELOAD_COOLDOWN_MS;
-        if (allowed) sessionStorage.setItem(RELOAD_MARK_KEY, String(Date.now()));
+        const now = Date.now();
+        if (now - last < RELOAD_COOLDOWN_MS) return 'cooldown';
+        sessionStorage.setItem(RELOAD_MARK_KEY, String(now));
     } catch {
         // sessionStorage 不可用时没法防刷新循环 → 不自动刷, 走手动按钮兜底
-        allowed = false;
+        return 'storage-unavailable';
     }
-    if (!allowed) return false;
     window.location.reload();
-    return true;
+    return 'reloading';
 };

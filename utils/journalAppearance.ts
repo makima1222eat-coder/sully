@@ -1,3 +1,4 @@
+import {validateScopedCss} from './scopedCss';
 import type { JournalAppearance, JournalAppearancePresetId } from '../types';
 
 export type JournalLayoutId = 'classic' | 'postal-archive' | 'celestial-album' | 'field-dossier' | 'memory-editor';
@@ -107,7 +108,7 @@ const journalSelectorPrompt = JOURNAL_CUSTOM_CSS_SELECTOR_GROUPS
     .map(group => `${group.label}：\n${group.selectors.join('、')}`)
     .join('\n\n');
 
-export const JOURNAL_AI_CSS_PROMPT = `你是 CSS 设计师，请为 SullyOS 的「交换日记」App 写一段完整的自定义 CSS。
+export const JOURNAL_AI_CSS_PROMPT = `你是 CSS 设计师，请为 SullyOS·糯米机 的「交换日记」App 写一段完整的自定义 CSS。
 
 要求：
 1. 只能使用下列公开选择器；每条普通规则都必须以 .sully-journal-root 或 .sully-journal-* 开头。
@@ -322,3 +323,11 @@ export const flattenJournalAppearance = (appearance?: JournalAppearance): Journa
     preset: 'original',
     customCss: resolveJournalAppearanceCss(appearance),
 });
+
+export function validateJournalAppearance(value:unknown):JournalAppearance {
+ if(!value||typeof value!=='object'||Array.isArray(value))throw Error('交换日记样式无效');const v=value as Record<string,unknown>;
+ if(v.preset!==undefined&&(typeof v.preset!=='string'||!JOURNAL_APPEARANCE_PRESETS.some(p=>p.id===v.preset)))throw Error('交换日记主题无效');
+ if(v.customCss!==undefined&&(typeof v.customCss!=='string'||v.customCss.length>1024*1024||/<\/?(?:script|style|html|iframe)\b/i.test(v.customCss)))throw Error('交换日记 CSS 无效');
+ const css=typeof v.customCss==='string'?v.customCss:'';const check=validateScopedCss(css,JOURNAL_CSS_SCOPE_REGEX,JOURNAL_CSS_SCOPE_HINT);if(!check.isValid)throw Error(check.errors.join('\n'));
+ return {preset:(v.preset||'original') as JournalAppearancePresetId,customCss:css};
+}

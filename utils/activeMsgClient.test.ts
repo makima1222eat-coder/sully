@@ -40,16 +40,18 @@ vi.mock('./keepAlive', () => ({
 
 import {
   ActiveMsgClient, buildFirePack, clearNamespaceValuesOrThrow, compareRemotePushSubscription,
-  describeInstantChatFailure, dropStaleSubscription, maybeGzipRequestBody, putClientStateOrThrow,
-  readAmsgFailKind, toRemoteAvatarUrl,
+  describeInstantChatFailure, dropStaleSubscription, formatAmsgServerError, maybeGzipRequestBody,
+  putClientStateOrThrow, readAmsgFailKind, toRemoteAvatarUrl,
 } from './activeMsgClient';
 import {
   AMSG_FIRE_PACK_KEY,
   AMSG_SLOT_CURRENT_TIME, AMSG_SLOT_REALTIME_WORLD, AMSG_SLOT_SCENE,
+  AMSG_SILENT_MARK, AMSG_SLOT_LIVE_CHAT,
   AMSG_SLOT_TASK_LIST, AMSG_SLOT_TIME_SINCE_USER, AMSG_SLOT_USER_CLOCK,
 } from './amsgFirePack';
 import { clearInstantChatPending, setInstantChatPending } from './amsgInstantChat';
 import { AMSG_TOOL_CONFIG_KEY, AMSG_TOOL_PACK_KEY } from './amsgToolPack';
+import { AMSG_LIMITS_KEY } from './amsgLimits';
 import * as dailySchedule from './dailySchedule';
 import { ChatPrompts } from './chatPrompts';
 import { DB } from './db';
@@ -76,6 +78,17 @@ vi.mock('./activeMsgStore', () => ({
 }));
 
 const ENTRIES = [{ namespace: 'amsg:char:x', key: 'fire_pack', value: '{}', updatedAt: 1 }];
+
+it('已经停止的即时请求不会开始准备或上传下一轮状态', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const fetchSpy = vi.spyOn(globalThis, 'fetch');
+  try {
+    await expect(ActiveMsgClient.sendInstantChat({ signal: controller.signal } as any))
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchSpy).not.toHaveBeenCalled();
+  } finally { fetchSpy.mockRestore(); }
+});
 
 /** 只需要 putClientState 这一个方法，其余 InternalReiClient 成员用不到。 */
 const clientWith = (impl: any) => ({ putClientState: impl } as any);
@@ -535,6 +548,33 @@ describe('连接前的 worker 配置自检', () => {
   // 的话，「重新连接并验证」拿回来的还是握着旧密钥的老 client：init-tenant 成功、界面报
   // 「连接成功」，此后每一次加密调用 worker 都解不开（即时对话每发一条挂一条、任务到点
   // 全失败），只有整页刷新能恢复。
+  // 回归守卫：connect() 握手后把配置整份写回，而那份是握手**之前**读的快照。握手顺手发起的
+  // 能力探测可能已经抢先落了新结论（用户刚更新完 Worker 点「重新连接」正是这种时候），
+  // 整份写回会把 instantChatSupported / workerBundleVersion 盖回旧值——SAR 信封回合的版本
+  // 闸门就会拿着过期的「旧版」一直把人挡在本地。
+  it('写回配置时不带两样探测结论（不拿握手前的旧值盖掉刚探到的新结论）', async () => {
+    routeFetch({});
+    reiClient.init.mockReset().mockResolvedValue(undefined);
+    storeConfigExtra.value = { instantChatSupported: false, workerBundleVersion: '2000-01-01', instantChatEnabled: true };
+    const { ActiveMsgStore } = await import('./activeMsgStore');
+    (ActiveMsgStore.saveGlobalConfig as any).mockClear();
+    try {
+      await ActiveMsgClient.connect();
+    } finally {
+      storeConfigExtra.value = {};
+    }
+    const writeBack = (ActiveMsgStore.saveGlobalConfig as any).mock.calls
+      .map((call: any[]) => call[0])
+      .find((update: Record<string, unknown>) => 'initializedAt' in update);
+    expect(writeBack).toBeDefined();
+    // 用户自己的配置照常写回……
+    expect(writeBack.workerUrl).toBe('https://amsg.example.workers.dev');
+    expect(writeBack.instantChatEnabled).toBe(true);
+    // ……探测结论一个都不带。
+    expect(writeBack).not.toHaveProperty('instantChatSupported');
+    expect(writeBack).not.toHaveProperty('workerBundleVersion');
+  });
+
   it('「重新连接并验证」每按一次都真的重新握手（换过 master key 后旧密钥必须被丢掉）', async () => {
     routeFetch({});
     reiClient.init.mockReset().mockResolvedValue(undefined);
@@ -568,11 +608,19 @@ describe('ActiveMsgClient.listRemoteTasksForChar 的版本护栏', () => {
       { uuid: 'task-b', charId: null },
     ]);
     await expect(ActiveMsgClient.listRemoteTasksForChar('char-1'))
-      .rejects.toThrow(/重新粘贴部署/);
+      .rejects.toThrow(/更新 Worker/);
   });
 
   it('远端确实一条任务都没有 → 空数组（跟版本无关，别误伤）', async () => {
     vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([]);
+    await expect(ActiveMsgClient.listRemoteTasksForChar('char-1')).resolves.toEqual([]);
+  });
+
+  it('任务全是解不开的（换了 Master Key）→ 不当成老 worker，别劝人重新部署', async () => {
+    vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([
+      { uuid: 'task-a', status: 'pending', error: { code: 'STORED_DATA_UNDECRYPTABLE', message: 'x' } },
+      { uuid: 'task-b', status: 'pending', error: { code: 'STORED_DATA_UNDECRYPTABLE', message: 'x' } },
+    ]);
     await expect(ActiveMsgClient.listRemoteTasksForChar('char-1')).resolves.toEqual([]);
   });
 });
@@ -659,6 +707,7 @@ describe('scheduleCharacterTask 与欠着的即时对话 chat 段', () => {
     reiClient._encrypt.mockReset().mockResolvedValue({ iv: 'iv', authTag: 'tag', encryptedData: 'enc' });
     // 模板本体、表情全库、推送登记这些都不在被测范围，桩掉。
     vi.spyOn(DB, 'getRecentMessagesByCharId').mockResolvedValue([] as any);
+    vi.spyOn(DB, 'ensureHomeContextMessages').mockResolvedValue(undefined);
     vi.spyOn(DB, 'getEmojis').mockResolvedValue([] as any);
     vi.spyOn(DB, 'getEmojiCategories').mockResolvedValue([] as any);
     vi.spyOn(ChatPrompts, 'buildSystemPrompt').mockResolvedValue('SYS_PROMPT_MARKER');
@@ -698,6 +747,13 @@ describe('scheduleCharacterTask 与欠着的即时对话 chat 段', () => {
   it('没欠着回复 → fire_pack 照常整份覆盖上去', async () => {
     await schedule();
     expect(writtenKeys()).toContain(AMSG_FIRE_PACK_KEY);
+  });
+
+  // 上限单独一份、每次传上下文都顺手带上（欠着回复时也照带：它跟 chat 段无关）。
+  it('排任务时顺手把「频率与额度」那份一起传上去', async () => {
+    setInstantChatPending(CHAR_ID, 'uuid-waiting');
+    await schedule();
+    expect(writtenKeys()).toContain(AMSG_LIMITS_KEY);
   });
 
   it('欠着回复 → 这一批把 fire_pack 抽掉，tool_pack / tool_config 照写、任务照建', async () => {
@@ -931,6 +987,7 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
   beforeEach(() => {
     // 模板本体不在被测范围：桩掉重依赖，测打包逻辑本身。
     vi.spyOn(DB, 'getRecentMessagesByCharId').mockResolvedValue([] as any);
+    vi.spyOn(DB, 'ensureHomeContextMessages').mockResolvedValue(undefined);
     systemPromptSpy = vi.spyOn(ChatPrompts, 'buildSystemPrompt').mockResolvedValue('SYS_PROMPT_MARKER');
     vi.spyOn(ChatPrompts, 'buildMessageHistory').mockReturnValue({ apiMessages: [] } as any);
     vi.spyOn(ChatPrompts, 'filterVisibleEmojis').mockReturnValue({ emojis: [], categories: [] } as any);
@@ -964,13 +1021,11 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
     expect(out.template).toContain(`现在是 ${AMSG_SLOT_CURRENT_TIME}`);
   });
 
-  it('随包带上用户设的连发上限；没设就不带（worker 侧用默认值）', async () => {
+  // 上限不再跟着 fire_pack 走：那一份要等「有待发任务、聊完一轮」才重传，改了上限会迟迟
+  // 不生效。上限单独住在 limits 那份记录里（见 amsgLimits），包里不该再有它。
+  it('fire_pack 不带连发上限（上限单独同步，见 amsgLimits）', async () => {
     const withLimit = await pack(baseChar({ activeMsg2Config: { enabled: true, maxUnansweredSends: 5 } }));
-    expect(withLimit.maxUnansweredSends).toBe(5);
-    const unlimited = await pack(baseChar({ activeMsg2Config: { enabled: true, maxUnansweredSends: 0 } }));
-    expect(unlimited.maxUnansweredSends).toBe(0);
-    const unset = await pack(baseChar());
-    expect(unset.maxUnansweredSends).toBeUndefined();
+    expect(withLimit).not.toHaveProperty('maxUnansweredSends');
   });
 
   // 回归守卫：用户设备的时区以前一个字都没上云。角色只看得到自己那边的钟，
@@ -1006,6 +1061,18 @@ describe('buildFirePack 的时区参照系与模板（①）', () => {
     const { template } = await pack(baseChar());
     expect(template).toContain('日子也在往前过');
     expect(template).toContain('关心别变成查岗');
+  });
+
+  // 到点说不说由角色看着最新对话自己判。模板得把三样东西交到它手上：正聊着时那行事实的
+  // 落点、「正聊着不等于不说」这条分寸、决定不说时写什么。缺了标记，角色的「不说」就只能
+  // 是空输出，跟模型没写出来分不开。
+  it('【开口之前】带上正聊着的落点、默认是说的分寸、和不说时的标记', async () => {
+    const { template } = await pack(baseChar());
+    const section = template.slice(template.indexOf('【开口之前】'));
+    expect(section).toContain(AMSG_SLOT_LIVE_CHAT);
+    expect(section).toContain('默认是照常说');
+    expect(section).toContain('正聊着不等于不说');
+    expect(section).toContain(`只写 ${AMSG_SILENT_MARK} 这一个标记`);
   });
 
   // 回归守卫：timeAwarenessEnabled=false 的架空角色在前台连今天几号都读不到
@@ -1351,6 +1418,18 @@ describe('ActiveMsgClient.registerPushSubscription（② 订阅按用户登记�
 
     await expect(ActiveMsgClient.registerPushSubscription()).rejects.toThrow('worker 拒绝了订阅');
   });
+
+  // 真实的 amsg-client 碰到 4xx 只把信封还回来、不抛。之前没看 success，Worker 拒收
+  // （比如订阅地址格式不认）也当登记成功，用户之后一条推送都收不到。
+  it('Worker 回失败信封时同样往外抛，不当成登记成功', async () => {
+    vi.spyOn(ActiveMsgClient, 'ensurePushSubscription').mockResolvedValue(SUB_JSON as any);
+    reiClient.putPushSubscription.mockResolvedValue({
+      success: false,
+      error: { code: 'INVALID_PUSH_SUBSCRIPTION', message: '订阅地址不被接受' },
+    });
+
+    await expect(ActiveMsgClient.registerPushSubscription()).rejects.toThrow('订阅地址不被接受');
+  });
 });
 
 // 回归守卫：换一台 worker 就是换一个空的 D1，而浏览器这侧的订阅一个字都没变——
@@ -1425,11 +1504,12 @@ describe('ActiveMsgClient.refreshApiCredentialsForPendingTasks（③ 凭据变�
 
   beforeEach(() => {
     reiClient.init.mockReset().mockResolvedValue(undefined);
+    vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([]);
     reiClient.updateMessage.mockReset().mockResolvedValue({ success: true });
   });
   afterEach(() => { vi.restoreAllMocks(); });
 
-  it('只刷「开着 2.0 且 pending 的 AI 任务」，三字段载荷；单独 API 的角色写单独 API 的值', async () => {
+  it('只刷「开着 2.0 且 pending 的 AI 任务」，旧单独 API 也统一使用主 API', async () => {
     vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([
       { id: 'char-a', activeMsg2Config: { enabled: true, tasks: [
         remoteTask('a1'),
@@ -1456,13 +1536,54 @@ describe('ActiveMsgClient.refreshApiCredentialsForPendingTasks（③ 凭据变�
       primaryModel: 'gpt-x',
     });
     expect(byUuid.get('c1')).toEqual({
-      apiUrl: 'https://sec.example.com/chat/completions',
-      apiKey: 'sec-key',
-      primaryModel: 'sec-model',
+      apiUrl: 'https://api.example.com/v1/chat/completions',
+      apiKey: 'new-key',
+      primaryModel: 'gpt-x',
     });
   });
 
-  it('没有 pending AI 任务（只剩 fixed / 全关掉）→ no-tasks，一个请求都不发', async () => {
+  it('迁移云端自排任务，保留情绪引用，跳过 fixed / 后台作业 / 正在等的即时回复', async () => {
+    vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([
+      { id: 'char-a', activeMsg2Config: { enabled: true, tasks: [] } },
+    ] as any);
+    const remote = (uuid: string, extra: Record<string, unknown> = {}) => ({
+      uuid, charId: 'char-a', status: 'pending', messageType: 'auto', messageSubtype: 'chat', ...extra,
+    });
+    vi.mocked(ActiveMsgClient.listAllTasks).mockResolvedValue([
+      remote('ref', { credRefs: { chat: 'char:char-a/chat', emotion: 'char:char-a/emotion' } }),
+      remote('inline'),
+      remote('instant-child', { messageSubtype: 'instant-chat', credRefs: { chat: 'char:char-a/instant' } }),
+      remote('fixed', { messageType: 'fixed' }),
+      remote('job', { messageSubtype: 'job' }),
+      remote('instant', { messageSubtype: 'instant-chat' }),
+      remote('disabled', { charId: 'char-disabled' }),
+      remote('done', { status: 'completed' }),
+    ]);
+    vi.spyOn(ActiveMsgClient, 'putLlmCredentials').mockResolvedValue(1);
+    reiClient._decrypt.mockImplementation(async (payload: unknown) => payload);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => ({
+      status: 200,
+      text: async () => JSON.stringify({ success: true, data: { task: {
+        metadata: url.includes('instant-child') ? { amsgSelfScheduled: true } : { amsgInstantChat: true },
+      } } }),
+      headers: new Headers({ 'content-type': 'application/json' }),
+    })));
+    try {
+      const result = await ActiveMsgClient.refreshApiCredentialsForPendingTasks(API);
+      expect(result).toEqual({ status: 'ok', updated: 3, failed: 0 });
+      expect(reiClient.updateMessage.mock.calls).toEqual([
+        ['ref', { credRefs: { chat: 'char:char-a/chat', emotion: 'char:char-a/emotion' } }],
+        ['inline', { apiUrl: 'https://api.example.com/v1/chat/completions', apiKey: 'new-key', primaryModel: 'gpt-x' }],
+        ['instant-child', { credRefs: { chat: 'char:char-a/chat' } }],
+      ]);
+      expect(ActiveMsgClient.putLlmCredentials).toHaveBeenCalledWith([{
+        credId: 'char:char-a/chat',
+        value: { apiUrl: 'https://api.example.com/v1/chat/completions', apiKey: 'new-key', primaryModel: 'gpt-x' },
+      }]);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it('没有 pending AI 任务（只剩 fixed / 全关掉）→ no-tasks，不写任务凭据', async () => {
     vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([
       { id: 'char-a', activeMsg2Config: { enabled: true, tasks: [remoteTask('a2', { mode: 'fixed' })] } },
     ] as any);
@@ -1472,7 +1593,7 @@ describe('ActiveMsgClient.refreshApiCredentialsForPendingTasks（③ 凭据变�
     expect(reiClient.updateMessage).not.toHaveBeenCalled();
   });
 
-  it('某个角色凭据配不齐（单独 API 缺字段）→ 该角色整组记失败，别拦其他角色', async () => {
+  it('残缺的旧单独 API 不影响主 API 刷新', async () => {
     vi.spyOn(DB, 'getAllCharacters').mockResolvedValue([
       { id: 'char-broken', activeMsg2Config: {
         enabled: true,
@@ -1485,18 +1606,19 @@ describe('ActiveMsgClient.refreshApiCredentialsForPendingTasks（③ 凭据变�
 
     const result = await ActiveMsgClient.refreshApiCredentialsForPendingTasks(API);
 
-    expect(result).toEqual({ status: 'partial', updated: 1, failed: 1 });
-    expect(reiClient.updateMessage.mock.calls.map((c: any[]) => c[0])).toEqual(['y1']);
+    expect(result).toEqual({ status: 'ok', updated: 2, failed: 0 });
+    expect(reiClient.updateMessage.mock.calls.map((c: any[]) => c[0])).toEqual(['x1', 'y1']);
   });
 });
 
 describe('ActiveMsgClient.refreshCharPendingAiTaskCredentials（③ 面板保存后的单角色版）', () => {
   beforeEach(() => {
     reiClient.init.mockReset().mockResolvedValue(undefined);
+    vi.spyOn(ActiveMsgClient, 'listAllTasks').mockResolvedValue([]);
     reiClient.updateMessage.mockReset().mockResolvedValue({ success: true });
   });
 
-  it('fixed 再滤一遍；凭据按传入的 config（面板手里的最新值）算，不读 DB', async () => {
+  it('fixed 再滤一遍；忽略旧的单独 API，按主 API 刷新', async () => {
     const result = await ActiveMsgClient.refreshCharPendingAiTaskCredentials({
       char: { id: 'char-a' } as any,
       config: {
@@ -1512,9 +1634,9 @@ describe('ActiveMsgClient.refreshCharPendingAiTaskCredentials（③ 面板保存
     expect(reiClient.updateMessage).toHaveBeenCalledTimes(1);
     expect(reiClient.updateMessage.mock.calls[0][0]).toBe('t1');
     expect(reiClient.updateMessage.mock.calls[0][1]).toEqual({
-      apiUrl: 'https://sec.example.com/chat/completions',
-      apiKey: 'sec-key',
-      primaryModel: 'sec-model',
+      apiUrl: 'https://api.example.com/chat/completions',
+      apiKey: 'k',
+      primaryModel: 'm',
     });
   });
 
@@ -1857,6 +1979,121 @@ describe('describeInstantChatFailure — 后端那句真话要露出来', () => 
   it('有专属指引的错误码不受影响（401 仍然只说该去核对共享密钥）', () => {
     expect(describeInstantChatFailure(401, internalError('D1_ERROR: whatever')))
       .toBe('即时对话没发出去：共享密钥和 Worker 上的对不上，去「主动消息 2.0」设置里核对一下。');
+  });
+
+  it('上游 400 参数校验失败时把 details 里的 missingFields / invalidFields 透传出来', () => {
+    const text = describeInstantChatFailure(400, {
+      error: {
+        code: 'INSTANT_CHAT_TASK_FAILED',
+        message: '任务没建起来，这条没发出去',
+        upstream: {
+          success: false,
+          error: {
+            code: 'INVALID_PARAMETERS',
+            message: '缺少必需参数或参数格式错误',
+            details: {
+              missingFields: ['apiKey'],
+              invalidFields: ['temperature (must be a finite number)'],
+            },
+          },
+        },
+      },
+    });
+    expect(text).toContain('缺少字段: apiKey');
+    expect(text).toContain('无效字段: temperature (must be a finite number)');
+  });
+
+  it('PUT /client-state 局部 rejected 时把被拒条目原因透传出来', () => {
+    const text = describeInstantChatFailure(409, {
+      error: {
+        code: 'INSTANT_CHAT_STATE_FAILED',
+        message: '这一轮的输入未能保存，任务没有创建',
+        upstream: {
+          success: true,
+          data: {
+            rejected: [
+              { key: 'input-1', code: 'STATE_VALUE_TOO_LARGE', message: '单条状态超限', bytes: 6000000, maxBytes: 5242880 },
+            ],
+          },
+        },
+      },
+    });
+    expect(text).toContain('input-1(单条状态超限（6000000/5242880 bytes）)');
+  });
+
+  it('503 INSTANT_CHAT_WORKER_OUTDATED 保留专属更新指引，不被通用环境变量提示覆盖', () => {
+    const text = describeInstantChatFailure(503, {
+      error: {
+        code: 'INSTANT_CHAT_WORKER_OUTDATED',
+        message: '即时对话需要更新 Worker：打开「系统设置 → 主动消息 2.0 → 配置」，点「更新 Worker」。',
+      },
+    });
+    expect(text).toContain('即时对话需要更新 Worker');
+    expect(text).not.toContain('环境变量没配齐');
+  });
+});
+
+describe('formatAmsgServerError — 通用后端错误细节透传', () => {
+  it('透传 500 INTERNAL_ERROR 的 cause（避免只剩一句「服务器内部错误」）', () => {
+    const text = formatAmsgServerError({
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: '服务器内部错误',
+        cause: { code: 'CLOUD_OWNER_RETIRED', message: '角色已停用，不能继续写入云端数据' },
+      },
+    }, '操作失败');
+    expect(text).toBe('服务器内部错误：CLOUD_OWNER_RETIRED: 角色已停用，不能继续写入云端数据');
+  });
+
+  it.each([
+    ['D1_STORAGE_FULL', '云端数据库满了'],
+    ['D1_DAILY_READ_LIMIT', '今天的数据库读取额度用完了'],
+    ['D1_DAILY_WRITE_LIMIT', '今天的数据库写入额度用完了'],
+  ])('%s 换成能照着做的说明，并留下代码方便排查', (code, expected) => {
+    const text = formatAmsgServerError({
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: '服务器内部错误',
+        cause: { code, message: 'raw D1 error' },
+      },
+    }, '操作失败');
+    expect(text).toContain(expected);
+    expect(text).toContain(`（${code}）`);
+    expect(text).not.toContain('raw D1 error');
+  });
+
+  it('Worker 解不开旧数据时说清是密钥换了、该点哪个按钮，不甩 WebCrypto 原文', () => {
+    const text = formatAmsgServerError({
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: '服务器内部错误',
+        cause: {
+          stage: 'request',
+          name: 'OperationError',
+          message: 'Decryption failed. This could be due to a ciphertext authentication failure, bad padding, incorrect CryptoKey, or another algorithm-specific reason. Input length was 113, output length expected to be 113 for AES-GCM',
+        },
+      },
+    }, '操作失败');
+    expect(text).toContain('Master Key');
+    expect(text).toContain('清空云端数据');
+    expect(text).not.toContain('ciphertext authentication failure');
+  });
+
+  it('新版 Worker 的 STORED_DATA_UNDECRYPTABLE 也给出同一套能照着做的说明', () => {
+    const text = formatAmsgServerError({
+      success: false,
+      error: { code: 'STORED_DATA_UNDECRYPTABLE', message: 'Stored data could not be decrypted with the current AMSG_MASTER_KEY' },
+    }, '操作失败');
+    expect(text).toContain('清空云端数据');
+    expect(text).toContain('（STORED_DATA_UNDECRYPTABLE）');
+  });
+
+  it('客户端体积预检无 message、只有 code 与 bytes/maxBytes 时也能拼出可读报错', () => {
+    const text = formatAmsgServerError(
+      { code: 'STATE_VALUE_TOO_LARGE', bytes: 6000000, maxBytes: 5242880 },
+      '工具配置写入未确认',
+    );
+    expect(text).toBe('STATE_VALUE_TOO_LARGE（6000000/5242880 bytes）');
   });
 });
 

@@ -5,14 +5,14 @@
 
 ## 它在哪、怎么用
 
-实现已**直接嵌入主 Worker** `worker/index.js`（即已部署的 `https://sullymeow.ccwu.cc`），
+实现已**直接嵌入主 Worker** `worker/index.js`（即已部署的 `https://proxy.friedsully.com`），
 作为隔离的 `XHSLite` 模块，对外暴露 `/api/<command>` 桥接接口，和
 `scripts/xhs-bridge.mjs` 完全兼容，前端 bridge 模式直接复用。
 
 **部署（运营方做一次）：** 像平时一样重新部署 `worker/index.js` 即可，URL 不变。
 
 **用户侧（不需要电脑/部署）：** SullyOS → 设置 → 实时感知 → 小红书：
-- 服务器 URL 已默认 `https://sullymeow.ccwu.cc/api`，一般无需改。
+- 服务器 URL 已默认 `https://proxy.friedsully.com/api`，一般无需改。
 - 粘贴浏览器登录 `xiaohongshu.com` 或 `rednote.com` 后的完整 cookie（含 `a1` 和
   `web_session`），点测试连接。Lite 会分别探测国内与全球后端并自动选择，不依赖
   `gid`、`bRequestId` 等可能随域名和灰度版本变化的字段。
@@ -23,6 +23,12 @@ cookie 存在本地，每次请求经 `X-Xhs-Cookie` 头发给 Worker；Worker �
 国内小红书和全球 RedNote 是两套不共享会话的后端：前者请求
 `edith.xiaohongshu.com`，后者请求 `webapi.rednote.com`。当前 RedNote 支持搜索、
 浏览、详情、点赞、收藏和评论；图片发布仍只对已验证的国内后端开放。
+
+## 卡片原帖链接
+
+2026-11-13：前端聊天卡片使用原生链接，手机采用 `/discovery/item/<id>` 详情路径，桌面保留网页路径。搜索结果记录 `pc_search`，用户分享保留原链接的域名、token 和来源参数，详情补全不再覆盖已有搜索来源；RedNote 结果保留对应站点。卡片底部可长按复制链接，卡片其余部分仍使用消息长按菜单。缺少有效笔记 ID 时显示按标题搜索的提示。
+
+这些修改只需发布前端。Lite 能搜索不等于手机小红书 App 已接收原帖跳转，程序不能确认外部 App 最后停在哪一页；旧卡片遗失的访问参数无法凭空补回，可重新搜索后分享。自动化验证覆盖参数、站点、手机路径和卡片链接渲染，不替代 iOS Safari 与小红书 App 的真机验收。
 
 ## 原理
 

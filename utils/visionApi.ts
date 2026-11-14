@@ -1,5 +1,6 @@
 import type { ApiPreset, Message, VisionApiConfig } from '../types';
 import { DB } from './db';
+import { getApiCallAmbientContext, type ApiCallMeta } from './apiCallLog';
 import { extractContent, safeFetchJson } from './safeApi';
 import { normalizeApiBaseUrl, normalizeApiCredential, normalizeApiModel } from './apiConfigNormalize';
 import { isBlobRef } from './blobRef';
@@ -56,6 +57,7 @@ const cleanDescription = (value: string): string => value
 export async function describeImageWithVisionApi(
   imageUrl: string,
   config: VisionApiConfig,
+  meta?: ApiCallMeta,
 ): Promise<string> {
   if (!isVisionApiReady(config)) {
     throw new Error('识图 API 已开启，但 URL、Key 或 Model 尚未填写完整');
@@ -66,6 +68,15 @@ export async function describeImageWithVisionApi(
 
   const existing = inFlightDescriptions.get(imageUrl);
   if (existing) return existing;
+
+  const ambient = getApiCallAmbientContext();
+  const callMeta: ApiCallMeta = meta
+    ? { ...meta, purpose: meta.purpose || '识图' }
+    : {
+      ...ambient,
+      appName: ambient.appName || '消息',
+      purpose: '识图',
+    };
 
   const request = (async () => {
     const baseUrl = config.baseUrl.trim().replace(/\/+$/, '');
@@ -88,7 +99,7 @@ export async function describeImageWithVisionApi(
         max_tokens: 1200,
         stream: false,
       }),
-    }, 1, 60_000, { appName: '消息', purpose: '识图' });
+    }, 1, 60_000, callMeta);
 
     const description = cleanDescription(extractContent(data));
     if (!description) throw new Error('识图 API 没有返回图片描述');
@@ -112,6 +123,7 @@ export async function describeImageWithVisionApi(
 export async function materializeVisionDescriptions(
   messages: Message[],
   config?: VisionApiConfig | null,
+  meta?: ApiCallMeta,
 ): Promise<Message[]> {
   if (config?.enabled !== true) return messages;
   if (!isVisionApiReady(config)) {
@@ -122,6 +134,19 @@ export async function materializeVisionDescriptions(
   const prepared: Message[] = [];
 
   for (const message of messages) {
+    if(message.type==='friend_feed_share_card') {
+      const share=message.metadata?.friendFeedShare;
+      if(!share?.imagesEnabled || !Array.isArray(share.imageRefs) || readVisionDescription(message)) {prepared.push(message);continue;}
+      const refs=share.imageRefs.filter((r:unknown)=>typeof r==='string'&&(isBlobRef(r)||r.startsWith('data:image/'))).slice(0,18);
+      const descriptions:string[]=[];
+      for(const [index,ref] of refs.entries()){
+        const description=descriptionByImage.get(ref)||await describeImageWithVisionApi(ref,config,meta);
+        descriptionByImage.set(ref,description);descriptions.push(`配图 ${index+1}：${description}`);
+      }
+      if(!descriptions.length){prepared.push(message);continue;}
+      const metadata={...message.metadata,visionDescription:descriptions.join('\n'),visionRecognizedAt:Date.now(),visionModel:config.model.trim()};
+      await DB.updateMessageMetadata(message.id,prev=>({...prev,...metadata}));prepared.push({...message,metadata});continue;
+    }
     if (message.type !== 'image') {
       prepared.push(message);
       continue;
@@ -142,7 +167,7 @@ export async function materializeVisionDescriptions(
       continue;
     }
     const description = descriptionByImage.get(imageUrl)
-      || await describeImageWithVisionApi(imageUrl, config);
+      || await describeImageWithVisionApi(imageUrl, config, meta);
     descriptionByImage.set(imageUrl, description);
 
     const metadata = {

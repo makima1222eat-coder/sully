@@ -13,7 +13,7 @@ import React, {
 } from 'react';
 import { cachedCall as _cachedCall, invalidate as _invalidateCache, clearAll as _clearAllCache } from '../utils/musicCache';
 import { DB } from '../utils/db';
-import { getProxyWorkerUrl, DEFAULT_PROXY_WORKER, PROXY_WORKER_CHANGED_EVENT } from '../utils/proxyWorker';
+import { getProxyWorkerUrl, DEFAULT_PROXY_WORKER, PROXY_WORKER_CHANGED_EVENT, isLegacyProxyWorkerUrl } from '../utils/proxyWorker';
 import type { PostProcessMusicHooks } from '../utils/applyAssistantPostProcessing';
 import { resolveRefToDataUrl } from '../utils/blobRef';
 
@@ -112,14 +112,13 @@ export const resolveMusicWorkerUrl = (
 //   2. 当前的公共默认实例；
 //   3. 跟当前中心地址一模一样的——老版本会把中心地址抄一份存进音乐配置。
 // 只有跟以上都不同的地址才原样保留。读到需要改写时落盘一次。
-const FOLLOW_CENTRAL_HOSTS = [/sully-n\.qegj567\.workers\.dev/i, /sullymeow\.ccwu213\.cc/i];
 const migrateWorkerUrl = (url: string | undefined): string => {
   const own = normalizeHost(url || '');
   if (!own) return '';
   const lower = own.toLowerCase();
   if (lower === normalizeHost(DEFAULT_PROXY_WORKER).toLowerCase()) return '';
   if (lower === normalizeHost(getProxyWorkerUrl()).toLowerCase()) return '';
-  if (FOLLOW_CENTRAL_HOSTS.some((re) => re.test(lower))) return '';
+  if (isLegacyProxyWorkerUrl(own)) return '';
   return own;
 };
 
@@ -173,7 +172,7 @@ export const loadMusicPlaybackSnapshot = (): MusicPlaybackSnapshot | null => __m
 /**
  * 模块级 musicHooks 出口 — 给 ChatParser.MUSIC_ACTION 用的三个钩子打包成一个对象, 由
  * MusicProvider mount 后持续写入最新闭包. 让 useChatAI (本地 fetch 路径) 和
- * activeMsgRuntime (instant push 路径) 都从这里取, 避免逻辑双份维护 / push 路径漏注入.
+ * activeMsgRuntime (云端回复的冲刷) 都从这里取, 避免逻辑双份维护 / push 路径漏注入.
  * 行为细节见 chatParser.ts 的 MUSIC_ACTION 分支.
  */
 let __musicHooks: PostProcessMusicHooks | null = null;
@@ -193,7 +192,10 @@ const loadState = (): { queue: Song[]; idx: number } => {
 };
 
 const saveState = (queue: Song[], idx: number) => {
-  try { localStorage.setItem(LS_STATE_KEY, JSON.stringify({ queue, idx })); } catch {}
+  try {
+    if (queue.length === 0 && idx === -1 && !localStorage.getItem(LS_STATE_KEY)) return;
+    localStorage.setItem(LS_STATE_KEY, JSON.stringify({ queue, idx }));
+  } catch {}
 };
 
 export const parseLyric = (txt: string): LyricLine[] => {
@@ -379,6 +381,7 @@ interface MusicContextType {
 }
 
 const MusicContext = createContext<MusicContextType | undefined>(undefined);
+export const MusicPreviewProvider = MusicContext.Provider;
 
 /* ───────────── Provider ───────────── */
 export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -459,6 +462,25 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   // 队列持久化
   useEffect(() => { saveState(queue, idx); }, [queue, idx]);
+
+  // 响应 localStorage 镜像自愈（lsMirror 回填后派发 storage 事件）或跨标签页同步
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === LS_CFG_KEY) {
+        setCfgState(loadCfg());
+      }
+      if (e.key === null || e.key === LS_STATE_KEY) {
+        const nextState = loadState();
+        setQueueState(nextState.queue);
+        setIdx(nextState.idx);
+      }
+      if (e.key === null || e.key === LS_LOCAL_ALBUM_KEY) {
+        setLocalAlbumSongs(loadLocalAlbum());
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   // 播放
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -881,7 +903,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     };
   }, [current, playing, lyric, activeLyricIdx, listeningTogetherWith, cfg, recentTrackChange]);
 
-  // 把整组 musicHooks 写到模块级 slot — useChatAI 和 instant push activeMsgRuntime 都从这里取.
+  // 把整组 musicHooks 写到模块级 slot — useChatAI 和 activeMsgRuntime 都从这里取.
   // current / addListeningPartner 变化时刷新闭包, 保证读到的是最新 React state.
   // addSongToCharPlaylist 直接落 DB, 落完广播 'char-music-profile-updated' 让 OSContext
   // 把新歌单同步回内存里的角色 (顺带刷主动消息 2.0 的云端快照).

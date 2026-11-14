@@ -1,8 +1,11 @@
 import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
+import type { ShareCardOptions } from './pngShare';
 
 export interface ShareOrDownloadOptions {
+    /** 有可导入内容的分享入口：打开 PNG 分享卡编辑器，并保留原格式导出。 */
+    card?: ShareCardOptions;
     /** 文件文本内容（目前导出都是文本，如 JSON / txt）。 */
     content: string;
     /** 带扩展名的文件名，如 `worldbook.json`。 */
@@ -14,14 +17,21 @@ export interface ShareOrDownloadOptions {
 }
 
 export interface ShareOrDownloadBlobOptions {
+    card?: ShareCardOptions;
     blob: Blob;
     fileName: string;
     shareTitle?: string;
     /** 大型 ZIP 在原生 WebView 中分片转 base64 并追加写盘，避免一次性读入导致 OOM。 */
     nativeChunked?: boolean;
+    /** 网页端明确显示为“下载”的入口跳过 Web Share；原生 App 仍使用系统分享。 */
+    preferDownloadOnWeb?: boolean;
 }
 
 const NATIVE_WRITE_CHUNK_SIZE = 3 * 1024 * 1024;
+
+// Capacitor's iOS and Android plugins reject with this message (without AbortError).
+const isShareCancelled = (error: any): boolean => error?.name === 'AbortError'
+    || /^share cancel(?:ed|led)$/i.test(String(error?.message || '').trim());
 
 const blobToBase64 = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -66,8 +76,12 @@ export async function fetchBlobForShare(sourceUrl: string, fallbackMimeType = 'a
  * 桌面浏览器才使用 a.download。WebView 普遍不可靠的裸 download 点击只作为末级兜底。
  */
 export async function shareOrDownloadBlob(options: ShareOrDownloadBlobOptions): Promise<'shared' | 'downloaded' | 'cancelled'> {
-    const { blob, fileName, shareTitle = fileName, nativeChunked = false } = options;
+    const { blob, fileName, shareTitle = fileName, nativeChunked = false, preferDownloadOnWeb = false } = options;
     if (!(blob instanceof Blob) || blob.size === 0) throw new Error('文件为空，无法保存');
+    if (options.card) {
+        const { openShareCardDialog } = await import('../components/share/ShareCardDialog');
+        return openShareCardDialog(options, options.card);
+    }
 
     const nativePlatform = Capacitor.isNativePlatform();
     let nativeFailure: unknown = null;
@@ -95,7 +109,7 @@ export async function shareOrDownloadBlob(options: ShareOrDownloadBlobOptions): 
             await Share.share({ title: shareTitle, files: [uriResult.uri] });
             return 'shared';
         } catch (error: any) {
-            if (error?.name === 'AbortError') return 'cancelled';
+            if (isShareCancelled(error)) return 'cancelled';
             console.error('Native Blob Share Error', error);
             nativeFailure = error;
             if (nativeChunked) {
@@ -107,6 +121,7 @@ export async function shareOrDownloadBlob(options: ShareOrDownloadBlobOptions): 
     try {
         const file = new File([blob], fileName, { type: blob.type || 'application/octet-stream' });
         const canShareFile = typeof navigator !== 'undefined'
+            && !preferDownloadOnWeb
             && typeof navigator.share === 'function'
             && (typeof navigator.canShare !== 'function' || navigator.canShare({ files: [file] }));
         if (canShareFile) {
@@ -114,8 +129,10 @@ export async function shareOrDownloadBlob(options: ShareOrDownloadBlobOptions): 
             return 'shared';
         }
     } catch (error: any) {
-        if (error?.name === 'AbortError') return 'cancelled';
-        console.error('Web Blob Share Error', error);
+        if (isShareCancelled(error)) return 'cancelled';
+        const expectedPermissionFallback = error?.name === 'NotAllowedError'
+            || /permission denied|not allowed|user activation/i.test(String(error?.message || error));
+        if (!expectedPermissionFallback) console.error('Web Blob Share Error', error);
     }
 
     // 原生壳绝不能伪装成“浏览器已下载”：WebView 的 a.download 正是最常见的无反应来源。
@@ -145,8 +162,11 @@ export async function shareOrDownloadBlob(options: ShareOrDownloadBlobOptions): 
  *
  * @returns `'shared'` 已调起分享面板；`'downloaded'` 走了浏览器下载兜底。
  */
-export async function shareOrDownloadFile(options: ShareOrDownloadOptions): Promise<'shared' | 'downloaded'> {
+export async function shareOrDownloadFile(options: ShareOrDownloadOptions & { card?: undefined }): Promise<'shared' | 'downloaded'>;
+export async function shareOrDownloadFile(options: ShareOrDownloadOptions): Promise<'shared' | 'downloaded' | 'cancelled'>;
+export async function shareOrDownloadFile(options: ShareOrDownloadOptions): Promise<'shared' | 'downloaded' | 'cancelled'> {
     const { content, fileName, mimeType = 'application/json', shareTitle = fileName } = options;
+    if (options.card) return shareOrDownloadBlob({ blob: new Blob([content], { type: mimeType }), fileName, shareTitle, card: options.card });
 
     // 1) 原生平台：写缓存 → 取 URI → 调起系统分享面板。
     const nativePlatform = Capacitor.isNativePlatform();

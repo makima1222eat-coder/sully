@@ -10,12 +10,33 @@ import type { MemoryEntity, MemoryNode, MemoryRoom } from './types';
 import type { LightLLMConfig } from './pipeline';
 import { safeFetchJson } from '../safeApi';
 import { safeParseJsonArray } from './jsonUtils';
-import { formatMessageForPrompt } from '../messageFormat';
+import { buildSARMemoryBoundaryInstruction, formatMessageForPrompt } from '../messageFormat';
 import { buildUserPronounRule } from './userPronoun';
 import { readRecallRuntimeSnapshot } from './trace';
+import { hasRelativeTime, hasMatchingRelativeSource, relativeTimeEnabled } from './relativeTime';
+import { getLocalDateKey } from '../localDate';
 
 function generateId(): string {
     return `mn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Bound batches by actual prompt text; keep every message intact, including long scenes. */
+export function splitExtractionMessages(messages: Message[], charName: string, userName: string): Message[][] {
+    const batches: Message[][] = [];
+    let batch: Message[] = [];
+    let chars = 0;
+    for (const message of messages) {
+        const size = formatMessageForPrompt(message, charName, userName).length + 50;
+        if (batch.length && (chars + size > 24_000 || batch.length >= 250)) {
+            batches.push(batch);
+            batch = [];
+            chars = 0;
+        }
+        batch.push(message);
+        chars += size;
+    }
+    if (batch.length) batches.push(batch);
+    return batches;
 }
 
 // ─── 共用的 prompt 规则部分 ──────────────────────────
@@ -74,14 +95,14 @@ function buildRulesBlock(charName: string, userLabel: string, includeEntities: b
 **Date field (required)**: Every message begins with a \`[YYYY-MM-DD HH:MM]\` timestamp. Set each memory's date to the actual day of that event in \`YYYY-MM-DD\` format, rather than assigning one day to the entire batch. If the batch spans multiple days, date each memory separately.`;
 }
 
-function buildConversationText(messages: Message[], charName: string, userLabel: string): string {
+function buildConversationText(messages: Message[], charName: string, userLabel: string, linkDates = false): string {
     // 每行带 [YYYY-MM-DD HH:MM] 时间戳前缀。
     // 没有这个 LLM 完全看不到日期，多日 batch 提取出来的记忆全部会被压到一个时间点
     // （见 parseMemoryNodesFromBuffer 的 midTime 兜底），跨日时间线就乱了。
     const pad2 = (n: number) => String(n).padStart(2, '0');
     return messages
-        .map(m => {
-            const body = formatMessageForPrompt(m, charName, userLabel).slice(0, 600);
+        .map((m, index) => {
+            const body = (linkDates ? `[M${index}] ` : '') + formatMessageForPrompt(m, charName, userLabel);
             const ts = m.timestamp;
             if (!ts || ts <= 0) return body;
             const d = new Date(ts);
@@ -98,7 +119,7 @@ const VALID_ROOMS: MemoryRoom[] = [
 
 /** 从消息缓冲区直接解析记忆节点（不依赖 TopicBox） */
 function parseMemoryNodesFromBuffer(
-    parsed: any[], charId: string, messages: Message[], _batchLabel: string, includeEntities: boolean,
+    parsed: any[], charId: string, messages: Message[], _batchLabel: string, includeEntities: boolean, linkDates = false,
 ): MemoryNode[] {
     if (parsed.length === 0) return [];
 
@@ -187,6 +208,17 @@ function parseMemoryNodesFromBuffer(
                 origin: 'extraction',
             };
             if (includeEntities) memory.entities = parseEntities(item.entities);
+            // No anchor guesses from event dates or the extraction batch. Only a valid original message reference.
+            if (linkDates && relativeTimeEnabled() && hasRelativeTime(memory.content)
+                && typeof item.relativeTimeSource === 'string' && /^M\d+$/.test(item.relativeTimeSource)) {
+                const source = messages[Number(item.relativeTimeSource.slice(1))];
+                if (source && Number.isFinite(source.timestamp) && source.timestamp > 0
+                    && hasMatchingRelativeSource(memory.content, formatMessageForPrompt(source, '', ''))) {
+                    memory.relativeTimeAnchor = {
+                        dateKey: getLocalDateKey(new Date(source.timestamp)), source: 'message', messageId: source.id,
+                    };
+                }
+            }
             return memory;
         });
 }
@@ -393,9 +425,25 @@ export async function extractMemoriesFromBuffer(
 ): Promise<BufferExtractionResult> {
     if (messages.length === 0) return { memories: [], crossTimeLinks: [], eventBoxHints: [], unpinIds: [], corrections: [] };
 
+    const batches = splitExtractionMessages(messages, charName, userName || '用户');
+    if (batches.length > 1) {
+        const result: BufferExtractionResult = { memories: [], crossTimeLinks: [], eventBoxHints: [], unpinIds: [], corrections: [] };
+        for (const batch of batches) {
+            const next = await extractMemoriesFromBuffer(batch, charId, charName, llmConfig, charContext, userName, relatedMemories, pinnedMemories);
+            result.memories.push(...next.memories);
+            result.crossTimeLinks.push(...next.crossTimeLinks);
+            result.eventBoxHints.push(...next.eventBoxHints);
+            result.unpinIds.push(...next.unpinIds);
+            result.corrections.push(...next.corrections);
+        }
+        return result;
+    }
+
     const includeEntities = readRecallRuntimeSnapshot().featureFlagsSnapshot.recallRouter;
+    const linkDates = relativeTimeEnabled();
     const userLabel = userName || 'the user';
-    const conversationText = buildConversationText(messages, charName, userLabel);
+    const conversationText = buildConversationText(messages, charName, userLabel, linkDates);
+    const sarMemoryBoundary = buildSARMemoryBoundaryInstruction(conversationText);
 
     const contextBlock = charContext
         ? `\n## Your Character Profile (reference for understanding relationships and roles in the conversation)\n${charContext}\n`
@@ -423,7 +471,10 @@ export async function extractMemoriesFromBuffer(
 
     const systemPrompt = `You are ${charName}. From the conversation below, extract memories worth retaining from your first-person ("I") perspective. Write every generated natural-language value in English, even when the source conversation is in another language.${contextBlock}${relatedBlock}${pinnedBlock}
 
-${buildRulesBlock(charName, userLabel, includeEntities)}${relatedToRule}${unpinRule}
+${buildRulesBlock(charName, userLabel, includeEntities)}${relatedToRule}${unpinRule}${sarMemoryBoundary ? `\n\n${sarMemoryBoundary}` : ''}${linkDates ? `
+
+## 相对时间来源
+content 保留原消息的相对时间措辞，不要自行添加日期括号。含“昨天、前天、几天前、上周、上个月、去年”等措辞时，额外输出 relativeTimeSource 字段，值为说出该措辞的原消息编号（例如 "M0"）。系统将以该消息的发送日补注，不使用 date 事件日。不同说话日期的相对时间应拆成不同记忆。没有可靠来源、跨时区语义不明或无法使用同一个参照日时，省略该字段，禁止猜测。` : ''}
 
 ## Output Format
 
@@ -469,14 +520,17 @@ If the conversation is too trivial to contain a worthwhile memory, return an emp
                     stream: false,
                 }),
             },
-            2, 180_000, { appName: '记忆宫殿', purpose: '记忆提取' }
+            2, 180_000, { appId: 'memorypalace', appName: '记忆宫殿', charId, charName, purpose: '记忆提取' }
         );
 
         const reply = data.choices?.[0]?.message?.content || '';
+        if (['length', 'max_tokens'].includes(data.choices?.[0]?.finish_reason)) {
+            throw new Error('记忆提取输出被截断，请降低每批原文数量后重试');
+        }
         const parsed = safeParseJsonArray(reply);
 
-        if (parsed.length === 0 && reply.trim().length > 0) {
-            console.warn(`🏰 [Extraction] LLM 返回了内容但 JSON 解析为空数组，可能格式异常。原始回复前200字: ${reply.slice(0, 200)}`);
+        if (parsed.length === 0 && !/^\s*(?:```(?:json)?\s*)?\[\s*\]\s*(?:```)?\s*$/i.test(reply)) {
+            throw new Error('记忆提取未返回有效 JSON，原文保留，请重试');
         }
 
         console.log(`🏰 [Extraction] 缓冲区提取完成：从 ${messages.length} 条消息中提取 ${parsed.length} 条记忆`);
@@ -489,7 +543,7 @@ If the conversation is too trivial to contain a worthwhile memory, return an emp
         const fmt = (d: Date) => `${d.getMonth() + 1}/${d.getDate()}`;
         const batchLabel = fmt(d1) === fmt(d2) ? fmt(d1) : `${fmt(d1)}-${fmt(d2)}`;
 
-        const memories = parseMemoryNodesFromBuffer(parsed, charId, messages, batchLabel, includeEntities);
+        const memories = parseMemoryNodesFromBuffer(parsed, charId, messages, batchLabel, includeEntities, linkDates);
 
         // 解析跨时间关联（→ EventBox 绑定信号）+ eventName/eventTags 提示
         const { crossTimeLinks, eventBoxHints } = parseRelatedToAndHints(
@@ -534,6 +588,6 @@ If the conversation is too trivial to contain a worthwhile memory, return an emp
 
     } catch (err: any) {
         console.error(`❌ [Extraction] 缓冲区提取失败 (${messages.length} 条消息):`, err.message);
-        return { memories: [], crossTimeLinks: [], eventBoxHints: [], unpinIds: [], corrections: [] };
+        throw err;
     }
 }

@@ -1,6 +1,6 @@
 # Dev Debug 调试子系统
 
-开发分支专用的"工具箱"：一个悬浮按钮 + 面板，放一堆**只在开发分支显示**的调试开关，外加一套可选的「分类捕获」日志——打开**总开关**「记录日志」后会露出并排的类型 checkbox（目前 `api` 普通聊天 / `instant-push` 即 IP 通道事件），勾哪类抓哪类。面板走极简：类型并排、无逐条说明（看不懂就别用）。正式分支（main / master）默认整个隐藏，用户看不到也不会误触。
+开发分支专用的"工具箱"：一个悬浮按钮 + 面板，放一堆**只在开发分支显示**的调试开关，外加一套可选的「分类捕获」日志——打开**总开关**「记录日志」后会露出并排的类型 checkbox（目前 `api` 普通聊天 / `amsg` 主动消息收发链路 / `lifecycle` 前后台 / `memory-palace` 记忆召回），勾哪类抓哪类。面板走极简：类型并排、无逐条说明（看不懂就别用）。正式分支（main / master）默认整个隐藏，用户看不到也不会误触。
 
 这份文档讲清楚它怎么运作，以及**怎么往里加新开关 / 加一类捕获日志**——照着步骤抄就行。
 
@@ -57,11 +57,11 @@ isDevDebugAvailable()  // utils/devDebug.ts
 
 | 开关 | 消费点 |
 |------|--------|
-| `skipPromptBuild` | `utils/chatRequestPayload.ts:158` |
-| `skipEmotionEval` | `context/OSContext.tsx:1436`、`hooks/useChatAI.ts:439 / 685` |
+| `skipPromptBuild` | `utils/chatRequestPayload.ts:266` |
+| `skipEmotionEval` | `context/OSContext.tsx`（`isEmotionEvalSkipped()`）、`hooks/useChatAI.ts`（`emotionEvalEnabled`） |
 | `mergeSystemMessages` | `utils/chatRequestPayload.ts`（fullMessages 组装末尾）+ `utils/systemMessageMerge.ts` |
 | 捕获类 `api` | `utils/safeApi.ts`（调 `appendDevDebugApiLog`，普通聊天直发 + Character 的记忆精炼/归档/导入/批量总结/印象生成，凡走 `safeFetchJson` 的 chat completions 都算） |
-| 捕获类 `instant-push` | `utils/activeMsgRuntime.ts`、`utils/instantPushClient.ts`（调 `appendDevDebugInstantPushLog`） |
+| 捕获类 `amsg` | `utils/activeMsgRuntime.ts`（模块顶 `makeDebugLogger('amsg', …)` + `activeMsgTrace` 镜像） |
 | 捕获类 `lifecycle` | `utils/devDebug.ts` 自带的 `installDevDebugLifecycleCapture()`（`App.tsx` 启动时挂一次，监听器常驻、抓不抓走门禁） |
 | 总开关 `captureEnabled` | `utils/devDebug.ts` 的 `isCaptureEnabled()` 闸门——关掉时所有捕获类都不抓 |
 
@@ -74,7 +74,7 @@ isDevDebugAvailable()  // utils/devDebug.ts
 | 类型 | 例子 | 数据形态 | 加新的成本 |
 |------|------|---------|-----------|
 | **行为开关（skip 型）** | `skipPromptBuild` / `skipEmotionEval` | `DevDebugFlags` 里一个 `boolean` | 改 flag 结构（见指南 A） |
-| **捕获类（checkbox）** | `api` / `instant-push`（未来 `mcp`…） | 进 `captureLogs: Category[]` 数组 | 加一行 category + 一个薄封装，flag 结构不动（见指南 B） |
+| **捕获类（checkbox）** | `api` / `amsg`（未来 `mcp`…） | 进 `captureLogs: Category[]` 数组 | 加一行 category + 一个薄封装，flag 结构不动（见指南 B） |
 
 > 还有个**总开关** `captureEnabled`（本质也是个 boolean 行为开关）：勾选只是「选类型」，真正抓不抓 = `captureEnabled && captureLogs.includes(category)`。面板上**总开关用 switch、类型用并排 checkbox**，且**总开关打开后才露出类型 checkbox**（无逐条说明）。
 
@@ -95,7 +95,7 @@ writeDevDebugFlags(flags)
    │  派发 DEV_DEBUG_EVENT 自定义事件
    │  ⚠️ 取消勾选「不」清日志（勾选是纯选择）；清日志只在「重置」时做
    ▼
-业务代码调 isXxxSkipped() / isCaptureEnabled('api' | 'instant-push')
+业务代码调 isXxxSkipped() / isCaptureEnabled('api' | 'amsg')
    │  闸门 = captureEnabled（总开关）&& 该类已勾
    │  每次都现读 localStorage，拿到最新值
    ▼
@@ -130,11 +130,12 @@ sullyos.devDebug.log.v1.<branch>        ← 分类捕获日志（各类混存，
 | 开关 | 类型 | 作用 | 副作用 |
 |------|------|------|--------|
 | `skipPromptBuild` | 行为 | 只发聊天历史，不注入 system prompt | 双语 / MCD / HTML / thinking 等增强全部关掉 |
-| `skipEmotionEval` | 行为 | 主回复照常，但不跑本地 / Instant Push 的 emotion eval | 关掉后情绪不更新 |
+| `skipEmotionEval` | 行为 | 主回复照常，但不跑情绪副评估（本地和即时对话都算） | 关掉后情绪不更新 |
+| `forceHomeSecretRoll` | 行为 | 「秘密必定命中」：跳过本地秘密任务的 20% 抽签；即时对话缺少完整回合绑定时不生成秘密 | 默认关；仍需情绪评估开启、有 3D 小屋、已完成素材对话及本轮成功回复的明确来源，同一片段不重复；没有宠物仍不生成宠物事件。调试不可用时不生效，测试后关闭恢复 20% |
 | `mergeSystemMessages` | 行为 | 把聊天请求的多条 `role:system`（稳定前缀 / 易变尾段 / 双语·MCP 提醒条）合并成开头一条再发送（`utils/systemMessageMerge.ts`）。用途：A/B 对照中转适配层对多 system 请求的计量——同一段聊天开关各发一条，对比中转记的 prompt_tokens；合并后骤降 = 中转把「历史后的 system」重复拼接了 | 易变尾段失去 recency 位置、稳定前缀缓存失效；只作临时排障，测完关掉 |
 | `captureEnabled`<br>（记录日志·总开关） | 行为 | 日志录制总闸：关掉时所有捕获类都不抓 | 默认关；关掉只是停录，**不清**已抓日志 |
 | 捕获类 `api` | 捕获 | 抓所有走 `safeFetchJson`（`safeApi`）的 chat completions 请求 + 响应：普通聊天直发，外加 Character 里的记忆精炼/强制归档/导入清洗/批量总结/印象生成。每条带 `durationMs`（最后一次 attempt 从发起到成功/报错的耗时）和 `requestChars`（请求体字符数，messages 折叠后靠它看体积） | 取消勾选只停此后抓取，**不清**已有日志 |
-| 捕获类 `instant-push` | 捕获 | 抓 instant push 通道：经 worker 的 LLM 交换 + SSE 投递结果（超时/收到/失败） | 同上，取消勾选不清日志 |
+| 捕获类 `amsg` | 捕获 | 抓主动消息 2.0 的收发链路：收件箱冲刷、推送落库、即时对话回合的 trace（`[ActiveMsg]` / `[amsg]` 两个 tag） | 同上，取消勾选不清日志 |
 | 捕获类 `lifecycle` | 捕获 | 抓页面前后台/焦点/网络状态变化：`visibilitychange`、`focus`/`blur`、`pagehide`/`pageshow`（含 bfcache `persisted` 标记）、`online`/`offline`、`freeze`/`resume`（Chromium 系）。跟 api 类对时间线用——API 报错前后紧挨着 `visibilitychange → hidden`，基本就是切后台/锁屏把 fetch 冻死的 | 同上，取消勾选不清日志 |
 | `exposeLogDetail`<br>（记录完整内容） | 抓取 | 关（默认）：`messages` 聊天历史数组整组换成一句 `…共 N 项（已折叠）`；开：整段存 | 影响**抓取 / 存储**；要完整须复现前打开，已抓的折叠版不可还原 |
 
@@ -216,11 +217,11 @@ if (isMemoryRecallSkipped()) {
 ### 1. `utils/devDebug.ts` —— 加 category + 元信息
 
 ```ts
-export type DevDebugCaptureCategory = 'api' | 'instant-push' | 'mcp';   // ← 加一个字面量
+export type DevDebugCaptureCategory = 'api' | 'amsg' | 'mcp';   // ← 加一个字面量
 
 export const DEV_DEBUG_CAPTURE_CATEGORIES: DevDebugCaptureCategoryMeta[] = [
     { key: 'api', title: 'API（普通聊天请求）', detail: '...' },
-    { key: 'instant-push', title: 'Instant Push（通道事件）', detail: '...' },
+    { key: 'amsg', title: '主动消息', detail: '...' },
     { key: 'mcp', title: '记录 MCP 调用', detail: '抓 MCP 工具的入参和返回。' },  // ← 加一行
 ];
 ```
@@ -229,7 +230,7 @@ export const DEV_DEBUG_CAPTURE_CATEGORIES: DevDebugCaptureCategoryMeta[] = [
 
 ### 2.（可选）写一个语义化薄封装
 
-底层 `appendDevDebugLog(category, { label, data })` 已经够用，但给每类包一层薄封装调用更顺手、字段更整齐（参考文件末尾的 `appendDevDebugApiLog` / `appendDevDebugInstantPushLog`，HTTP 形状的可直接复用 `appendDevDebugHttpLog`）：
+底层 `appendDevDebugLog(category, { label, data })` 已经够用，但给每类包一层薄封装调用更顺手、字段更整齐（参考文件末尾的 `appendDevDebugApiLog`，HTTP 形状的可直接复用 `appendDevDebugHttpLog`）：
 
 ```ts
 export function appendDevDebugMcpLog(input: { tool: string; args: unknown; result?: unknown }): void {
@@ -282,6 +283,57 @@ LLM 日志里的聊天历史动辄几十条，整段塞进 localStorage 很快�
 
 > 折叠是**通用**的——对所有捕获类的 `data` 一视同仁，未来加的捕获类自动享受，不用各自处理。当前规则只有一条：递归遇到 key=`messages` 的数组就整组替换成 metadata，其它字段一律原样。
 
+### 主动消息复现诊断（真实 AI + 推送）
+
+入口：调试面板 → 主动消息观察窗 →「测试推送」。打开后默认沿用设置中的最新全局 API，一分钟后触发，直接点「开始测试」即可。需要换便宜模型时展开「更换 API」，可选已有预设或临时自定义，也可恢复跟随当前配置；修改只用于本次。点「调整」可改成 2／5 分钟或选择锁屏、关闭浏览器等场景。开始后切后台，等执行后先检查系统通知中心，再回来点选看到了什么、点「导出诊断报告」；「查看进度」会把每一步有没有记录画成一条时间线。界面复用设置页的 Modal 和主题色，关闭后回到观察窗。这个入口不轮询云端，也不会为了复现重建推送订阅或保持页面活跃。
+
+需要更新网页（包含推送 SW）和主动消息 Worker。创建前检查 Worker 的 `diagnosticReproduction: 1` 能力；旧 Worker 会提示更新，不发送测试任务。旧 SW 的通知记录可能缺失，不能据此判断没有送达。
+
+- 真实经过云端定时调度、所选 API 生成、正式分段、推送服务、设备收件、系统通知接口和补收。固定短提示词，输出最多 512 tokens；生成失败不自动重试，已生成内容的投递沿用正式重试。
+- 独立诊断身份与 `AmsgReproduction` 本机库，消息只进入诊断区，不写真实聊天、记忆、情绪或角色计数，不执行工具。API 配置不会覆盖全局或角色配置，Key 只随加密任务上云。
+- 报告合并复现前后的环境、订阅匹配状态、Worker 执行和推送阶段、SW 收件和 `showNotification` 结果、补收及用户观察。一次探针失败不会丢掉其他证据。通知接口完成不代表用户看到横幅，报告明确保留这一区别。
+- 云端阶段记录存于加密的 `amsg:diagnostic` client_state，保留 7 天；开始新一轮时清理本机旧记录，最多保留最近 10 轮。报告不含 API Key、完整推送订阅或普通聊天正文，但包含测试模型、环境和生成的测试消息。
+- 创建请求超时或接单后的本机保存失败时保留原编号，先查询或取消，避免重复付费调用。短时间内存在未确认的运行会阻止重复创建。
+
+走 Bark、WxPusher、MeoW 这类第三方推送或 FCM 原生通道时不经过网页的 Service Worker，时间线最多走到「推送已发出」，后面几步以手机上实际看到的为准。
+
+它用于复现传输和通知环境，不等同于完整角色行为回放：角色上下文、主动频率门禁、MCP、记忆和工具副作用不参与。若日志止于 Worker 开始前、Worker 崩溃或记录写入失败，仍可能需要对应时间段的 Worker logs；这份报告不会声称收齐平台层面的所有信息。
+
+实现入口：`components/AmsgReproductionPanel.tsx`、`utils/amsgReproductionClient.ts`、`worker/amsg/src/reproduction.ts`、`worker/diagnosticNotification.ts`。
+
+### 主动消息的 trace 是另一套（无条件记录）
+
+上面那套要先勾选才录。主动消息这条链路另有一套 **不用勾、正式版照录** 的记录，落在 `localStorage` 的 `instant_push_trace_log_v1`（滚动留 400 条，刷新不丢），实现在 [`utils/instantTraceLog.ts`](../utils/instantTraceLog.ts)。Service Worker 那一侧的记录存在独立的 `ActiveMsgSwTrace` 库里（SW 访问不到 localStorage），导出时两边合成一份、按时间排好。
+
+入口在主动消息观察窗底部的「导出记录」按钮，得到一个 json；最近几条原始记录收在「技术记录」折叠区里。因为不用提前开任何开关，**可以先复现、事后再导**。
+
+排「通知都弹了、聊天界面半天不出字」这类问题时，看这几个字段：
+
+| 字段 | 在哪条记录上 | 说明 |
+|---|---|---|
+| `trigger` | `runtime-flush-start` | 这趟冲刷是谁发起的。`生成前收件` 是聊天组装上下文前的本机收件（当前角色没有待收消息时不留这条）；`SW通知` 是推送直达的那条；`本地巡查` 是页面自己隔几秒数收件箱数出来的（见下）；`第三方补收` 是第三方推送模式下页面在前台时定期去云端账本拉回来的（见下）；其余（`回到前台` / `启动` / `轮询补收` / `上线补收`…）各自带着更长的固有延迟 |
+| `waitedMs` | `runtime-inbox-message` | 这条消息在收件箱里躺了多久才轮到它。跟正文长短无关，纯粹是「没人来捞」的时间。算的是它**第一次**落到这台设备的时刻——补收把同一条重新写一遍时会保住这个值，否则它永远显示「刚到」 |
+| `charId` / `waitedMs` | `runtime-before-chat-inbox-timeout` | 生成前收件等待达到 30 秒，本轮先继续，原收件管线仍在工作。这一趟跑完之前，同角色后续的生成不再等、也不再记这条 |
+| `charId` / `count` | `runtime-before-chat-inbox-pending` | 生成前收件结束时，当前角色还有 `count` 条留在收件箱（多段没到齐被扣住，或处理失败等重试）；本轮先继续 |
+| `messageId` / `charId` / `taskUuid` | `runtime-scheduled-delivery-accepted` | 已发送的定时消息进入接收流程，与用户此后是否发言无关。是否最终落库还需接着看后处理与重试记录 |
+| `count` / `posted` / `targets` | `notify-clients`（SW 侧） | SW 喊页面时找到几个页面、各自可见性、发成功几个 |
+| `portAck` / `clientsAck` | `runtime-sw-channel-probe` | 启动时的通道体检。两条路分开测：port 通而 clients 不通 = SW 活着但找不到页面 |
+
+面板上还有一行现成的结论：**实时通道正常**（附上次收到 SW 消息的时刻），或者 **没收到过 SW 实时通知**。后者意味着消息全靠本地巡查在捞，会慢那么几秒——这种状态下功能表面上是正常的（消息照样会到），所以只能靠主动看，等不到用户来报。
+
+**iOS 上这行几乎必然显示后者**，这是平台行为不是故障：App 不在最前台时，Service Worker 拿到的「当前有哪些页面」名单直接是空的，存完消息喊了也没人听见。所以页面不指望被喊——它自己隔几秒数一眼本地收件箱（`sweepLocalInbox`，纯本地读、不走网络），库里有货就冲刷。`pageshow` / `focus` / 切回前台这几个「页面刚活过来」的时刻会额外立刻数一次。数出来是 0 就什么都不做，**空转不写 trace**，否则几秒一条就能把要看的记录顶出缓冲区。
+
+**第三方推送模式**（WxPusher / Bark / MeoW）下，云端只把消息推给第三方 App，浏览器的 SW 一条都收不到：SW 侧记录里只有通道体检，看不到任何收件记录，面板显示「没收到过 SW 实时通知」，这些都是这个模式的正常现象。页面在前台时会自己去云端账本拉，trace 里记为 `第三方补收`。频率分三档：等即时回复时每 3 秒一次；本机任务清单里有定时任务快到点（到点前 1 分钟到到点后 5 分钟）时每 6 秒一次；其余时候每 60 秒一次，兜住本机不知道时间的消息（失败重发、清单还没同步的任务等）。重复任务按每天或每周推算下一次，跨夏令时那两天可能差一小时，那两次落到慢档。切回页面或点通知打开时也会马上拉一次，只有 3 秒防抖。页面在后台时不拉，等回到前台再补上。
+
+别把它跟 `轮询补收` 搞混：那个是即时对话欠着回复时每 60 秒去**云端账本**捞一圈（要分页拉、还要逐条查任务状态，全是网络），只在欠着回复时才存在。
+
+本地聊天（没走即时对话）时角色调主动消息工具，也记在这套 trace 里。排程规矩是在浏览器里判的，被打回的请求根本到不了 worker，拿 CF token 在服务端什么都查不到，只能看这里。排「角色反复调排程、最后空回」这类问题时看这两种记录：
+
+| 记录 | 字段 | 说明 |
+|---|---|---|
+| `amsg2-local-tool` | `tool` / `round` / `status` / `reason` / `message` | 每调一次记一条。`status`：`done` 办成了，`rejected` 跑了但清单没变，`duplicate` 同名同参第二次没再跑，`error` 抛错。`reason` 是打回原因（`unanswered_limit` 连发额度满、`min_gap` 离排着的太近、`recurring_not_allowed` 不许排重复的，说不清的是 `no_change`）；`message` 只有 `error` 才有，是报错开头一截。不记参数和聊天内容 |
+| `amsg2-local-tool-loop` | `toolRounds` / `wrapUp` / `emptyRescued` / `leadIns` / `replyChars` | 一轮工具循环收尾时记一条。`wrapUp` 是有没有被逼收尾、因为什么（`amsg2-stalled` = 主动消息工具连着两轮没办成事）；`emptyRescued` = 模型最后一个字没说、补了一轮不带工具的请求；`leadIns` 是工具轮里留下了几段话；`replyChars` 是最后拼出来的回复有多长 |
+
 ---
 
 ## 十、容易踩的坑
@@ -299,23 +351,18 @@ LLM 日志里的聊天历史动辄几十条，整段塞进 localStorage 很快�
 
 ## 十一、TODO：还没接入 devDebug 的日志支线
 
-`makeDebugLogger` 已经把 P1 等价的错误支线接进来了（safeApi 重试、InstantPush HTTP failure / fetch threw / saveOutboundSession、ActiveMsg post-processing / saveMessage / requeue lost / flushInboxToChat、amsg multipart expired）。下面这些还没接，价值递减或工程量大，**单点踩坑时再换成 `log.warn(...)` 即可**（每条改 1 行）：
+`makeDebugLogger` 已经把 P1 等价的错误支线接进来了（safeApi 重试、ActiveMsg post-processing / saveMessage / requeue lost / flushInboxToChat、amsg multipart expired）。下面这些还没接，价值递减或工程量大，**单点踩坑时再换成 `log.warn(...)` 即可**（每条改 1 行）：
 
 ### P2 — 价值递减的前端支线
 
 | 文件 | 行 | 标签 | 干嘛 |
 |------|----|------|------|
-| `utils/instantPushClient.ts` | — | （已无遗漏） | — |
-| `utils/activeMsgRuntime.ts` | 166 | `[ActiveMsg] claimReasoning failed` | reasoning 兜底失败 |
-| `utils/activeMsgRuntime.ts` | 183 | `[ActiveMsg] restore xhs session notes failed` | xhs note 恢复失败 |
-| `utils/activeMsgRuntime.ts` | 237 | `[push:toast]` | 通知文案 |
-| `utils/activeMsgRuntime.ts` | 346 | `[DevDebug] instant-push LLM log failed` | **自身的元错误，别接！会绕死或加重 bug** |
-| `utils/activeMsgRuntime.ts` | 385 / 387 / 390 | `[push:memory-palace]` 几条 | 记忆宫殿 stage / 异常 |
-| `utils/activeMsgRuntime.ts` | 445 | `[flush:emotion_update] apply failed` | 情绪更新落库失败 |
-| `utils/activeMsgRuntime.ts` | 569 | `[instant-push] runPendingToolCalls failed` | 工具调用待办失败 |
-| `utils/activeMsgRuntime.ts` | 604 | `[ActiveMsg] backfill reasoning failed` | reasoning 回填失败 |
+| `utils/activeMsgRuntime.ts` | 655 | `[ActiveMsg] restore xhs session notes failed` | xhs note 恢复失败 |
+| `utils/activeMsgRuntime.ts` | 717 | `[push:toast]` | 通知文案 |
+| `utils/activeMsgRuntime.ts` | 1115 / 1117 / 1120 | `[push:memory-palace]` 几条 | 记忆宫殿 stage / 异常 |
+| `utils/activeMsgRuntime.ts` | 315 | `[flush:emotion_update] apply failed` | 情绪更新落库失败 |
 
-> 接的姿势就是：模块顶 `const log = makeDebugLogger('instant-push', '<Tag>')`（已有就复用），然后 `console.warn('[Tag] event', ...x)` 换成 `log.warn('event', ...x)`。
+> 接的姿势就是：模块顶 `const log = makeDebugLogger('amsg', '<Tag>')`（已有就复用），然后 `console.warn('[Tag] event', ...x)` 换成 `log.warn('event', ...x)`。
 
 ### SW 端（Service Worker context，工程量大）
 
@@ -323,21 +370,18 @@ SW 跑在自己的 context，没法直接访问 page 的 `localStorage` / `appen
 
 1. SW 端攒一份 trace ring buffer（已有 `[InstantTrace:SW]` 在 `worker/sw-keep-alive.ts`）
 2. page 端解锁面板时，向所有 SW client `postMessage({ type: 'GET_DEBUG_TRACE' })` 拉一份
-3. page 端收到 SW 回包 → 写进 devDebug 的 `instant-push` 类目
+3. page 端收到 SW 回包 → 写进 devDebug 的 `amsg` 类目
 
 涉及范围（grep 出来的 SW 端日志，先列着）：
 
 | 文件 | 行 | 标签 |
 |------|----|------|
-| `worker/sw-keep-alive.ts` | 107 | `[InstantTrace:SW]` |
-| `worker/sw-keep-alive.ts` | 486 | `[amsg] clearReasoningBuffer before tool_request failed` |
-| `worker/sw-keep-alive.ts` | 531 | `[amsg] tool_request notification failed` |
-| `worker/sw-keep-alive.ts` | 579 / 589 | `[amsg] blob fetch ...` |
-| `worker/sw-keep-alive.ts` | 632 | `[amsg] error push` |
-| `worker/sw-keep-alive.ts` | 642 | `[amsg] unknown messageKind, falling back to content` |
-| `public/sw-keep-alive.js` | 234 / 240 / 436 / 449 / 509 / 539 / 551 | `[rei-standard-amsg-sw] ...` 系列 |
-| `public/sw-keep-alive.js` | 689 / 739 / 854 / 881 / 891 | `RESTORE ERROR` |
-| `public/sw-keep-alive.js` | 1308 | `[InstantTrace:SW]`（构建产物里也叫这名） |
+| `worker/sw-keep-alive.ts` | 213 | `[InstantTrace:SW]` |
+| `worker/sw-keep-alive.ts` | 644 | `[amsg] error push` |
+| `worker/sw-keep-alive.ts` | 662 | `[amsg] unknown messageKind, falling back to content` |
+| `worker/sw-keep-alive.ts` | 698 / 711 | `[amsg] pushsubscriptionchange 重订失败` / `写订阅变化标记失败` |
+| `public/sw-keep-alive.js` | — | `[rei-standard-amsg-sw] ...` 系列（amsg-sw 包内的 dedupe / multipart / 通知报错） |
+| `public/sw-keep-alive.js` | — | `[InstantTrace:SW]`（构建产物里也叫这名） |
 
 > **建议路径**：等真的有 SW 端 bug 需要远端排障时再做（开发本地 SW 在 DevTools 单独面板就能看，价值不大）。做的时候在 `utils/swVersion.ts` 旁边新增 `utils/swTrace.ts` 包通信协议。
 
@@ -365,16 +409,16 @@ SW 跑在自己的 context，没法直接访问 page 的 `localStorage` / `appen
 在 `catch` 里调用它：
 
 ```
-URL: https://sullymeow.ccwu.cc/api/health
+URL: https://proxy.friedsully.com/api/health
 请求: GET · 失败于 43ms
 错误: TypeError: Failed to fetch
-目标域名: sullymeow.ccwu.cc（跨域请求，受 CORS 约束）
+目标域名: proxy.friedsully.com（跨域请求，受 CORS 约束）
 本页来源: https://xxx.pages.dev
 浏览器联网状态: 在线
 Resource Timing: responseStatus=429, transferSize=0 → 对方其实回了 HTTP 429，是响应被 CORS 拦掉的，不是网络不通
 初判: 请求在拿到响应头之前就失败了——浏览器没告诉我们具体是哪一步断的。
 可能原因: 梯子/代理把这个域名的连接掐了 · DNS 解析不到 · ...
-连通性复检: no-cors 直连 sullymeow.ccwu.cc 成功 → 网络路径是通的，问题出在响应本身（...）
+连通性复检: no-cors 直连 proxy.friedsully.com 成功 → 网络路径是通的，问题出在响应本身（...）
 ```
 
 两个关键设计：
@@ -419,3 +463,18 @@ Resource Timing: responseStatus=429, transferSize=0 → 对方其实回了 HTTP 
 
 `NETWORK_SELF_CHECK_STEPS` 同时被调试终端（`components/os/StatusBar.tsx`，网络类错误时折叠展示）复用。
 改文案改那一处即可，两边不会不同步。
+
+## SAR 剧情与表情校对
+
+扳手内仅在 `pnpm dev` 显示此开关，默认关闭；开启后临时开放名册全部 84 段原稿及逐句表情编辑、分支返回和 JSON 导出。关闭立即恢复真实收藏锁定，未解锁预览退出；不修改星级、奖励或收藏记录，既有校对草稿保留。正式构建即使手动解锁扳手也不能启用。开关按分支随调试标志保存，细节见 [SAR 个人线](./sar-personal-lines.md)。
+
+## 家园自主行为观察（2026-10-04）
+扳手面板顶部的 HomeCompanionDebug 读取 utils/homeCompanionDebug.ts 的会话内快照。useHomeCompanion 在原有三秒决策周期发布当前阻塞条件、坐姿、距离、冷却、判断/尝试/启动/失败次数及最近八次尝试；editor 返回实际寻路失败或降级原因。面板一秒刷新倒计时，不主动调用引擎，不触发 LLM。仅在 isDevDebugAvailable 门禁内可读写，不持久化，不收录聊天/门牌文本；不属于 capture 日志，无须打开记录日志。家园退出/挂起标记已停止，重新挂载重置计数；启动数不是完成数。日程家具动作的并行槽限制另行提示，不能把这份陪伴统计当作全部日程执行记录。
+
+### 私聊与家园请求准备耗时（2026-10-08）
+
+共享 `buildChatRequestPayload` 提供本地 `onPreparationStage`，将识图、记忆召回、提示词组装、协同文件柜、家园任务回执分别计时，保留原顺序和内容。家园进度区分「记忆召回」「组装提示词」，`Home timing` 的 API 日志记录对应毫秒数；ChatApp 原有 `[send→API]` 汇总增加 `payload.memory` / `payload.prompt` 等字段。计时从 `KeepAlive.start()` 前开始，`keepAlive` 单列 SW 准备等待，避免首次请求等待被漏算。`payload` 是总时间，其子阶段不得相加后再与它累加。此处只加阶段名与耗时，不加遥测、不记录正文；真实设备的额外等待需要同角色、同配置的日志对照，不能用隔离测试耗时替代。范围内已存在的家园输入不再额外整份读取角色；新输入仍读持久化记录核对范围，范围外重试继续拒绝。
+
+### 3D 素材的正常取消
+
+`Home3DView` 将实际编辑器初始化推迟到微任务，跳过 StrictMode 已清理的首次 effect，不发出废弃的素材请求。卸载时由 signal 通知编辑器清理，取消原因标记为 `Home3D disposed`。全局 fetch 日志只对 room3d 路径、信号确已取消且原因为该标记的 AbortError 不生成网络故障日志；仍把异常交回调用方。未标记取消、超时、HTTP 失败和真实联网失败保持原有诊断。回归：homeEditorLifecycle / homeAssetCancellation / networkFailureDiagnosis。

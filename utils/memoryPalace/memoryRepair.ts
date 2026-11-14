@@ -1,5 +1,5 @@
-import type { APIConfig, CharacterProfile, UserProfile } from '../../types';
 import { ContextBuilder } from '../context';
+import type { APIConfig, CharacterProfile, UserProfile } from '../../types';
 import { extractContent, extractJson, safeFetchJson } from '../safeApi';
 import { EventBoxDB, MemoryNodeDB } from './db';
 import { getLatestRecallReceipt, type RecallReceipt } from './recallReceipts';
@@ -228,10 +228,9 @@ export async function loadRecallRepairSnapshot(
  * 按产品约定明确调用 buildCoreContext(..., false)，同时抹掉所有持久记忆、
  * 召回注入、房间门牌和情绪注入，确保不会暗中再读一次记忆上下文。
  */
-export function buildMemoryRepairCoreContext(
-    char: CharacterProfile,
+export async function buildMemoryRepairCoreContext(char: CharacterProfile,
     user: UserProfile,
-): string {
+): Promise<string> {
     const memoryIsolatedChar: CharacterProfile = {
         ...char,
         memories: [],
@@ -243,7 +242,7 @@ export function buildMemoryRepairCoreContext(
         buffInjection: undefined,
         activeBuffs: [],
     };
-    return ContextBuilder.buildCoreContext(memoryIsolatedChar, user, false);
+    return (await ContextBuilder.buildCoreContext(memoryIsolatedChar, user, false));
 }
 
 function snapshotCandidates(snapshot: RecallRepairSnapshot): Array<{
@@ -312,7 +311,7 @@ export async function diagnoseRecallIssue(params: {
         };
     }
 
-    const coreContext = buildMemoryRepairCoreContext(params.char, params.user);
+    const coreContext = (await buildMemoryRepairCoreContext(params.char, params.user));
     const charName = params.char.name || '对方';
     const userName = params.user.name || '你';
     const candidateText = candidates
@@ -372,7 +371,7 @@ ${candidateText}`;
         },
         1,
         90_000,
-        { appId: 'chat', charId: params.char.id, purpose: 'memory-repair-diagnosis' },
+        { appId: 'memorypalace', appName: '记忆宫殿', ...(params.char.id ? { charId: params.char.id } : {}), ...(params.char.name ? { charName: params.char.name } : {}), purpose: '记忆召回诊断' },
     );
     const raw = extractContent(data);
     const parsed = extractJson(raw);
@@ -443,7 +442,7 @@ const GUIDE_COPY: Record<NonNullable<CharacterProfile['personalityStyle']>, Memo
     ],
     analytical: [
         { greeting: '你来啦，{user}。本轮召回现场已经封存，我们逐条核对。', trail: '以下是刚才实际经过的记忆，以及命中事件盒的完整结构。', empty: '核对完成：本轮没有记忆注入记录。' },
-        { greeting: '正好，{user}。刚才的回复和召回记录都还在可比对范围内。', trail: '召回痕迹正在展开，请从事实、对象和时间三个方向检查。', empty: '没有召回项。刚才的问题不应归因于向量记忆。' },
+        { greeting: '正好，{user}。刚才的回复和召回记录都还在可比对范围内。', trail: '召回痕迹正在展开，请从事实、对象和时间三个方向检查。', empty: '没有召回项。刚才的问题应该不在记忆宫殿里。' },
     ],
 };
 

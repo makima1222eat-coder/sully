@@ -108,6 +108,19 @@ const REPLY = JSON.stringify([
   { room: 'user_room', text: '小明在读研，最近搬去和同学合租', basedOn: 'U0', tag: '居住' },
 ]);
 
+describe('门牌结果携带原始快照时间', () => {
+  it('输入解析、生成与 emitResult 全程保留客户端快照时间', async () => {
+    const snapshotAt = NOW.getTime() - 40 * 60_000;
+    const { ctx, scratch } = makeCtx({
+      jobValue: await packStateValue(JSON.stringify(jobInput({ snapshotAt }))),
+    });
+    await amsgHooks.onBeforeFire(ctx);
+    const session = makeSessionCtx(scratch, REPLY);
+    await amsgHooks.onLLMOutput(session.ctx);
+    expect(session.emitResult).toHaveBeenCalledWith(expect.objectContaining({ snapshotAt }));
+  });
+});
+
 describe('后台任务分派：聊天那几道门一道都不该拦它', () => {
   it('没有 fire_pack 也照跑（聊天那条路在这儿是硬失败）', async () => {
     const { ctx } = makeCtx({ jobValue: await packStateValue(JSON.stringify(jobInput())) });
@@ -244,6 +257,20 @@ describe('门牌整理 handler', () => {
     );
   });
 
+  it('服务商返回 usage 时随结果回传 promptTokens 与 completionTokens', async () => {
+    const { ctx: fireCtx, scratch } = makeCtx({
+      jobValue: await packStateValue(JSON.stringify(jobInput())),
+    });
+    await amsgHooks.onBeforeFire(fireCtx);
+
+    const { ctx, emitResult } = makeSessionCtx(scratch, REPLY);
+    ctx.usage = { prompt_tokens: 1850, completion_tokens: 230, total_tokens: 2080 };
+    await amsgHooks.onLLMOutput(ctx);
+
+    const payload = (emitResult.mock.calls[0] as unknown as [any])[0];
+    expect(payload.usage).toEqual({ promptTokens: 1850, completionTokens: 230 });
+  });
+
   it('LLM 一条都没吐出来 → 不送空结果（空列表会被客户端当成「清空门牌」）', async () => {
     const { ctx: fireCtx, scratch } = makeCtx({
       jobValue: await packStateValue(JSON.stringify(jobInput())),
@@ -260,6 +287,25 @@ describe('门牌整理 handler', () => {
     // 孤儿，装着整块门牌原文 + 材料 + 身份上下文，一直占到 TTL。
     expect(writeState, '不删的话每次失败留一行，而 beforeFire 每跳都要把这个命名空间整个读出来解密')
       .toHaveBeenCalledWith(AMSG_JOB_NAMESPACE, [{ key: plateJobKey(JOB_ID), value: null }]);
+  });
+
+  // 模型回了东西却一条都解析不出来时，日志里得看得出它回了个什么（被截断？空的？格式跑偏？）。
+  it('一条都没解析出来 → 记一行跳过诊断，reason 是 plate-empty-generation', async () => {
+    const { ctx: fireCtx, scratch } = makeCtx({
+      jobValue: await packStateValue(JSON.stringify(jobInput())),
+    });
+    await amsgHooks.onBeforeFire(fireCtx);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { ctx } = makeSessionCtx(scratch, '模型今天不想说话');
+    ctx.llmResponse = { choices: [{ finish_reason: 'length', message: { content: '模型今天不想说话' } }] };
+    await amsgHooks.onLLMOutput(ctx);
+
+    const diag = warn.mock.calls.find(([tag]) => tag === '[amsg:skip-diag]')?.[1];
+    warn.mockRestore();
+    expect(diag, '门牌整理空跑时也该留一行诊断').toMatchObject({
+      reason: 'plate-empty-generation', finishReason: 'length', contentChars: 8,
+    });
   });
 
   // 回归守卫：kind 是从任务 metadata 上读出来的字符串。handler 表要是普通对象字面量，
@@ -330,7 +376,7 @@ describe('worker config', () => {
       VAPID_PRIVATE_KEY: '',
     } as any) as any;
 
-    expect(config.clientStateTtl).toEqual({ [AMSG_JOB_NAMESPACE]: 3 });
+    expect(config.clientStateTtl).toMatchObject({ [AMSG_JOB_NAMESPACE]: 3, 'amsg:instant-input': 7 });
     // 角色状态（fire_pack / tool_pack）绝不能配 TTL——配了就是定时把角色的云端状态抹掉
     expect(Object.keys(config.clientStateTtl)).not.toContain('amsg:char:');
   });

@@ -34,7 +34,7 @@ describe('打脏入口接线（保存后调 markAmsgStateDirty）', () => {
     for (const [start, end] of [
       ['const handleDeleteMessage', 'const confirmEditMessage'],
       ['const confirmEditMessage', 'const handleQuickReply'],
-      ['const handleClearHistory', "trackEvent('清空聊天记录');\n        setModalType"],
+      ['const handleHistoryCleanupDone', '// 只在打开聊天设置时计算一键存入'],
       ['const handleReroll', 'const handleImageSelect'],
     ] as const) {
       expect(sliceBetween(src, start, end), `${start} 里少了打脏调用`).toContain('markAmsgStateDirty(');
@@ -49,19 +49,18 @@ describe('打脏入口接线（保存后调 markAmsgStateDirty）', () => {
 // 换 Key 之后云端那几行凭据不重传的话，已排程的任务到点全部 401，而界面上一切正常。
 // 保存配置那两处是它唯一的触发点，接线被删就没人补了。
 describe('LLM 凭据行的重传接线', () => {
-  it('设置页换聊天 API：重传凭据行 + 存量内联任务照旧补刷（两条并存）', () => {
+  it('设置页换聊天 API：通过同步队列更新凭据与存量任务', () => {
     const src = read('../apps/Settings.tsx');
     // 保存按钮和点预设切换汇到 commitApiConfig 这一个出口，凭据接线挂在它身上。
     const fn = sliceBetween(src, 'const commitApiConfig', 'const applyPreset');
     expect(fn).toContain('syncAmsgLlmCredentials(');
-    expect(fn, '存量内联任务还靠它续命，不能顺手退役')
-      .toContain('ActiveMsgClient.refreshApiCredentialsForPendingTasks(');
+    expect(read('./amsgStateSync.ts')).toContain('ActiveMsgClient.refreshApiCredentialsForPendingTasks(');
     // 两个入口都得走这个出口：绕过去就是「聊天换了 API、后台任务还拿旧 Key」
     expect(sliceBetween(src, 'const handleSaveApi', 'const handleSaveVisionApi')).toContain('commitApiConfig(');
     expect(sliceBetween(src, 'const applyPreset', 'const openEditPreset')).toContain('commitApiConfig(');
   });
 
-  it('角色 2.0 面板保存（单独 API 可能刚改过）：也重传一次', () => {
+  it('角色 2.0 面板保存：也同步一次主 API', () => {
     expect(read('../components/chat/ActiveMsg2SettingsModal.tsx')).toContain('syncAmsgLlmCredentials(');
   });
 
@@ -73,7 +72,10 @@ describe('LLM 凭据行的重传接线', () => {
 
   it('删角色时连它名下那几行凭据一起清（keys 是 API Key，不能留在云端）', () => {
     const src = read('./amsg2CharCleanup.ts');
-    expect(src).toContain('deleteLlmCredentials({ credIds: charCredIds(');
+    // 清单由调用方给，这里钉的是「删角色那份清单是全量的」——少一种用途，
+    // 就有一行 API Key 留在云端没人再清。
+    expect(src).toContain('credPurposes: ALL_CREDENTIAL_PURPOSES');
+    expect(src).toContain('deleteLlmCredentials({ credIds })');
   });
 });
 

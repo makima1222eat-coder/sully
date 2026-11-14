@@ -1,23 +1,24 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Modal from '../os/Modal';
+import ConfirmDialog from '../os/ConfirmDialog';
+import AmsgIntroDemo from './AmsgIntroDemo';
 import { ActiveMsg2GlobalConfig, RealtimeConfig } from '../../types';
 import {
-  ActiveMsgClient, ActiveMsg2PushStatus, fetchWorkerDiagnostics, readAmsgFailKind,
+  ActiveMsgClient, ActiveMsg2PushStatus, fetchWorkerDiagnostics, fetchWorkerTickReport, readAmsgFailKind,
+  type AmsgCronTriggerState,
+  type AmsgWorkerVersionProbe,
 } from '../../utils/activeMsgClient';
+import { describeAmsgSelfUpdate } from '../../utils/amsgSelfUpdateState';
 import {
-  AmsgDiagnosticLevel, AmsgDiagnosticsProbe,
+  AmsgDiagnosticLevel, AmsgDiagnosticsProbe, type AmsgTickReportResult,
   buildAmsgDiagnosticRows, summarizeAmsgDiagnostics,
   INSTANT_CHAT_BLOCKER_HINTS, resolveInstantChatBlocker,
   type InstantChatGateInput,
 } from '../../utils/amsgDiagnostics';
-import { ActiveMsgStore, maskActiveMsgUserId } from '../../utils/activeMsgStore';
-import { cancelAllRemoteAmsgTasks, isWorkerUrlCleared, wipeAmsgCloudData } from '../../utils/amsgStateSync';
-import {
-  buildCloudflareDashboardUrl,
-  isInstantConfigReady,
-  loadInstantConfig,
-  saveInstantConfig,
-} from '../../utils/instantPushClient';
+import { ActiveMsgStore, isInstantChatSwitchedOn, maskActiveMsgUserId } from '../../utils/activeMsgStore';
+import { formatTaskTime } from '../../utils/amsg2Tasks';
+import { isWorkerUrlCleared } from '../../utils/amsgStateSync';
+import { rememberDetachedWorker } from '../../utils/amsgDetachedWorkers';
 import { generateClientToken } from '../../utils/vapidGen';
 import { loadPushVapid, savePushVapid } from '../../utils/pushVapid';
 import {
@@ -29,6 +30,16 @@ import {
 } from '../../utils/cfProvision';
 import { isAmsgServerVersionAtLeast } from '../../utils/amsgWorkerVersion';
 import { trackEvent } from '../../utils/analytics';
+import {
+  canRelayWorkerUrl, fetchRelayUsage, getRelayDeploymentSource, isRelayTokenWellFormed, resolveWorkerFetchBase, type RelayUsageResult,
+} from '../../utils/amsgRelay';
+import { formatBytes } from '../../utils/format';
+import {
+  getThirdPartyPushProviderMeta,
+  THIRD_PARTY_PUSH_PROVIDERS,
+  validateThirdPartyPushConfig,
+  type ThirdPartyPushProvider,
+} from '../../utils/amsgThirdPartyPush';
 
 // 满血链路吃满这些 worker 特性（amsg-server 2.6.0-next.4+）。探测不到端点（老部署
 // 404 → null）或缺任何一项，就亮「重新部署」提示——worker 跑在用户自己的账号里，
@@ -61,6 +72,14 @@ const REQUIRED_WORKER_FEATURES = [
   // ——包括角色在触发时给自己排的那些——下次触发就用新凭据。缺了它就退回「凭据冻结
   // 进每条任务」的老路：换 Key 要逐条补刷，漏一条到点就是 401。
   'llm-credentials',
+  // 即时对话通过正式策略关闭生成重试，收尾读取上游的 willRetry 决定。
+  'max-generation-retries',
+  // 即时任务绑定独立输入；后台按 key 读取、核对实际任务并保存不可变附件。
+  'task-input',
+  'client-state-key',
+  'agentic-list-tasks',
+  'agentic-tool-allowlist',
+  'attachments',
 ];
 // features 之外还必须比版本：这波依赖的能力大多没发独立 flag，光查 features 分不出新旧。
 //   next.5 — GET /messages 投影（charId/clientTaskId）、onBeforeFire 的 { skip } 出口
@@ -107,14 +126,71 @@ const REQUIRED_WORKER_FEATURES = [
 //            `silent: 'when-visible'`（静音改由 Service Worker 按窗口可见性算）。
 //            server 侧没有行为变化，单升这一档不解决任何问题；这批真正要用户去点
 //            一次「更新 Worker」的是通知策略本身，见 utils/amsgBundleVersion.ts。
+//   next.26 — client_state 的条件写不再被「来自未来」的时间戳锁死。设备时钟只要
+//            领先过真实时间，那一刻同步上去的行就带着一个还没到的时刻，之后这台
+//            设备发什么都被判成「旧的」，云端那行要等真实时间追上来才解得开；用户
+//            侧的表现是某个角色的即时对话一直发不出去，删消息、重装、重填地址全都
+//            不管用。这一档两件事：库里那种行不再有拦人的资格（存量能被覆盖回来），
+//            以及新写入的护栏值钳到服务端当前时刻（不再产生新的脏行）。旧部署上前端
+//            的水位（utils/amsgStateClock.ts）能兜住发不出去这一半，但云端那行会一直
+//            停在未来，只有升上来才会第一次写入就回到现实。
+//   next.27 — 两件事。一、cron 每跳顺手跑的几条清理 DELETE 有了索引：client_state 和
+//            message_outbox 上原先没有对应的索引，每分钟整表扫一遍，扫过的行全算进
+//            D1 的 rows read，两张表合计一千七百行就把免费额度（每天 500 万行）用完，
+//            之后整个 worker 报「exceeded daily row read limit」、所有查询都拒。索引在
+//            用户点「重新连接并验证」（POST /init-tenant）时补上，「更新 Worker」会自动
+//            接一次。二、PUT /client-state 认 value: null 删行：客户端取回旁路存的大
+//            内容后把那行真的删掉，不再留空壳（即时对话每轮的键都是新的，空壳只涨不
+//            跌，worker 每次生成都要把整个角色命名空间读一遍）。前端接入见
+//            utils/activeMsgClient.ts 的 clearClientStateValue 与存量空壳清理。
+//   next.28 — 跟着 amsg-shared 0.4.0-next.10 一起升：中转站回 HTTP 200、响应体里却是
+//            报错时，按模型调用失败处理，原话写进 last_error、任务照常重试。旧 worker
+//            上这类响应被当成模型「这轮没说话」静默跳过，面板上只写「没写出要说的话」，
+//            看不出是中转站在报错。同一批还带上 0.4.0-next.9 的脱敏补漏：形状像模型名
+//            的自建网关 Key 不再明文进 last_error。
+//   next.31 — 正式支持按任务配置生成重试次数。即时对话设为 0，失败立即结束；
+//            已整批入箱的内容仍可补推。收尾通过 willRetry 读取上游决定，不修改错误对象。
+//            旧部署缺少这项策略，会继续让用户等自动重试，需更新 Worker。
+//   next.32 — 执行中的即时对话可取消，模型请求与工具循环共享取消信号。
+//   next.33 — onBeforeFire 可以推迟一次触发（{ defer }）。到点时页面正在本地生成回复，
+//            定时消息靠它等那一轮结束再生成。
 // 不比版本的话，旧粘贴部署会被误判为最新，问题全在 worker 侧静默发生。
-const REQUIRED_WORKER_VERSION = '2.6.0-next.23';
+//
+// 3.1.0 修复云端数据清单与清理在分块大值与海量收件箱下的内存/CPU 耗尽；投递或某项清理出错时，
+// 其余库存清理照跑；D1 存储满与每日额度用完的报错带机读代码，界面能说清楚原因。
+const REQUIRED_WORKER_VERSION = '3.1.0';
+// 3.2.0-next 给任务占位加了租约令牌，并收紧了入参校验。前端没有用到新能力，门槛保持 3.1.0；
+// Worker 自动更新会带上新版，不必让旧部署重新粘贴。
+// 3.2.0-next.2 把解不开的旧数据报成 STORED_DATA_UNDECRYPTABLE。前端对新旧两种报法都认得，
+// 门槛同样不动。
+const WORKER_VERSION_LAG_ACK = '3.2.0-next.2';
 
-/** 装着打包好的 worker 代码的部署仓库：fork 它 → 在 Cloudflare 连上 → 以后点 Sync fork 更新。 */
-const WORKERS_REPO_URL = 'https://github.com/Tosd0/sullyos-workers';
-const SETUP_WALKTHROUGH_URL = 'https://github.com/qegj567-cloud/SullyOS/blob/master/docs/amsg2-setup-walkthrough.md';
+/** 手动配置的图文教程，只在用户展开「我要手动配置」后出现。 */
+const MANUAL_SETUP_TUTORIAL_URL = 'https://discord.com/channels/1487742660314923100/1533520151784460449';
+/** workers.dev 在当前网络连不上时怎么直连的教程，挂在 Worker 地址输入框下面。 */
+const DIRECT_CONNECT_TUTORIAL_URL = 'https://discord.com/channels/1487742660314923100/1536968535727677450';
 /** 一键部署要的那枚 API Token 在这里建。 */
 const CF_TOKEN_URL = 'https://dash.cloudflare.com/profile/api-tokens';
+
+// 浏览器的 SW ready 和存储读取都可能一直不返回，不能让配置入口跟着消失。
+const SETTINGS_CHECK_TIMEOUT_MS = 10_000;
+const waitForSettingsCheck = async <T,>(check: Promise<T>): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      check,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('设置检查超时');
+          error.name = 'TimeoutError';
+          reject(error);
+        }, SETTINGS_CHECK_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 // 探测结果每次会话只报一次。refresh() 在开面板、连接成功、订阅成功后都会跑一遍，
 // 一个连不上、反复点「连接」的人否则能一个人刷出十几条同样的结果，把分布带歪。
@@ -130,12 +206,74 @@ const DIAGNOSTIC_STYLES: Record<AmsgDiagnosticLevel, { dot: string; text: string
   unknown: { dot: 'bg-slate-300', text: 'text-slate-400', word: '查不到' },
 };
 
-/** 刚生成的密钥明文：输入框是 password 型，只能在这一处让用户看见并手动复制。 */
-const SecretReveal: React.FC<{ value: string; className?: string }> = ({ value, className = '' }) => (
-  <p className={`font-mono text-[10px] leading-relaxed text-slate-500 break-all bg-white border border-slate-200 rounded-xl px-2 py-1.5 ${className}`}>
-    {value}
-  </p>
-);
+/** 刚生成的密钥明文：输入框是 password 型，只能在这一处让用户看见并复制。 */
+const SecretReveal: React.FC<{ value: string; className?: string }> = ({ value, className = '' }) => {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  useEffect(() => setCopyState('idle'), [value]);
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyState('copied');
+    } catch {
+      setCopyState('failed');
+    }
+  };
+  return (
+    <div className={`flex items-start gap-2 bg-white border border-slate-200 rounded-xl px-2 py-1.5 ${className}`}>
+      {/* body 全局 user-select:none，这里得单独放开，否则连手动复制都做不到 */}
+      <p
+        className="flex-1 font-mono text-[10px] leading-relaxed text-slate-500 break-all"
+        style={{ userSelect: 'all', WebkitUserSelect: 'all' }}
+      >
+        {value}
+      </p>
+      <button
+        type="button"
+        onClick={() => void handleCopy()}
+        className="shrink-0 text-[10px] font-bold text-slate-500 active:scale-95 transition-transform"
+      >
+        {copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制'}
+      </button>
+    </div>
+  );
+};
+
+/**
+ * 面板里的一块：标题和状态常驻，内容平时收着。
+ * 有事要处理（needsAttention）时自己展开；只自动开、不自动关——刚办完的那一步下面往往还挂着
+ * 下一个要点的按钮（开好通知之后的「发送测试通知」），办完就收走会让人找不到。
+ */
+const FoldCard: React.FC<{
+  title: string;
+  status?: string;
+  statusClass?: string;
+  needsAttention?: boolean;
+  className?: string;
+  children: React.ReactNode;
+}> = ({ title, status, statusClass = 'text-slate-400', needsAttention = false, className = 'bg-white border-slate-200', children }) => {
+  const [open, setOpen] = useState(needsAttention);
+  useEffect(() => { if (needsAttention) setOpen(true); }, [needsAttention]);
+  return (
+    <div className={`border rounded-2xl p-4 space-y-3 ${className}`}>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((prev) => !prev)}
+        className="w-full flex items-center justify-between gap-3 text-left"
+      >
+        <span className="font-bold text-slate-700">{title}</span>
+        <span className="shrink-0 flex items-center gap-2">
+          {status ? <span className={`text-xs font-bold ${statusClass}`}>{status}</span> : null}
+          <span className="text-xs font-bold text-slate-400">{open ? '收起' : '展开'}</span>
+        </span>
+      </button>
+      {open ? children : null}
+    </div>
+  );
+};
+
+/** 引导的四步（介绍页是第 0 屏，不算在里面）。 */
+const GUIDE_STEPS = ['装后端', '开通知', '即时对话', '给角色开启'];
 
 interface ActiveMsgGlobalSettingsModalProps {
   isOpen: boolean;
@@ -145,6 +283,8 @@ interface ActiveMsgGlobalSettingsModalProps {
   realtimeConfig: RealtimeConfig;
   /** 由 Settings 注入：点「去推送凭据面板」时打开顶层 PushVapidSettingsModal */
   onOpenVapid?: () => void;
+  /** 打开「云端数据」清点页（跟 onOpenVapid 一样，由设置页负责渲染那个面板）。 */
+  onOpenCloudData?: () => void;
 }
 
 const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> = ({
@@ -153,19 +293,30 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
   addToast,
   realtimeConfig,
   onOpenVapid,
+  onOpenCloudData,
 }) => {
   const [config, setConfig] = useState<ActiveMsg2GlobalConfig | null>(null);
+  const [configLoadError, setConfigLoadError] = useState('');
+  const configRequestIdRef = useRef(0);
+  const pushRequestIdRef = useRef(0);
   const [loading, setLoading] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [deployOpen, setDeployOpen] = useState(false);
-  // 手动粘贴部署：给没有 GitHub 账号的人留的退路，默认收着不干扰主流程。
-  const [pasteFallbackOpen, setPasteFallbackOpen] = useState(false);
-  // Deno 门面：workers.dev 在国内连不上时才需要，默认收着。
-  const [denoProxyOpen, setDenoProxyOpen] = useState(false);
+  // 这次打开看哪一面：没连上后端的人走引导（介绍 → 三步），连上的直接进面板。
+  // 配置读回来时定一次、之后只由用户点按钮切换——引导走到一半连上了后端，不能把人直接甩进面板。
+  const [view, setView] = useState<'guide' | 'panel' | null>(null);
+  /** 引导走到第几屏：0 是介绍，1~4 对应 GUIDE_STEPS。 */
+  const [guideStep, setGuideStep] = useState(0);
+  const topRef = useRef<HTMLDivElement>(null);
+  // 换一屏就回到顶上，不然会停在上一屏滚到的位置。（jsdom 里没有 scrollIntoView。）
+  useEffect(() => { topRef.current?.scrollIntoView?.({ block: 'start' }); }, [view, guideStep]);
+  // 手动配置：只给明确不想走一键部署的人看，默认收着。
+  const [manualSetupOpen, setManualSetupOpen] = useState(false);
   const [pushStatus, setPushStatus] = useState<ActiveMsg2PushStatus | null>(null);
+  const [checkingPush, setCheckingPush] = useState(false);
+  const [pushCheckError, setPushCheckError] = useState('');
   // 「生成 Master Key」只在本次打开期间展示，前端不落盘——它是 worker 侧密钥，粘进 CF env 即可。
   const [generatedMasterKey, setGeneratedMasterKey] = useState('');
   const [generatedServerToken, setGeneratedServerToken] = useState('');
+  const [serverTokenOpen, setServerTokenOpen] = useState(false);
 
   // 一键部署：填一枚 CF Token，剩下的（建库、传 worker、写密钥、加定时）都自动做完。
   // Token 只在这次部署期间留在内存里，成功与否都不落盘——它是能改整个账号 Workers 的
@@ -179,6 +330,8 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
   const [needsSubdomain, setNeedsSubdomain] = useState(false);
   const [desiredSubdomain, setDesiredSubdomain] = useState('');
   const [provisionError, setProvisionError] = useState('');
+  /** 账号里的同名库有旧数据、本机又没旧钥匙：记下是哪个账号，等用户确认清空后接着装。 */
+  const [staleDatabase, setStaleDatabase] = useState<{ accountId?: string } | null>(null);
 
   // 补装更新能力：老办法装的后端里没有 CF_API_TOKEN，点更新会被顶回来。
   // 粘一枚 token 就能就地补上，不用去 Cloudflare 面板。只在真的缺钥匙时才露出来。
@@ -194,6 +347,8 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
   // 有没有停」都算好了，但入口一直只有手拼 URL——而这几样恰恰是「界面上一切正常、
   // 就是一条都不发」的全部原因。存原始探测结果，红绿灯在渲染时算（推送状态一变就跟着走）。
   const [diagnosticsProbe, setDiagnosticsProbe] = useState<AmsgDiagnosticsProbe | null>(null);
+  // 定时任务的逐条细账（GET /tick-report）。/debug 只知道「几条到点没发」，为什么没发要看这份。
+  const [tickReportResult, setTickReportResult] = useState<AmsgTickReportResult | null>(null);
   const [diagnosing, setDiagnosing] = useState(false);
   // 体检摆在最上面，但默认收着：装好之后它天天是「都正常」，摊开占掉半屏。
   // 标题那一行已经把结论说了，要看是哪一项才需要点开。
@@ -204,14 +359,22 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
    * 用户那台 Worker 上的后端代码是不是最新的（见 ActiveMsgClient.probeWorkerVersion）。
    * null = 还没探到（没填地址 / 正在探）。界面拿它决定更新按钮是高亮催更新还是弱化。
    */
-  const [workerVersion, setWorkerVersion] = useState<
-    { state: 'current' | 'outdated' | 'unknown'; deployed: string | null; expected: string } | null
-  >(null);
+  const [workerVersion, setWorkerVersion] = useState<AmsgWorkerVersionProbe | null>(null);
   /** 自更新成功后 worker 报回来的代码指纹，显示出来好让人确认这次真换了。 */
   const [selfUpdateHash, setSelfUpdateHash] = useState('');
-  // Instant Push 也开着：聊天会走它，2.0 挂在本地那条路上的几样东西全静默失效——设置页
-  // 两道双向门通常已经拦住这种组合，这里读一次是给漏网脏配置兜底，关掉后立刻更新。
-  const [instantOn, setInstantOn] = useState(false);
+  /**
+   * 后台任务的定时触发（Worker 的 cron trigger）现在开着没有，见 ActiveMsgClient.getCronTriggerState。
+   * null = 这台 Worker 没有这个端点（旧版）或没读到，按钮整个不显示。
+   * token-missing = 端点在、但 Worker 没配 CF_API_TOKEN，点按钮先引导补钥匙。
+   */
+  const [cronState, setCronState] = useState<
+    { kind: 'known'; enabled: boolean } | { kind: 'token-missing'; message: string } | null
+  >(null);
+  /** 「暂停后台任务」的确认框开着没有。恢复不用确认。 */
+  const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
+  const [relayConfirmOpen, setRelayConfirmOpen] = useState(false);
+  /** 中转令牌近 30 天的用量；null = 还没查（或没开中转、令牌格式不对）。 */
+  const [relayUsage, setRelayUsage] = useState<RelayUsageResult | null>(null);
   // 这台 worker 认不认 /instant-chat。即时对话的**唯一**版本门槛就在这儿，
   // 别处不做逐调用预检——每发一条消息多探一次网络，探失败还分不清是旧版还是网抖。
   const [instantChatSupported, setInstantChatSupported] = useState(false);
@@ -253,10 +416,32 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
   const runDiagnostics = async () => {
     setDiagnosing(true);
     try {
-      setDiagnosticsProbe(await fetchWorkerDiagnostics());
+      // 两个端点互不依赖，并排拉；细账那边失败不抛，不会拖垮体检本身。
+      const [probe, tickReport] = await Promise.all([fetchWorkerDiagnostics(), fetchWorkerTickReport()]);
+      setDiagnosticsProbe(probe);
+      setTickReportResult(tickReport);
     } finally {
       setDiagnosing(false);
     }
+  };
+
+  /** 把 worker 报回来的定时触发状态翻成界面上的三态（见 cronState 的说明）。 */
+  const applyCronTriggerState = (state: AmsgCronTriggerState | null) => {
+    if (!state) {
+      setCronState(null);
+      return;
+    }
+    if (state.supported && typeof state.enabled === 'boolean') {
+      setCronState({ kind: 'known', enabled: state.enabled });
+      return;
+    }
+    if (state.code === 'CF_TOKEN_MISSING') {
+      setCronState({ kind: 'token-missing', message: state.message || '' });
+      return;
+    }
+    // 别的原因（认不出 Worker 名、CF 那边读不到）：按钮不显示，原因留在 console 里备查。
+    if (state.message) console.warn('[amsg2] 读不到后台任务的定时触发状态：', state.message);
+    setCronState(null);
   };
 
   /**
@@ -277,46 +462,83 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
     });
   };
 
-  const refresh = async () => {
-    const nextConfig = await ActiveMsgClient.getGlobalConfig();
-    const nextPushStatus = await ActiveMsgClient.getPushStatus();
-    savedWorkerUrlRef.current = nextConfig.workerUrl || '';
-    setConfig(nextConfig);
-    setPushStatus(nextPushStatus);
-    setInstantOn(isInstantConfigReady());
-    void probeWorkerCaps(Boolean(nextConfig.workerUrl?.trim()));
-    if (nextConfig.workerUrl?.trim()) {
-      void ActiveMsgClient.probeWorkerVersion().then(setWorkerVersion);
-      void ActiveMsgClient.probeInstantChatSupport().then((supported) => {
-        setInstantChatSupported(supported);
-        reportInstantChatGate({
-          connected: Boolean(nextConfig.initializedAt),
-          pushSubscribed: Boolean(nextPushStatus?.hasSubscription),
-          workerSupportsInstantChat: supported,
-          instantPushOn: isInstantConfigReady(),
-        }, Boolean(nextConfig.instantChatEnabled));
-      });
-      void runDiagnostics();
-    } else {
-      setInstantChatSupported(false);
-      setDiagnosticsProbe(null);
-      setWorkerVersion(null);
+  const refreshPushStatus = async (nextConfig: ActiveMsg2GlobalConfig) => {
+    const requestId = ++pushRequestIdRef.current;
+    setCheckingPush(true);
+    setPushCheckError('');
+    setPushStatus(null);
+    try {
+      const nextPushStatus = await waitForSettingsCheck(ActiveMsgClient.getPushStatus());
+      if (requestId !== pushRequestIdRef.current) return;
+      setPushStatus(nextPushStatus);
+      if (nextConfig.workerUrl?.trim()) {
+        void ActiveMsgClient.probeInstantChatSupport().then((supported) => {
+          if (requestId !== pushRequestIdRef.current) return;
+          setInstantChatSupported(supported);
+          reportInstantChatGate({
+            connected: Boolean(nextConfig.initializedAt),
+            pushSubscribed: Boolean(nextPushStatus.hasSubscription),
+            workerSupportsInstantChat: supported,
+          }, isInstantChatSwitchedOn(nextConfig));
+        }).catch(() => {
+          if (requestId === pushRequestIdRef.current) setInstantChatSupported(false);
+        });
+      }
+    } catch (error) {
+      if (requestId !== pushRequestIdRef.current) return;
+      setPushCheckError(error instanceof Error && error.name === 'TimeoutError'
+        ? '推送状态检查超时，可以重试；其他配置仍可正常修改。'
+        : '推送状态读取失败，可以重试；其他配置仍可正常修改。');
+    } finally {
+      if (requestId === pushRequestIdRef.current) setCheckingPush(false);
     }
   };
 
-  /** 关掉 Instant Push 的开关，worker 地址等配置留着——以后想切回去不用重填。 */
-  const disableInstantPush = () => {
-    saveInstantConfig({ ...loadInstantConfig(), enabled: false });
-    setInstantOn(false);
-    addToast('已关闭 Instant Push，聊天回到本地直连。', 'success');
+  const refresh = async () => {
+    const requestId = ++configRequestIdRef.current;
+    ++pushRequestIdRef.current;
+    setConfigLoadError('');
+    let nextConfig: ActiveMsg2GlobalConfig;
+    try {
+      nextConfig = await waitForSettingsCheck(ActiveMsgClient.getGlobalConfig());
+    } catch (error) {
+      if (requestId !== configRequestIdRef.current) return;
+      setConfigLoadError(error instanceof Error && error.name === 'TimeoutError'
+        ? '本地配置读取超时，请重试。'
+        : '本地配置读取失败，请重试。');
+      throw error;
+    }
+    if (requestId !== configRequestIdRef.current) return;
+    savedWorkerUrlRef.current = nextConfig.workerUrl || '';
+    // 先交出表单，推送就绪与否只影响推送区域，不挡住整个面板。
+    setConfig(nextConfig);
+    setView((prev) => prev ?? (nextConfig.initializedAt ? 'panel' : 'guide'));
+    void refreshPushStatus(nextConfig);
+    void probeWorkerCaps(Boolean(nextConfig.workerUrl?.trim()));
+    if (nextConfig.workerUrl?.trim()) {
+      void ActiveMsgClient.probeWorkerVersion().then(setWorkerVersion);
+      void runDiagnostics();
+      // 已连接才问定时触发开没开：没连上的时候这事还轮不到操心。
+      if (nextConfig.initializedAt) void ActiveMsgClient.getCronTriggerState().then(applyCronTriggerState);
+      else setCronState(null);
+    } else {
+      setInstantChatSupported(false);
+      setDiagnosticsProbe(null);
+      setTickReportResult(null);
+      setWorkerVersion(null);
+      setCronState(null);
+    }
   };
 
   useEffect(() => {
     if (!isOpen) return;
-    setAdvancedOpen(false);
+    setConfig(null);
+    setPushStatus(null);
+    setInstantChatSupported(false);
+    setView(null);
+    setGuideStep(0);
     setDiagnosticsOpen(false);
-    setDeployOpen(false);
-    setPasteFallbackOpen(false);
+    setManualSetupOpen(false);
     // 两个明文密钥都要清：留到下次打开面板还挂在页面上，就是白白多摊一次。
     setGeneratedMasterKey('');
     setGeneratedServerToken('');
@@ -332,43 +554,57 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
     setAttachNeedsScriptName(false);
     setAttachAccounts(null);
     setAttachError('');
-    void refresh();
+    setPauseConfirmOpen(false);
+    // refresh 已把读取错误放进面板；操作按钮仍可用它的 rejection 显示操作失败。
+    void refresh().catch(() => {});
+    return () => {
+      ++configRequestIdRef.current;
+      ++pushRequestIdRef.current;
+    };
   }, [isOpen]);
 
   /**
-   * 地址被清空时的收尾：先问一句，再拿**旧地址**把远端任务取消干净，最后才存空值。
+   * 地址被清空时的收尾：把「那边还留着东西」说清楚，把旧地址记一笔，**不动云端数据**。
    *
-   * 光存空值的话，前端这边所有同步立刻停摆，D1 里的任务却一条没少：cron 每分钟照常
-   * 消费、照烧 LLM、照推送（推送订阅也还在），只是内容永远停在最后一次同步的样子。
-   * 用户以为自己关掉了一切，实际只是把自己变成了看不见的那一方。
+   * 早先这里会顺手把远端任务全取消掉，理由是「地址一清，回复推回来这边也接不住」。
+   * 但清空地址本身没有毁灭的意味：用户可能只是要换个反代端点、换个自定义域名，背后
+   * 还是同一台 worker、同一个 D1，照着「地址变了」就去销毁任务，等于把人家排好的东西
+   * 删了。真想清有专门的入口——「清空云端数据」是用户亲手点的，那里才该动手。
+   *
+   * 代价得说在明处：光存空值的话，前端这边所有同步立刻停摆，D1 里的任务却一条没少，
+   * cron 每分钟照常消费、照烧 LLM、照推送，只是内容永远停在最后一次同步的样子。所以
+   * 这句提示必须把「任务不会被取消」写明白，并且把旧地址记进备忘——地址一清，本地就
+   * 再没有别的地方记得它，用户想回去清都找不到门。
    */
-  const confirmAndClearRemote = async (): Promise<boolean> => {
-    const ok = confirm('清空 Worker 地址会把远端还挂着的主动消息任务一并取消，确定吗？\n\n不取消的话，那些任务仍会按时触发并给你推送，而这边已经管不到它们了。');
+  const confirmDetachWorker = async (previousUrl: string): Promise<boolean> => {
+    const ok = confirm(`清空 Worker 地址之后，那台 Worker 上已经排好的定时任务不会被取消——它们仍会按时触发、照常推送，只是这边管不到了。\n\n地址：${previousUrl}\n\n想连任务一起停掉的话，请先用下面「高级信息」里的「清空云端数据」清一遍，再回来清空地址。\n\n仍然清空吗？`);
     if (!ok) return false;
-    const { total, failed, listed } = await cancelAllRemoteAmsgTasks();
-    if (!listed) {
-      addToast('远端任务没能取消，可能还挂在那儿照常触发。建议把地址填回去，到角色的主动消息面板里逐个处理。', 'error');
-    } else if (failed > 0) {
-      addToast(`还有 ${failed} 个远端任务取消失败，建议恢复地址后在面板处理。`, 'error');
-    } else if (total > 0) {
-      addToast(`已取消远端 ${total} 个任务。`, 'info');
-    }
+    rememberDetachedWorker(previousUrl);
+    addToast('地址已清空，云端那份没动。想清的话把地址填回来，用「清空云端数据」清一遍。', 'info');
     return true;
   };
 
   const persistGlobalConfig = async () => {
     if (!config) return;
-    if (isWorkerUrlCleared(savedWorkerUrlRef.current, config.workerUrl)) {
-      if (!await confirmAndClearRemote()) {
+    const previousUrl = savedWorkerUrlRef.current;
+    const nextUrl = config.workerUrl || '';
+    if (isWorkerUrlCleared(previousUrl, nextUrl)) {
+      if (!await confirmDetachWorker(previousUrl)) {
         // 用户反悔：把地址填回输入框，别留一个「界面空着、库里还存着」的错位。
         patchConfig({ workerUrl: savedWorkerUrlRef.current });
         return;
       }
+    } else if (previousUrl && nextUrl && previousUrl !== nextUrl) {
+      // 换地址：多半只是换了个入口（反代端点、自定义域名），背后还是同一台 worker，
+      // 所以一个字节都不动，只把旧地址记一笔——万一真是换了后端，用户还有地方找回去。
+      rememberDetachedWorker(previousUrl);
     }
     await ActiveMsgStore.saveGlobalConfig({
       workerUrl: config.workerUrl,
       serverToken: config.serverToken,
       instantChatEnabled: config.instantChatEnabled,
+      pushMode: config.pushMode,
+      thirdPartyPush: config.thirdPartyPush,
       // 一键部署生成的 Master Key 也要跟着存：这是本地唯一的一份，Worker 那边读不回来。
       masterKey: config.masterKey,
     });
@@ -386,6 +622,123 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
       ...(prev || { userId: '', workerUrl: '' }),
       ...updates,
     }));
+  };
+
+  // 立刻存盘，不等「连接」：一键部署后等 Worker 生效、连接建表，都按存盘的配置发请求
+  const saveRelay = async (next: boolean) => {
+    patchConfig({ useRelay: next });
+    await ActiveMsgStore.saveGlobalConfig({ useRelay: next });
+  };
+
+  const saveRelayToken = async (value: string) => {
+    const relayToken = value.trim();
+    patchConfig({ relayToken });
+    await ActiveMsgStore.saveGlobalConfig({ relayToken });
+  };
+
+  // 打开面板、令牌变了各查一次用量，不轮询；稍等一下再查，免得边粘贴边发请求
+  // 非官方渠道不能用官方中转；判定前（checking）也先当不能用，免得开关闪一下可点
+  const [relayDeployment, setRelayDeployment] = useState<'checking' | 'official' | 'other'>('checking');
+  useEffect(() => {
+    let cancelled = false;
+    void getRelayDeploymentSource().then((source) => {
+      if (!cancelled) setRelayDeployment(source === 'official' ? 'official' : 'other');
+    });
+    return () => { cancelled = true; };
+  }, []);
+  const relayAllowed = relayDeployment === 'official';
+  const relayTokenReady = relayAllowed && !!config?.useRelay && isRelayTokenWellFormed(config?.relayToken);
+  useEffect(() => {
+    setRelayUsage(null);
+    if (!isOpen || !relayTokenReady || !config?.relayToken) return;
+    let cancelled = false;
+    const relayToken = config.relayToken;
+    const timer = setTimeout(() => {
+      void fetchRelayUsage(relayToken).then((result) => { if (!cancelled) setRelayUsage(result); });
+    }, 600);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [isOpen, relayTokenReady, config?.relayToken]);
+
+  // 打开要先过数据边界的提醒；关掉直接生效
+  const handleToggleRelay = (next: boolean) => {
+    if (next) setRelayConfirmOpen(true);
+    else void saveRelay(false);
+  };
+
+  const handleSwitchPushMode = async (nextMode: 'web-push' | 'third-party') => {
+    if (!config) return;
+    const nextThirdParty = config.thirdPartyPush || { provider: 'wxpusher' as const, token: '' };
+    patchConfig({ pushMode: nextMode, thirdPartyPush: nextThirdParty });
+    await ActiveMsgStore.saveGlobalConfig({
+      instantChatEnabled: config.instantChatEnabled,
+      pushMode: nextMode,
+      thirdPartyPush: nextThirdParty,
+    });
+    if (nextMode === 'web-push' && config.initializedAt) {
+      void ActiveMsgClient.reconcilePushSubscription().catch(() => {});
+    }
+    await refreshPushStatus({ ...config, pushMode: nextMode, thirdPartyPush: nextThirdParty });
+  };
+
+  const handleSelectThirdPartyProvider = async (nextProvider: ThirdPartyPushProvider) => {
+    if (!config) return;
+    const prevTp = config.thirdPartyPush || { provider: 'wxpusher' as const, token: '' };
+    const nextThirdParty = {
+      ...prevTp,
+      provider: nextProvider,
+    };
+    patchConfig({ pushMode: 'third-party', thirdPartyPush: nextThirdParty });
+    await ActiveMsgStore.saveGlobalConfig({
+      instantChatEnabled: config.instantChatEnabled,
+      pushMode: 'third-party',
+      thirdPartyPush: nextThirdParty,
+    });
+    await refreshPushStatus({ ...config, pushMode: 'third-party', thirdPartyPush: nextThirdParty });
+  };
+
+  const handleSaveThirdPartyPush = async () => {
+    if (!config) return;
+    const tp = config.thirdPartyPush || { provider: 'wxpusher' as const, token: '' };
+    const validation = validateThirdPartyPushConfig(tp);
+    if (!validation.ok) {
+      addToast(validation.error || '请填写有效的第三方推送配置。', 'error');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await ActiveMsgStore.saveGlobalConfig({
+        instantChatEnabled: config.instantChatEnabled,
+        pushMode: 'third-party',
+        thirdPartyPush: tp,
+      });
+      if (config.workerUrl?.trim()) {
+        await ActiveMsgClient.registerPushSubscription();
+        await refresh();
+        addToast('第三方推送通道已保存并登记到 Worker。', 'success');
+      } else {
+        await refreshPushStatus({ ...config, pushMode: 'third-party', thirdPartyPush: tp });
+        addToast('第三方推送配置已保存，连接 Worker 后会自动登记。', 'success');
+      }
+      trackEvent('开启通知与推送订阅', { result: 'ok' });
+    } catch (error: any) {
+      addToast(error?.message || '登记第三方推送失败。', 'error');
+      trackEvent('开启通知与推送订阅', { result: readAmsgFailKind(error) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSendTestPush = async () => {
+    setLoading(true);
+    try {
+      await ActiveMsgClient.sendTestPush();
+      addToast('测试通知已发出，请看手机通知栏是否收到！', 'success');
+    } catch (error: any) {
+      addToast(error?.message || '发送测试通知失败。', 'error');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleCreateSubscription = async () => {
@@ -417,7 +770,7 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
    * Token 只在这次操作期间留在内存里，成功与否都不落盘。需要长期留着的那一份已经作为
    * secret 写进用户自己的 Worker 了（以后「更新后端」用的就是它）。
    */
-  const handleOneClickDeploy = async (accountId?: string) => {
+  const handleOneClickDeploy = async (accountId?: string, resetExistingDatabase = false) => {
     const token = cfToken.trim();
     if (!token) {
       addToast('先把 Cloudflare API Token 填进来。', 'error');
@@ -427,6 +780,7 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
     setProvisioning(true);
     setProvisionError('');
     setProvisionStep('');
+    setStaleDatabase(null);
     try {
       const vapid = loadPushVapid();
       const result = await provisionAmsgBackend({
@@ -440,6 +794,7 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
           VAPID_EMAIL: vapid.vapidEmail || undefined,
           AMSG_SERVER_TOKEN: config?.serverToken || undefined,
         },
+        resetExistingDatabase,
         onProgress: (p: ProvisionProgress) => setProvisionStep(p.message),
       });
 
@@ -455,6 +810,12 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
           setNeedsSubdomain(true);
           setProvisionError(result.message);
           trackEvent('一键部署 2.0 后端', { result: '要起子域名' });
+          return;
+        }
+        if (result.code === 'DATABASE_KEY_MISSING') {
+          setStaleDatabase({ accountId });
+          setProvisionError(result.message);
+          trackEvent('一键部署 2.0 后端', { result: '旧库缺密钥' });
           return;
         }
         setProvisionError(result.message);
@@ -476,6 +837,8 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
         serverToken: secrets.AMSG_SERVER_TOKEN,
         masterKey: secrets.AMSG_MASTER_KEY,
         instantChatEnabled: config?.instantChatEnabled,
+        pushMode: config?.pushMode,
+        thirdPartyPush: config?.thirdPartyPush,
       });
       patchConfig({
         workerUrl: result.workerUrl,
@@ -496,7 +859,7 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
 
       // 刚建好的 workers.dev 地址要等一会儿才解析得到，等它活过来再建表。
       setProvisionStep('等待 Worker 启动…');
-      const ready = await waitForWorkerReady(result.workerUrl);
+      const ready = await waitForWorkerReady(resolveWorkerFetchBase(result.workerUrl, config?.useRelay, config?.relayToken));
       if (!ready) {
         addToast('Worker 装好了，但地址还没生效。过一两分钟点一下「连接并启用」即可。', 'info');
         return;
@@ -528,6 +891,8 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
         workerUrl: config.workerUrl,
         serverToken: config.serverToken,
         instantChatEnabled: config.instantChatEnabled,
+        pushMode: config.pushMode,
+        thirdPartyPush: config.thirdPartyPush,
       });
       const { warnings } = await ActiveMsgClient.connect();
       await refresh();
@@ -563,6 +928,9 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
    *
    * 失败不改判这次更新：代码确实已经换上了，只是库没跟上。分开报，用户才知道该点哪个。
    */
+  /** 自动更新近况那一行；没能力（没钥匙）时是 null。 */
+  const autoUpdateText = describeAmsgSelfUpdate(workerVersion?.autoUpdate ?? null);
+
   const handleSelfUpdateWorker = async () => {
     setLoading(true);
     try {
@@ -595,6 +963,48 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
     } finally {
       setLoading(false);
     }
+  };
+
+  /**
+   * 暂停 / 恢复后台任务：让 Worker 摘掉或加回自己的 cron trigger（见 worker/amsg/src/cronTrigger.ts）。
+   *
+   * 暂停期间到点的任务在 D1 里排着，不会丢；恢复后的第一跳一起补发。
+   * 走 GitHub 的 Sync fork 重新部署会按 wrangler.toml 把 cron 加回来，所以这不是永久开关。
+   */
+  const applyCronTrigger = async (enabled: boolean) => {
+    setPauseConfirmOpen(false);
+    setLoading(true);
+    const action = enabled ? 'resume' : 'pause';
+    try {
+      const result = await ActiveMsgClient.setCronTriggerEnabled(enabled);
+      if (result.ok) {
+        setCronState({ kind: 'known', enabled });
+        addToast(result.message, 'success');
+      } else {
+        addToast(result.message, 'error');
+        // 缺 CF_API_TOKEN 是这里唯一能就地解决的一种，跟自更新一样露出补钥匙那一块。
+        if (result.code === 'CF_TOKEN_MISSING') setAttachOpen(true);
+      }
+      trackEvent('暂停后台任务', { action, result: result.ok ? 'ok' : 'failed' });
+    } catch (error: any) {
+      addToast(error?.message || (enabled ? '恢复失败。' : '暂停失败。'), 'error');
+      trackEvent('暂停后台任务', { action, result: 'failed' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** 暂停要先确认（点错一下角色就全哑了），恢复直接做。 */
+  const handleCronTriggerClick = () => {
+    if (!cronState) return;
+    if (cronState.kind === 'token-missing') {
+      // 钥匙还没装，先把补装那一块露出来；装好之后再点就能真的暂停了。
+      addToast(cronState.message || '这台 Worker 还没配 CF_API_TOKEN，先在下面补一把钥匙。', 'info');
+      setAttachOpen(true);
+      return;
+    }
+    if (cronState.enabled) setPauseConfirmOpen(true);
+    else void applyCronTrigger(true);
   };
 
   /**
@@ -646,6 +1056,8 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
       setAttachNeedsScriptName(false);
       addToast('钥匙装好了，现在可以点上面的「更新 Worker」了。', 'success');
       trackEvent('补装后端更新能力', { result: '成功' });
+      // 钥匙一到位，暂停后台任务那个按钮也能用了，重新问一次它的状态。
+      void ActiveMsgClient.getCronTriggerState().then(applyCronTriggerState);
     } catch (error: any) {
       setAttachError(error?.message || '装钥匙时出错了。');
       trackEvent('补装后端更新能力', { result: '失败' });
@@ -654,8 +1066,7 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
     }
   };
 
-  // 手动粘贴部署用。主流程是 fork sullyos-workers + 在 CF 连 Git，这条是给没有 GitHub
-  // 账号的人留的退路，所以在面板里收在折叠区里。
+  // 手动配置用：把打包好的 Worker 代码复制出来，贴进 CF 后台的 Edit code。
   const handleCopyWorkerBundle = async () => {
     try {
       await ActiveMsgClient.copyWorkerBundleToClipboard();
@@ -665,19 +1076,6 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
       addToast(`复制失败（${error?.message || error}）。也可以从仓库 worker/amsg/worker.bundle.js 获取。`, 'error');
       // 剪贴板 API 在非 HTTPS / 部分 WebView 里会直接抛，这条就是那批人的规模。
       trackEvent('复制 2.0 Worker 代码', { result: 'failed' });
-    }
-  };
-
-  // workers.dev 在国内连不上时的门面脚本。跟上面那份不一样：这份不打包、原样发布，
-  // 用户要照着里面的注释改 UPSTREAM 那一行，所以注释必须留着。
-  const handleCopyDenoProxy = async () => {
-    try {
-      await ActiveMsgClient.copyDenoProxyToClipboard();
-      addToast('代理代码已复制，贴进 Deno Playground 后记得改 UPSTREAM 那一行。', 'success');
-      trackEvent('复制 2.0 Deno 代理代码', { result: 'ok' });
-    } catch (error: any) {
-      addToast(`复制失败（${error?.message || error}）。也可以从仓库 worker/amsg/deno-proxy.ts 获取。`, 'error');
-      trackEvent('复制 2.0 Deno 代理代码', { result: 'failed' });
     }
   };
 
@@ -719,69 +1117,12 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
     return revealAndCopy(ActiveMsgClient.generateMasterKey(), setGeneratedMasterKey, 'AMSG_MASTER_KEY');
   };
 
-  const handleWipeCloudData = async () => {
-    if (!confirm(
-      '确定清空云端数据？Worker D1 里属于你的这几样会一起删掉：\n\n'
-      + '· 已排程的主动消息任务（含角色自己排的）\n'
-      + '· 同步上去的角色上下文与工具凭据\n'
-      + '· 登记的 API 凭据\n'
-      + '· 推送订阅登记\n\n'
-      + '任务删了要重新排。角色上下文下次聊天会自动传回去，API 凭据下次排程/发消息时重新登记，'
-      + '工具凭据和推送订阅当场就补登记。'
-    )) return;
-    setLoading(true);
-    try {
-      const result = await wipeAmsgCloudData(realtimeConfig, {
-        pushRegistered: Boolean(pushStatus?.hasSubscription),
-      });
-
-      // 没清干净的地方逐条说明白：这个按钮多半是在「云端数据已经出问题」时点的，
-      // 含糊一句「部分失败」会让人不知道下一步该干嘛。
-      const problems: string[] = [];
-      if (!result.tasks.listed) {
-        problems.push('任务清单读不出来（换过 AMSG_MASTER_KEY 的话旧任务解不开就会这样），这些任务到点会失败，Worker 会在 7 天后自动清掉它们');
-      } else if (result.tasks.failed > 0) {
-        problems.push(`${result.tasks.failed} 个任务没取消成功，建议到角色的主动消息面板里逐个处理`);
-      }
-      if (result.stateDeleted === null) {
-        problems.push('角色上下文没能删掉');
-      } else if (!result.toolConfigRestored) {
-        problems.push('工具凭据没能补传回去，请到「实时感知」里重新保存一次配置，否则已排程的 AI 任务会一直失败');
-      }
-      if (result.llmCredentialsDeleted === null) {
-        // 老 Worker 上压根没有这张表，这一句同样成立：那边确实没清成，而下次排程会
-        // 走回「凭据冻结进任务」的老路，也就无所谓残留。
-        problems.push('登记的 API 凭据没能删掉（Worker 版本较旧的话本来就没有这一项）');
-      }
-      if (result.push === 'failed') {
-        problems.push('推送订阅没能收拾干净，建议到上面的推送区域重新订阅一次');
-      }
-
-      if (problems.length > 0) {
-        addToast(`云端数据没能全部清干净：${problems.join('；')}。`, 'error');
-      } else {
-        const done = [
-          `任务 ${result.tasks.total} 个`,
-          `状态 ${result.stateDeleted} 条`,
-          `API 凭据 ${result.llmCredentialsDeleted} 行`,
-        ];
-        if (result.push === 'reregistered') done.push('推送订阅已重新登记');
-        addToast(`已清空云端数据（${done.join('、')}）。`, 'success');
-      }
-    } catch (error: any) {
-      addToast(error?.message || '清空云端数据失败。', 'error');
-    } finally {
-      setLoading(false);
-      void refresh();
-    }
-  };
-
   /**
    * 开关即时对话。直接落盘而不是走那条 1 秒去抖的自动保存：开关是一次明确的动作，
    * 点完立刻生效（下一条消息就按新路走），而不是「点完还得等一下」。
    */
   const handleToggleInstantChat = async () => {
-    const next = !config?.instantChatEnabled;
+    const next = !(config && isInstantChatSwitchedOn(config));
     // 开了又关是这条路上最值钱的信号：能开、开过、然后放弃了，跟「压根没开」不是一回事。
     trackEvent('切换即时对话', { action: next ? '开' : '关' });
     patchConfig({ instantChatEnabled: next });
@@ -796,16 +1137,42 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
     return revealAndCopy(token, setGeneratedServerToken, 'AMSG_SERVER_TOKEN');
   };
 
-  if (!config) return null;
+  if (!config) {
+    return (
+      <Modal isOpen={isOpen} title="主动消息 2.0" onClose={onClose}>
+        <div className="space-y-3 text-sm text-slate-600">
+          <p role={configLoadError ? 'alert' : 'status'}>
+            {configLoadError || '正在读取本地配置…'}
+          </p>
+          {configLoadError ? (
+            <button
+              type="button"
+              onClick={() => void refresh().catch(() => {})}
+              className="w-full py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform"
+            >
+              重试读取配置
+            </button>
+          ) : null}
+        </div>
+      </Modal>
+    );
+  }
 
   const isConnected = Boolean(config.initializedAt);
+  const instantChatOn = isInstantChatSwitchedOn(config);
 
   // 体检：探测结果 + 「这台设备订阅了没」这个只有前端知道的事实，红绿灯判定全在
   // amsgDiagnostics 那份纯函数里（那边有回归测试钉着）。
-  const diagnosticRows = diagnosticsProbe
+  const diagnosticRows = diagnosticsProbe && pushStatus
     ? buildAmsgDiagnosticRows({
       probe: diagnosticsProbe,
       localPushSubscribed: Boolean(pushStatus?.hasSubscription),
+      pushMode: config.pushMode,
+      // 跟任务卡片同一种写法：cron 一分钟一跳，秒位没有意义。
+      formatTime: (atMs) => formatTaskTime(atMs),
+      tickReport: tickReportResult,
+      // 用户自己暂停了后台任务的话，任务攒着是意料之中，那一行不能报成触发器坏了。
+      cronPaused: cronState?.kind === 'known' && !cronState.enabled,
     })
     : [];
   const diagnosticLevel = diagnosticRows.length ? summarizeAmsgDiagnostics(diagnosticRows) : 'unknown';
@@ -814,29 +1181,21 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
     connected: isConnected,
     pushSubscribed: Boolean(pushStatus?.hasSubscription),
     workerSupportsInstantChat: instantChatSupported,
-    instantPushOn: instantOn,
   });
-  const instantChatBlockedReason = instantChatBlocker ? INSTANT_CHAT_BLOCKER_HINTS[instantChatBlocker] : '';
+  const instantChatBlockedReason = isConnected && checkingPush
+    ? '正在检查推送状态…'
+    : isConnected && pushCheckError
+      ? '暂时无法确认推送状态，请先重试推送检查。'
+      : instantChatBlocker ? INSTANT_CHAT_BLOCKER_HINTS[instantChatBlocker] : '';
 
-  return (
-    <Modal
-      isOpen={isOpen}
-      title="主动消息 2.0"
-      onClose={onClose}
-      footer={(
-        <button
-          onClick={onClose}
-          className="flex-1 py-3 bg-slate-100 text-slate-500 font-bold rounded-2xl active:scale-95 transition-transform"
-        >
-          关闭
-        </button>
-      )}
-    >
-      <div className="space-y-4 text-sm text-slate-600">
-        {/* 体检。主动消息坏掉的那几种方式在界面上全是隐形的：D1 没绑、表结构是旧的、
-            VAPID 没配、云端没登记收件设备——任务照建、面板照常，就是一条都不发。
-            Worker 的 /debug 一直算得出这些，这里只是把它摆到看得见的地方。 */}
-        {config.workerUrl?.trim() ? (
+  // ── 各块的内容 ──────────────────────────────────────────────────────────────
+  // 引导和面板摆的是同一份内容，只是外面的壳不同：引导一屏只做一件事，面板一块只占一行、
+  // 平时收着。取舍见 docs/amsg2-settings-guide.md。
+
+  /* 体检。主动消息坏掉的那几种方式在界面上全是隐形的：D1 没绑、表结构是旧的、
+     VAPID 没配、云端没登记收件设备——任务照建、面板照常，就是一条都不发。
+     Worker 的 /debug 一直算得出这些，这里只是把它摆到看得见的地方。 */
+  const diagnosticsCard = config.workerUrl?.trim() ? (
           <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
             {/* 收着时那句「都正常 / 有问题」就是全部结论，逐项细节点开再看。 */}
             <div className="flex items-center justify-between gap-3">
@@ -884,39 +1243,41 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
                           {row.detail}
                         </p>
                       )}
+                      {/* 逐条细目（比如每条到点没发的任务现在算哪种情况）。报错原文默认收着：
+                          多半很长，摊开会把整块体检撑满，但排查时又必须看得到原话。 */}
+                      {row.level === 'ok' || !row.items?.length ? null : (
+                        <div className="mt-1.5 pl-3.5 space-y-1.5">
+                          {row.items.map((item, index) => (
+                            <div key={index} className="border-l-2 border-slate-100 pl-2 text-[11px] leading-relaxed text-slate-500">
+                              <p className="whitespace-pre-line">{item.text}</p>
+                              {item.raw ? (
+                                <details className="mt-0.5">
+                                  <summary className="cursor-pointer text-[10px] font-bold text-slate-400">原文</summary>
+                                  <pre className="mt-1 whitespace-pre-wrap break-all font-mono text-[10px] leading-relaxed text-slate-500 bg-slate-50 rounded-lg p-2 select-text">
+                                    {item.raw}
+                                  </pre>
+                                </details>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
               </div>
             ) : (
               <p className="text-xs leading-relaxed text-slate-400">
-                {diagnosing ? '正在问 Worker…' : '还没有结果，点右上角检查一次。'}
+                {checkingPush ? '正在检查这台设备的推送状态…'
+                  : pushCheckError ? '推送状态暂时无法确认，请先重试推送检查。'
+                  : diagnosing ? '正在问 Worker…' : '还没有结果，点右上角检查一次。'}
               </p>
             )}
           </div>
-        ) : null}
+  ) : null;
 
-        {/* 正常情况下两道双向门会拦住「两个都开」，能走到这儿全是脏配置遗留。
-            脏配置照样会让聊天悄悄走 Instant，2.0 挂在本地那条路上的东西全静默失效——
-            没有报错也没有提示，只会表现成「这功能怎么不响」，这张卡就是收拾它的入口。 */}
-        {instantOn ? (
-          <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 space-y-2">
-            <div className="font-bold text-amber-900 text-sm">Instant Push 也开着</div>
-            <p className="text-xs leading-relaxed text-amber-800">
-              检测到 Instant Push 还开着。即时对话已经覆盖了它的能力（发完就自由、云端跑工具、断网补收），两条路只能留一条。点下面把 Instant Push 关掉，聊天就交给 2.0。
-            </p>
-            <button
-              type="button"
-              onClick={disableInstantPush}
-              className="w-full py-2.5 bg-amber-500 text-white text-xs font-bold rounded-xl active:scale-95 transition-transform"
-            >
-              关掉 Instant Push（保留它的配置）
-            </button>
-          </div>
-        ) : null}
-
-        {/* 已经填了 Worker 地址就说明后端装好了，这张卡收起来；重装走「清掉地址再回来」这条路。 */}
-        {config.workerUrl?.trim() ? null : (
+  // 已经填了 Worker 地址就说明后端装好了，这张卡收起来；重装走「清掉地址再回来」这条路。
+  const deployCard = config.workerUrl?.trim() ? null : (
         <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
           <div className="flex items-center justify-between gap-2">
             <span className="font-bold text-slate-700">一键部署（推荐）</span>
@@ -1005,97 +1366,61 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
             <p className="text-[11px] leading-relaxed text-rose-600 whitespace-pre-line">{provisionError}</p>
           ) : null}
 
-          <p className="text-[10px] leading-relaxed text-slate-400">
-            浏览器不能直接调 Cloudflare 的接口（它不给跨域），所以这枚 Token 会经过本站的
-            网络代理 Worker 转发一次。部署完它会作为密钥存进<strong>你自己的</strong> Worker，
-            以后「更新后端」用的就是它；本页不保存。介意的话可以照下面的手动方式装。
-          </p>
-        </div>
-        )}
+          {staleDatabase ? (
+            <button
+              type="button"
+              disabled={provisioning || !cfToken.trim()}
+              onClick={() => {
+                if (!confirm('旧数据库里的数据会全部清掉（已排的主动消息、云端保存的角色状态和凭据），清了找不回来。\n\n确定清空并继续部署吗？')) return;
+                void handleOneClickDeploy(staleDatabase.accountId, true);
+              }}
+              className="w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-rose-300 text-rose-600 active:scale-95 transition-transform disabled:opacity-50"
+            >
+              清空旧数据并继续部署
+            </button>
+          ) : null}
 
-        <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
+          <p className="text-[10px] leading-relaxed text-slate-400">
+            Token 会经本站中转一次，部署完存进<strong>你自己的</strong> Worker，以后更新后端也用它；
+            本页不保存。介意的话可以手动配置。
+          </p>
+
+          {/* 手动配置只给明确选了这条路的人看：入口做成一行浅色小字，平时所有人都走上面的一键部署。 */}
           <button
             type="button"
-            onClick={() => setDeployOpen((prev) => {
-              // 只在展开时记一笔：收起也记的话同一个人会被数两次，漏斗第一格直接虚高一倍。
-              if (!prev) trackEvent('展开 2.0 部署指引', { mode: '主流程' });
+            onClick={() => setManualSetupOpen((prev) => {
+              // 只在展开时记一笔：收起也记的话同一个人会被数两次。
+              if (!prev) trackEvent('展开 2.0 部署指引', { mode: '手动配置' });
               return !prev;
             })}
-            className="w-full flex items-center justify-between text-left"
+            className="w-full flex items-center justify-between text-left text-[11px] font-bold text-slate-400"
           >
-            <span className="font-bold text-slate-700">手动部署 Worker（想自己一步步来）</span>
-            <span className="text-xs font-bold text-slate-400">{deployOpen ? '收起' : '展开'}</span>
+            <span>我要手动配置</span>
+            <span>{manualSetupOpen ? '收起' : '展开'}</span>
           </button>
 
-          {deployOpen ? (
-            <div className="space-y-3">
-              <p className="text-xs leading-relaxed text-slate-500">
-                全程在网页上点，不用装东西也不用敲命令，大约 15 分钟。第一次做建议直接照着
-                <strong>图文教程</strong>走，下面是简版。
+          {manualSetupOpen ? (
+            <div className="space-y-2.5">
+              <p className="text-[11px] leading-relaxed text-slate-500">
+                手动配置要自己在 Cloudflare 后台建数据库和 Worker、填密钥，步骤比较多，照着教程一步步来。
+                下面是教程里要用到的几样东西。
               </p>
-
-              <ol className="text-xs leading-relaxed text-slate-500 space-y-1.5 list-decimal list-outside pl-4">
-                <li>
-                  Fork 后端仓库 <code className="font-mono">sullyos-workers</code>
-                  （页面右上角 Fork → Create fork）。
-                </li>
-                <li>
-                  CF 后台 Storage &amp; databases → <strong>D1 SQLite Database</strong> 建一个库，
-                  把它的 <strong>Database ID</strong> 复制下来。表不用建，下面点「连接」时会自动建好。
-                </li>
-                <li>
-                  CF 后台 Workers &amp; Pages → <strong>Create application</strong> →
-                  <strong> Continue with GitHub</strong>，选中你 fork 的仓库，然后填：
-                  <ul className="mt-1 space-y-0.5 list-disc list-outside pl-4">
-                    <li>Build command：<code className="font-mono">sh ./deploy-prepare.sh</code></li>
-                    <li>Advanced settings → Path：<code className="font-mono">/amsg</code></li>
-                    <li>
-                      Advanced settings 里加一个构建变量
-                      <code className="font-mono"> D1_DATABASE_ID </code>
-                      = 上一步的 Database ID（<strong>别点 Encrypt</strong>，构建时要读它）
-                    </li>
-                  </ul>
-                </li>
-                <li>部署完在 Settings → Variables and secrets 按下面的清单填密钥，再 Deploy 一次。</li>
-              </ol>
-
-              <p className="text-[11px] leading-relaxed text-slate-400">
-                D1 绑定和「每分钟检查一次」的定时触发器都写在仓库里，会自动带上，不用手动加。
-                以后想更新，回你 fork 的仓库点一下 <strong>Sync fork</strong> 就行，CF 会自动重新部署。
-              </p>
-
-              <div className="grid grid-cols-3 gap-2">
-                {/* 三个出口合成一个事件带 target 枚举：它们是部署流程同一步的三条岔路，
-                    拆成三个事件名只是多占清单行数，看漏斗时还得自己加回去。 */}
-                <a
-                  href={WORKERS_REPO_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  onClick={() => trackEvent('打开 2.0 部署外链', { target: 'fork仓库' })}
-                  className="py-2.5 rounded-xl text-xs font-bold bg-violet-500 text-white text-center active:scale-95 transition-transform"
-                >
-                  ↗ Fork 仓库
-                </a>
-                <a
-                  href={SETUP_WALKTHROUGH_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  onClick={() => trackEvent('打开 2.0 部署外链', { target: '图文教程' })}
-                  className="py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 text-center active:scale-95 transition-transform"
-                >
-                  ↗ 图文教程
-                </a>
-                <a
-                  href={buildCloudflareDashboardUrl(config.workerUrl.trim() || undefined)}
-                  target="_blank"
-                  rel="noreferrer"
-                  onClick={() => trackEvent('打开 2.0 部署外链', { target: 'CF面板' })}
-                  className="py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 text-center active:scale-95 transition-transform"
-                >
-                  ↗ CF 面板
-                </a>
-              </div>
-
+              <a
+                href={MANUAL_SETUP_TUTORIAL_URL}
+                target="_blank"
+                rel="noreferrer"
+                onClick={() => trackEvent('打开 2.0 部署外链', { target: '手动配置教程' })}
+                className="block w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 text-center active:scale-95 transition-transform"
+              >
+                ↗ 手动配置教程（Discord）
+              </a>
+              <button
+                type="button"
+                onClick={() => void handleCopyWorkerBundle()}
+                className="w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
+              >
+                复制 Worker 代码
+              </button>
               <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3 space-y-2.5 text-xs">
                 <p className="font-bold text-slate-700">环境变量清单</p>
 
@@ -1136,7 +1461,7 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
                     ) : null}
                   </div>
                   <p className="text-[11px] text-slate-400">
-                    必须和「推送凭据 (VAPID)」面板里的是<strong>同一对</strong>（和 Instant Push 共用）——
+                    必须和「推送凭据 (VAPID)」面板里的是<strong>同一对</strong>——
                     整个站点只有一个浏览器推送订阅，Worker 用别的密钥对签推送会 403。
                   </p>
                 </div>
@@ -1144,75 +1469,75 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
                 <div className="space-y-1">
                   <code className="font-mono text-[11px] text-slate-600">AMSG_SERVER_TOKEN（可选）</code>
                   <p className="text-[11px] text-slate-400">
-                    防止别人滥用你的 Worker。值 = 下面「共享密钥」填的那串，两边一致即可；不配则端点全开。
+                    防止别人滥用你的 Worker。值 = 下面「共享密钥」（点「展开」才出现）填的那串，两边一致即可；不配则端点全开。
                   </p>
                 </div>
-              </div>
-
-              <div className="border-t border-slate-100 pt-2.5">
-                <button
-                  type="button"
-                  onClick={() => setPasteFallbackOpen((prev) => {
-                    if (!prev) trackEvent('展开 2.0 部署指引', { mode: '手动粘贴' });
-                    return !prev;
-                  })}
-                  className="w-full flex items-center justify-between text-left text-[11px] font-bold text-slate-400"
-                >
-                  <span>没有 GitHub 账号？手动粘贴部署</span>
-                  <span>{pasteFallbackOpen ? '收起' : '展开'}</span>
-                </button>
-
-                {pasteFallbackOpen ? (
-                  <div className="mt-2 space-y-2">
-                    <ol className="text-[11px] leading-relaxed text-slate-500 space-y-1.5 list-decimal list-outside pl-4">
-                      <li>
-                        点下面「复制 Worker 代码」，CF 后台 Create → Worker 建一个空 Worker，
-                        进 <strong>Edit code</strong> 全选粘贴覆盖，Deploy。
-                      </li>
-                      <li>
-                        Settings → Bindings 加一个 <strong>D1 database</strong>，
-                        变量名必须是 <code className="font-mono">DB</code>。
-                      </li>
-                      <li>
-                        Settings → Trigger Events 加 <strong>Cron Trigger</strong>：
-                        <code className="font-mono"> * * * * * </code>（每分钟检查一次到点任务）。
-                      </li>
-                      <li>Settings → Variables and secrets 按上面的清单填密钥，然后重新 Deploy 一次。</li>
-                    </ol>
-
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyWorkerBundle()}
-                      className="w-full py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
-                    >
-                      复制 Worker 代码
-                    </button>
-
-                    <p className="text-[11px] leading-relaxed text-slate-400">
-                      这条路每次 Worker 更新都要重新粘一遍，D1 绑定和定时触发器也得自己加，容易漏。
-                      能用 GitHub 的话还是走上面的 fork 流程。
-                    </p>
-                  </div>
-                ) : null}
               </div>
             </div>
           ) : null}
         </div>
+  );
 
-        <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
-          <div className="flex items-center justify-between gap-3">
-            <span className="font-bold text-slate-700">当前状态</span>
-            <span className={`text-xs font-bold ${isConnected ? 'text-emerald-600' : 'text-amber-600'}`}>
-              {isConnected ? '已连接' : '未连接'}
+  // 数据边界放在打开时的确认弹窗里（relayConfirmDialog），这里只留一句用途
+  const relayToggle = (
+    <div className="bg-white/70 border border-slate-200 rounded-2xl px-4 py-3 space-y-3">
+      <label className="flex items-start gap-3">
+        <input
+          type="checkbox"
+          checked={relayAllowed && !!config.useRelay}
+          disabled={!relayAllowed}
+          onChange={(event) => handleToggleRelay(event.target.checked)}
+          className="mt-0.5 shrink-0 disabled:opacity-40"
+        />
+        <span className="space-y-1">
+          <span className="block text-xs font-bold text-slate-700">大陆连接优化</span>
+          <span className="block text-[11px] leading-relaxed text-slate-400">
+            大陆网络连不上 Worker 时打开，请求经维护者的中转服务器转给你的 Worker。
+          </span>
+          {relayDeployment === 'other' ? (
+            <span className="block text-[11px] leading-relaxed text-amber-600">
+              为防止二改中修改过的主动消息逻辑产生未经认证的流量（可能会被判定为滥用），非官方版本不能使用官方中转。
             </span>
-          </div>
+          ) : null}
+          {relayAllowed && config.useRelay && config.workerUrl?.trim() && !canRelayWorkerUrl(config.workerUrl) ? (
+            <span className="block text-[11px] leading-relaxed text-amber-600">
+              中转只支持 https 域名地址，不能是 IP，也不能带端口或路径。现在这个地址会直接连。
+            </span>
+          ) : null}
+        </span>
+      </label>
+      {relayAllowed && config.useRelay ? (
+        <label className="block space-y-1.5">
+          <span className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-1">中转令牌</span>
+          <input
+            type="password"
+            value={config.relayToken || ''}
+            onChange={(event) => void saveRelayToken(event.target.value)}
+            placeholder="在 SullyOS 的 Discord 群里发 /中转令牌 领取"
+            className="w-full bg-white border border-slate-200 rounded-2xl px-4 py-3 text-xs font-mono"
+          />
+          {!isRelayTokenWellFormed(config.relayToken) ? (
+            <span className="block text-[11px] leading-relaxed text-amber-600 pl-1">填好令牌后才会走中转，现在仍是直连</span>
+          ) : relayUsage?.kind === 'ok' ? (
+            <span className="block text-[11px] leading-relaxed text-slate-500 pl-1">
+              近 30 天：上传 {formatBytes(relayUsage.last30.up) || '0 B'} · 下载 {formatBytes(relayUsage.last30.down) || '0 B'} · {relayUsage.last30.requests} 次请求
+            </span>
+          ) : relayUsage?.kind === 'invalid-token' ? (
+            <span className="block text-[11px] leading-relaxed text-amber-600 pl-1">令牌无效或已过期，请在群里重新发 /中转令牌</span>
+          ) : relayUsage?.kind === 'error' ? (
+            <span className="block text-[11px] leading-relaxed text-slate-400 pl-1">暂时查不到用量</span>
+          ) : null}
+        </label>
+      ) : null}
+    </div>
+  );
 
+  const workerBody = (
+    <>
           {workerOutdated ? (
             <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs leading-relaxed text-amber-700">
               Worker 上跑的还是旧版代码，缺少新特性（大上下文云端存储、服务端工具循环等）。
-              回你 fork 的 <code className="font-mono">sullyos-workers</code> 仓库点一下
-              <strong> Sync fork</strong>，CF 会自动重新部署（当初是手动粘贴部署的话，
-              去下方「部署 Worker」里重新复制一次代码粘贴覆盖）。已有数据和任务不受影响。
+              点下方的<strong>「更新 Worker」</strong>就能换上新版，已有数据和任务不受影响。
             </div>
           ) : null}
 
@@ -1227,95 +1552,60 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
               placeholder="https://amsg.你的账号.workers.dev"
               className="w-full bg-white/70 border border-slate-200 rounded-2xl px-4 py-3 text-xs font-mono"
             />
-
-            <div className="mt-2">
-              <button
-                type="button"
-                onClick={() => setDenoProxyOpen((prev) => {
-                  if (!prev) trackEvent('展开 2.0 部署指引', { mode: 'Deno 代理' });
-                  return !prev;
-                })}
-                className="w-full flex items-center justify-between text-left text-[11px] font-bold text-slate-400"
-              >
-                <span>这个地址连不上？在外面套一层 Deno</span>
-                <span>{denoProxyOpen ? '收起' : '展开'}</span>
-              </button>
-
-              {denoProxyOpen ? (
-                <div className="mt-2 space-y-2">
-                  <p className="text-[11px] leading-relaxed text-slate-500">
-                    <code className="font-mono">workers.dev</code> 这个域名在国内连不上。
-                    办法是给它套一个门面：Worker 和数据全都留在 Cloudflare 不动，
-                    只在外面加一层只管转发的 Deno，然后把地址换成 Deno 那个。
-                  </p>
-
-                  <ol className="text-[11px] leading-relaxed text-slate-500 space-y-1.5 list-decimal list-outside pl-4">
-                    <li>
-                      去 Deno 控制台点右上角 <strong>New Playground</strong>。
-                    </li>
-                    <li>
-                      点下面「复制 Deno 代理代码」，在 Playground 里全选粘贴覆盖，
-                      把开头 <code className="font-mono">UPSTREAM</code> 那一行改成你上面填的
-                      Cloudflare 地址，然后 Deploy。
-                    </li>
-                    <li>
-                      把 Deploy 后拿到的 <code className="font-mono">https://xxx.deno.net</code> 地址
-                      填回上面的输入框，替换掉原来那个。
-                    </li>
-                  </ol>
-
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyDenoProxy()}
-                      className="flex-1 py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
-                    >
-                      复制 Deno 代理代码
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        trackEvent('打开 Deno 控制台');
-                        window.open('https://console.deno.com', '_blank');
-                      }}
-                      className="shrink-0 px-3 py-2.5 rounded-xl text-xs font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
-                    >
-                      去 Deno
-                    </button>
-                  </div>
-
-                  <p className="text-[11px] leading-relaxed text-slate-400">
-                    收消息不走这一层——推送是 Cloudflare 直接发给手机的，
-                    所以这层就算挂了也只影响你打开这个面板改配置。
-                    部署好后打开 <code className="font-mono">/__proxy-health</code> 能看它活着没。
-                  </p>
-                </div>
-              ) : null}
-            </div>
+            <a
+              href={DIRECT_CONNECT_TUTORIAL_URL}
+              target="_blank"
+              rel="noreferrer"
+              onClick={() => trackEvent('打开 2.0 部署外链', { target: '直连教程' })}
+              className="mt-2 flex items-center justify-between text-[11px] font-bold text-slate-400"
+            >
+              <span>这个地址连不上？看直连教程</span>
+              <span>↗</span>
+            </a>
           </div>
 
-          <div>
-            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 block pl-1">
-              共享密钥（可选）
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="password"
-                value={config.serverToken || ''}
-                onChange={(event) => patchConfig({ serverToken: event.target.value })}
-                placeholder="worker 配了 AMSG_SERVER_TOKEN 才需要填"
-                className="flex-1 bg-white/70 border border-slate-200 rounded-2xl px-4 py-3 text-sm"
-              />
-              <button
-                type="button"
-                onClick={() => void handleGenerateServerToken()}
-                className="shrink-0 px-3 py-3 text-xs rounded-2xl font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
-              >
-                随机
-              </button>
-            </div>
-            {generatedServerToken ? (
-              <SecretReveal value={generatedServerToken} className="mt-1.5" />
+          {relayToggle}
+
+          {/*
+            共享密钥默认收着：一键部署会自己生成并填好，跟 Worker 上的 AMSG_SERVER_TOKEN 是同一串。
+            这里一改（尤其是误点「随机」）两边就对不上，之后每个请求都 401。只有手动配置或
+            从别的设备搬过来的人才需要动它，所以入口做成一行浅色小字，点开才有输入框。
+          */}
+          <div className="space-y-2">
+            <button
+              type="button"
+              aria-expanded={serverTokenOpen}
+              onClick={() => setServerTokenOpen((prev) => !prev)}
+              className="w-full flex items-center justify-between text-left text-[11px] font-bold text-slate-400 pl-1"
+            >
+              <span>共享密钥 · {config.serverToken ? '已填好' : '未填'}</span>
+              <span>{serverTokenOpen ? '收起' : '展开'}</span>
+            </button>
+            {serverTokenOpen ? (
+              <>
+                <p className="text-[11px] leading-relaxed text-slate-400 pl-1">
+                  一键部署已经自动填好，不用动。改了的话要和 Worker 上的 AMSG_SERVER_TOKEN 保持一致，否则会连不上。
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    type="password"
+                    value={config.serverToken || ''}
+                    onChange={(event) => patchConfig({ serverToken: event.target.value })}
+                    placeholder="worker 配了 AMSG_SERVER_TOKEN 才需要填"
+                    className="flex-1 bg-white/70 border border-slate-200 rounded-2xl px-4 py-3 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateServerToken()}
+                    className="shrink-0 px-3 py-3 text-xs rounded-2xl font-bold bg-white border border-slate-200 text-slate-600 active:scale-95 transition-transform"
+                  >
+                    随机
+                  </button>
+                </div>
+                {generatedServerToken ? (
+                  <SecretReveal value={generatedServerToken} className="mt-1.5" />
+                ) : null}
+              </>
             ) : null}
           </div>
 
@@ -1334,10 +1624,6 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
               ? provisionStep || '部署中…'
               : loading ? '处理中...' : isConnected ? '重新连接并验证' : '连接并启用'}
           </button>
-
-          <p className="text-xs leading-relaxed text-slate-500">
-            「连接」会自动在你的 D1 里把表建好（幂等，重复点没关系），不用手动执行 SQL。
-          </p>
 
           {isConnected ? (
             <div className="pt-1 space-y-2 border-t border-slate-200">
@@ -1367,14 +1653,31 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
                   {workerVersion.deployed ? <code className="font-mono"> {workerVersion.deployed} </code> : '更早的版本'}
                   ，更新后即时对话才走得上新的生成通道。
                 </p>
+              ) : workerVersion?.state === 'ahead' ? (
+                <p className="text-xs leading-relaxed text-emerald-700">
+                  后端已经是更新的
+                  <code className="font-mono"> {workerVersion.deployed} </code>
+                  ，这个页面还是旧版（<code className="font-mono">{workerVersion.expected}</code>），刷新页面就能用上新版 App。
+                </p>
               ) : workerVersion?.state === 'current' ? (
                 <p className="text-xs leading-relaxed text-slate-500">
                   后端已经是最新版（<code className="font-mono">{workerVersion.expected}</code>）。
                 </p>
               ) : null}
+              {/*
+                装了钥匙的（一键部署、或补过钥匙）后端会自己定期查新代码，这里报它的近况；
+                没钥匙的沿用原来那段说明。文案出自 describeAmsgSelfUpdate，跟 worker 记的状态同源。
+              */}
+              {autoUpdateText ? (
+                <p className={`text-xs leading-relaxed ${workerVersion?.autoUpdate?.state?.lastOutcome === 'failed' ? 'text-amber-700' : 'text-slate-500'}`}>
+                  {autoUpdateText}
+                </p>
+              ) : null}
               <p className="text-xs leading-relaxed text-slate-500">
                 后端自己去取最新代码覆盖自己，你排好的任务和填过的密钥都不动，更新完会自动验证一次。
-                用一键部署装的可以直接点；老办法装的第一次点会提示补一把钥匙，就在下面补。
+                {autoUpdateText
+                  ? '平时不用管，想立刻更新就点上面这颗。'
+                  : '用一键部署装的可以直接点，装完以后后端还会自己定期更新；老办法装的第一次点会提示补一把钥匙，就在下面补，补完同样自动更新。'}
               </p>
               {selfUpdateHash ? (
                 <p className="text-xs leading-relaxed text-emerald-600">
@@ -1382,12 +1685,36 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
                 </p>
               ) : null}
 
+              {/* 暂停 / 恢复后台任务：摘掉或加回 Worker 的 cron trigger。旧版 Worker 没这个端点时整块不显示。 */}
+              {cronState ? (
+                <>
+                  <button
+                    onClick={handleCronTriggerClick}
+                    disabled={loading}
+                    className={`w-full py-2.5 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 ${
+                      cronState.kind === 'known' && !cronState.enabled
+                        ? 'bg-amber-500 text-white border border-amber-500'
+                        : 'bg-white border border-slate-300 text-slate-700'
+                    }`}
+                  >
+                    {loading
+                      ? '处理中...'
+                      : cronState.kind === 'known' && !cronState.enabled
+                        ? '恢复后台任务'
+                        : '暂停后台任务'}
+                  </button>
+                  <p className="text-xs leading-relaxed text-slate-500">
+                    暂停会摘掉 Worker 的定时触发，到点的主动消息和定时消息先攒在云端，不会丢；恢复后一起补发。
+                  </p>
+                </>
+              ) : null}
+
               {attachOpen ? (
                 <div className="bg-slate-50 border border-slate-200 rounded-2xl p-3 space-y-2.5">
                   <p className="text-[11px] font-bold text-slate-600">给这台后端补一把更新用的钥匙</p>
                   <p className="text-[11px] leading-relaxed text-slate-500">
                     建一枚只勾 <strong>Account → Workers Scripts : Edit</strong> 的 Cloudflare API Token
-                    粘进来（<strong>Start Date 留空</strong>），SullyOS 会把它写进你这台 Worker。
+                    粘进来（<strong>Start Date 留空</strong>），SullyOS·糯米机 会把它写进你这台 Worker。
                     做完一次以后更新就都是点上面那个按钮了。
                   </p>
                   <a
@@ -1457,110 +1784,273 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
               ) : null}
             </div>
           ) : null}
-        </div>
+    </>
+  );
 
-        <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
-          <div className="flex items-center justify-between gap-3">
-            <span className="font-bold text-slate-700">
-              {pushStatus?.transport === 'unified-push' ? 'UnifiedPush 通知' : '通知权限'}
-            </span>
-            <span className={`text-xs font-bold ${pushStatus?.hasSubscription ? 'text-emerald-600' : 'text-amber-600'}`}>
-              {pushStatus?.hasSubscription ? '已开启' : '未开启'}
-            </span>
-          </div>
-          <p className="text-xs leading-relaxed text-slate-500">
-            这是第二步。只有你真的想让角色在后台主动推送消息时，才需要点。
-          </p>
-          {pushStatus?.transport === 'unified-push' ? (
-            <p className="text-xs leading-relaxed text-slate-500">
-              Android App 通过开放的 UnifiedPush 收消息，不依赖 Firebase 或 Google 服务。
-              ntfy 只负责在后台唤醒本 App，AMSG Worker 仍是你自己部署的那一台。
-            </p>
-          ) : (
-            <p className="text-xs leading-relaxed text-slate-500">
-              推送跟着「排程时所在的设备」走：每条任务到点后，推给保存这条排程时用的那台设备。
-              换了设备（或者换了浏览器）之后，在新设备上把排程重新保存一次，之后的推送就发到这台。
-            </p>
-          )}
-          {pushStatus?.needsDistributor ? (
-            <a
-              href="https://docs.ntfy.sh/subscribe/phone/"
-              target="_blank"
-              rel="noreferrer"
-              className="block text-xs font-bold text-violet-600 underline"
+  const pushTitle = config.pushMode === 'third-party'
+    ? '第三方推送 App'
+    : pushStatus?.transport === 'unified-push' ? 'UnifiedPush 通知' : '通知与推送通道';
+  const pushStatusText = checkingPush ? '检查中…' : pushCheckError ? '暂时无法检查' : pushStatus?.hasSubscription ? '已开启' : '未开启';
+  const pushStatusClass = checkingPush ? 'text-slate-400' : pushStatus?.hasSubscription ? 'text-emerald-600' : 'text-amber-600';
+  const pushBody = (
+    <>
+          <div className="grid grid-cols-2 gap-1.5 bg-slate-200/70 p-1 rounded-xl">
+            <button
+              type="button"
+              onClick={() => void handleSwitchPushMode('web-push')}
+              className={`py-2 px-2.5 rounded-lg text-xs font-bold transition-colors ${
+                config.pushMode !== 'third-party'
+                  ? 'bg-white text-slate-800 shadow-sm'
+                  : 'text-slate-500'
+              }`}
             >
-              安装并打开 ntfy（选择无 Firebase 版本）
-            </a>
-          ) : null}
-          {pushStatus?.detail ? (
-            <p className="text-xs leading-relaxed text-amber-600">{pushStatus.detail}</p>
-          ) : null}
-          <button
-            onClick={handleCreateSubscription}
-            disabled={loading}
-            className="w-full py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50"
-          >
-            {loading ? '处理中...' : pushStatus?.transport === 'unified-push' ? '连接 ntfy 并开启通知' : '开启通知与推送'}
-          </button>
-        </div>
-
-        {/* 即时对话：聊天本身也交给云端跑。四道门缺一不可，缺哪道就把哪道写出来——
-            置灰而不说原因的话，用户只会反复点它。 */}
-        <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
-          <div className="flex items-center justify-between gap-3">
-            <span className="font-bold text-slate-700">即时对话</span>
-            {/* 开着但有门没过时不能只写「已开启」——那几道门是真的会让这一轮走本地生成的，
-                标成绿色的「已开启」就是在骗人：用户以为聊天在云端跑，实际一直在本地。 */}
-            <span className={`text-xs font-bold ${
-              !config.instantChatEnabled ? 'text-slate-400'
-                : instantChatBlockedReason ? 'text-amber-600' : 'text-emerald-600'
-            }`}>
-              {!config.instantChatEnabled ? '未开启'
-                : instantChatBlockedReason ? '已开启 · 暂不生效' : '已开启'}
-            </span>
+              {pushStatus?.transport === 'unified-push' ? '系统 / ntfy 推送' : '网页 / 系统原生推送'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleSwitchPushMode('third-party')}
+              className={`py-2 px-2.5 rounded-lg text-xs font-bold transition-colors ${
+                config.pushMode === 'third-party'
+                  ? 'bg-white text-violet-700 shadow-sm'
+                  : 'text-slate-500'
+              }`}
+            >
+              第三方推送 App
+            </button>
           </div>
-          <p className="text-xs leading-relaxed text-slate-500">
-            开了以后，你发出的每一条消息都由这台 Worker 去生成回复，回复走推送回来。
-            发完就能切后台、关掉应用，回来时消息已经在那儿了。关掉则回到本地直连生成。
-          </p>
-          {instantChatBlockedReason ? (
-            <p className="text-xs leading-relaxed text-amber-600">{instantChatBlockedReason}</p>
+
+          {config.pushMode === 'third-party' ? (
+            (() => {
+              const tp = config.thirdPartyPush || { provider: 'wxpusher' as const, token: '' };
+              const providerMeta = getThirdPartyPushProviderMeta(tp.provider);
+              const liveValidation = validateThirdPartyPushConfig(tp);
+              const savedAndMatched = Boolean(
+                liveValidation.ok
+                && pushStatus?.hasSubscription
+                && pushStatus?.thirdPartyProvider === providerMeta.id,
+              );
+              const liveDetail = !liveValidation.ok
+                ? liveValidation.error
+                : !config.workerUrl?.trim()
+                  ? '请先填写 Worker 地址。'
+                  : savedAndMatched
+                    ? `第三方推送：${providerMeta.shortLabel}`
+                    : `已填写 ${providerMeta.shortLabel} 配置，请点击下方「保存并登记推送」生效。`;
+              return (
+                <div className="space-y-3">
+                  <p className="text-xs leading-relaxed text-slate-500">
+                    通过手机上的第三方推送 App 转发系统级通知，可绕过老版本 iOS 不支持网页推送（Web Push）的限制，
+                    也不受 Google 推送服务器在国内网络波动的影响。打开 SullyOS 时会自动从云端收件箱拉取完整角色消息。
+                  </p>
+
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block pl-1">
+                      选择推送平台
+                    </label>
+                    <div className="space-y-1.5">
+                      {THIRD_PARTY_PUSH_PROVIDERS.map((item) => {
+                        const selected = providerMeta.id === item.id;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => void handleSelectThirdPartyProvider(item.id as ThirdPartyPushProvider)}
+                            className={`w-full text-left px-3 py-2.5 rounded-xl border transition-colors flex items-center justify-between gap-2 ${
+                              selected
+                                ? 'bg-violet-50 border-violet-300 text-violet-900'
+                                : 'bg-white border-slate-200 text-slate-700'
+                            }`}
+                          >
+                            <span className="text-xs font-bold">{item.label}</span>
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ${
+                              selected ? 'bg-violet-200/70 text-violet-800' : 'bg-slate-100 text-slate-500'
+                            }`}>
+                              {item.badge}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] leading-relaxed text-slate-500 bg-white border border-slate-200 rounded-xl px-3 py-2.5">
+                    {providerMeta.helpText}
+                  </p>
+
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1 block pl-1">
+                      {providerMeta.tokenLabel}
+                    </label>
+                    <input
+                      type="text"
+                      value={tp.token || ''}
+                      onChange={(e) => patchConfig({
+                        pushMode: 'third-party',
+                        thirdPartyPush: {
+                          ...tp,
+                          provider: providerMeta.id,
+                          token: e.target.value,
+                        },
+                      })}
+                      placeholder={providerMeta.tokenPlaceholder}
+                      autoComplete="off"
+                      className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2.5 text-xs font-mono"
+                    />
+                  </div>
+
+                  {providerMeta.supportsCustomServer ? (
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1 block pl-1">
+                        自定义服务器地址（可选，留空用官方服务器）
+                      </label>
+                      <input
+                        type="text"
+                        value={tp.serverUrl || ''}
+                        onChange={(e) => patchConfig({
+                          pushMode: 'third-party',
+                          thirdPartyPush: {
+                            ...tp,
+                            provider: providerMeta.id,
+                            serverUrl: e.target.value,
+                          },
+                        })}
+                        placeholder={providerMeta.defaultServerOrigin || 'https://'}
+                        autoComplete="off"
+                        className="w-full bg-white border border-slate-200 rounded-xl px-3 py-2.5 text-xs font-mono"
+                      />
+                    </div>
+                  ) : null}
+
+                  {liveDetail ? (
+                    <p className={`text-xs leading-relaxed ${savedAndMatched ? 'text-emerald-600' : 'text-amber-600'}`}>
+                      {liveDetail}
+                    </p>
+                  ) : null}
+
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveThirdPartyPush()}
+                      disabled={loading}
+                      className="flex-1 py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 text-xs"
+                    >
+                      {loading ? '处理中...' : '保存并登记推送'}
+                    </button>
+                    {isConnected && pushStatus?.hasSubscription ? (
+                      <button
+                        type="button"
+                        onClick={() => void handleSendTestPush()}
+                        disabled={loading}
+                        className="shrink-0 px-3.5 py-3 bg-white border border-slate-300 text-slate-700 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 text-xs"
+                      >
+                        发送测试通知
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })()
           ) : (
-            <p className="text-[11px] leading-relaxed text-slate-400">
-              没有逐字吐出，生成期间显示「正在输入…」；云端明确报错才会提示重发，
-              只要还在生成或重试就一直等（LLM 慢不算失败）。
-            </p>
+            <>
+              {pushStatus?.transport === 'unified-push' ? (
+                <p className="text-xs leading-relaxed text-slate-500">
+                  Android App 通过开放的 UnifiedPush 收消息，不依赖 Firebase 或 Google 服务。
+                  ntfy 只负责在后台唤醒本 App，AMSG Worker 仍是你自己部署的那一台。你也可以切换到上方的「第三方推送 App」使用 WxPusher（推荐）。
+                </p>
+              ) : (
+                <p className="text-xs leading-relaxed text-slate-500">
+                  若你的 iOS 版本不支持网页推送，或受网络影响（如谷歌浏览器）收不到通知，可切换到上方的「第三方推送 App」。
+                  换了设备或浏览器，在新设备上点一次「开启通知与推送」，会覆盖原来的订阅，之后通知只发到新设备。
+                </p>
+              )}
+              {pushStatus?.needsDistributor ? (
+                <a
+                  href="https://docs.ntfy.sh/subscribe/phone/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block text-xs font-bold text-violet-600 underline"
+                >
+                  安装并打开 ntfy（选择无 Firebase 版本）
+                </a>
+              ) : null}
+              {pushStatus?.detail ? (
+                <p className="text-xs leading-relaxed text-amber-600">{pushStatus.detail}</p>
+              ) : null}
+              {pushCheckError ? (
+                <div role="alert" className="space-y-2 text-xs text-amber-600">
+                  <p>{pushCheckError}</p>
+                  <button type="button" onClick={() => void refreshPushStatus(config)} className="font-bold underline">
+                    重试推送检查
+                  </button>
+                </div>
+              ) : null}
+              <div className="flex gap-2">
+                <button
+                  onClick={handleCreateSubscription}
+                  disabled={loading}
+                  className="flex-1 py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50"
+                >
+                  {loading ? '处理中...' : pushStatus?.transport === 'unified-push' ? '连接 ntfy 并开启通知' : '开启通知与推送'}
+                </button>
+                {isConnected && pushStatus?.hasSubscription ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleSendTestPush()}
+                    disabled={loading}
+                    className="shrink-0 px-3.5 py-3 bg-white border border-slate-300 text-slate-700 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50 text-xs"
+                  >
+                    发送测试通知
+                  </button>
+                ) : null}
+              </div>
+            </>
           )}
-          <button
-            type="button"
-            onClick={() => void handleToggleInstantChat()}
-            disabled={loading || (!config.instantChatEnabled && !!instantChatBlockedReason)}
-            className={`w-full py-3 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-40 ${
-              config.instantChatEnabled ? 'bg-slate-200 text-slate-600' : 'bg-slate-900 text-white'
-            }`}
-          >
-            {config.instantChatEnabled ? '关闭即时对话' : '开启即时对话'}
-          </button>
+    </>
+  );
+
+  /* 即时对话：聊天本身也交给云端跑。几道门缺一不可，缺哪道就把哪道写出来——
+     置灰而不说原因的话，用户只会反复点它。
+     开着但有门没过时状态不能只写「已开启」——那几道门是真的会让这一轮走本地生成的，
+     标成绿色的「已开启」就是在骗人：用户以为聊天在云端跑，实际一直在本地。 */
+  const instantStatusText = !instantChatOn ? '未开启' : instantChatBlockedReason ? '已开启 · 暂不生效' : '已开启';
+  const instantStatusClass = !instantChatOn ? 'text-slate-400' : instantChatBlockedReason ? 'text-amber-600' : 'text-emerald-600';
+  const instantBody = (
+    <>
+      {/* 「即时」容易被读成「秒回、不走模型」，所以第一句先把这个误会拆掉，再讲开和关差在哪。 */}
+      <p className="text-xs leading-relaxed text-slate-500">
+        「即时」不是秒回。回复照样由你配的模型现写，要等多久、花多少 API 费用都和平时一样，变的只是<strong>在哪儿写</strong>。
+      </p>
+      <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-100 text-xs leading-relaxed text-slate-500">
+        <div className="px-3 py-2.5">
+          <p className="font-bold text-slate-600">关着</p>
+          <p>回复在这台设备的页面里写。写完之前页面得一直开着，切到后台、锁屏，或者 App 被杀后台，这条回复就断了。</p>
         </div>
-
-        <div className="bg-amber-50 border border-amber-100 rounded-2xl p-4 text-xs leading-relaxed text-amber-700 space-y-2">
-          <div className="font-bold text-amber-800">风险说明</div>
-          <p>开了 2.0 以后，主动消息内容、提示词、相关配置，都会进入你自己部署的 Worker 及其 D1 数据库。</p>
-          <p>这是你自己的 Worker、你自己的库，项目不会额外接一个中心服务器。但只要数据进库，能碰到这台 Worker / 数据库的人（也就是你自己）就能看到这些内容。</p>
-          <p>如果你不接受把私密提示词、API Key 放进自己部署的服务，就不要开 2.0。</p>
+        <div className="px-3 py-2.5">
+          <p className="font-bold text-violet-600">开着</p>
+          <p>回复在你的云端后端里写，写好了用通知送回来。发完消息就算把 App 杀后台也没关系，回来时消息已经在那儿了。</p>
         </div>
+      </div>
+      {instantChatBlockedReason ? (
+        <p className="text-xs leading-relaxed text-amber-600">{instantChatBlockedReason}</p>
+      ) : (
+        <p className="text-[11px] leading-relaxed text-slate-400">
+          开着时没有逐字吐出，生成期间显示「正在输入…」；云端明确报错才会提示重发，只要还在生成或重试就一直等（LLM 慢不算失败）。
+        </p>
+      )}
+      <button
+        type="button"
+        onClick={() => void handleToggleInstantChat()}
+        disabled={loading || (!instantChatOn && !!instantChatBlockedReason)}
+        className={`w-full py-3 font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-40 ${
+          instantChatOn ? 'bg-slate-200 text-slate-600' : 'bg-slate-900 text-white'
+        }`}
+      >
+        {instantChatOn ? '关闭即时对话' : '开启即时对话'}
+      </button>
+    </>
+  );
 
-        <div className="bg-white border border-slate-200 rounded-2xl p-4 space-y-3">
-          <button
-            type="button"
-            onClick={() => setAdvancedOpen((prev) => !prev)}
-            className="w-full flex items-center justify-between text-left"
-          >
-            <span className="font-bold text-slate-700">高级信息</span>
-            <span className="text-xs font-bold text-slate-400">{advancedOpen ? '收起' : '展开'}</span>
-          </button>
-
-          {advancedOpen ? (
+  const advancedBody = (
             <div className="space-y-3 text-xs">
               <div className="bg-violet-50 border border-violet-100 rounded-2xl p-3 space-y-2">
                 <div className="flex items-center justify-between gap-3">
@@ -1569,32 +2059,310 @@ const ActiveMsgGlobalSettingsModal: React.FC<ActiveMsgGlobalSettingsModalProps> 
                 </div>
               </div>
               <p className="text-[11px] leading-relaxed text-slate-500">
-                Worker 侧的环境变量清单见上面「部署 Worker」一节。发布的 Worker 代码默认 CORS 全开
+                发布的 Worker 代码默认 CORS 全开
                 （<code className="font-mono">origin: '*'</code>），想收紧就把它改成自己站点的域名再部署。
               </p>
-              <div className="bg-rose-50 border border-rose-100 rounded-2xl p-3 space-y-2">
-                <div className="font-semibold text-rose-700">清空云端数据</div>
-                <p className="text-[11px] leading-relaxed text-rose-600">
-                  把 Worker D1 里属于你的数据全部删掉：已排程的主动消息任务（含角色自己排的）、
-                  同步上去的角色上下文（角色卡、最近聊天窗口等）与工具凭据、推送订阅登记。
-                </p>
-                <p className="text-[11px] leading-relaxed text-rose-600">
-                  清完角色上下文下次聊天会自动传回去，工具凭据和推送订阅当场补登记，任务要自己重新排。
-                  换过 <code className="font-mono">AMSG_MASTER_KEY</code> 之后旧数据解不开，也从这里清干净。
-                </p>
-                <button
-                  onClick={() => void handleWipeCloudData()}
-                  disabled={loading}
-                  className="w-full py-2.5 bg-rose-500 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-50"
-                >
-                  {loading ? '处理中...' : '清空云端数据'}
-                </button>
-              </div>
+              {onOpenCloudData ? (
+                <div className="bg-white border border-slate-200 rounded-2xl p-3 space-y-2">
+                  <div className="font-semibold text-slate-700">云端数据</div>
+                  <p className="text-[11px] leading-relaxed text-slate-500">
+                    直接查看 Worker 保存的任务、上下文、凭据和结果，按实际范围清理。
+                    本机未关联的角色也会显示；其他设备可能还在使用。
+                  </p>
+                  <button
+                    onClick={onOpenCloudData}
+                    className="w-full py-2.5 bg-slate-100 text-slate-700 font-bold rounded-2xl active:scale-95 transition-transform"
+                  >
+                    云端数据管理
+                  </button>
+                </div>
+              ) : null}
+
             </div>
-          ) : null}
+  );
+
+  // ── 引导 ────────────────────────────────────────────────────────────────────
+
+  const cardClass = 'bg-white border border-slate-200 rounded-2xl p-4 space-y-3';
+  const mutedCardClass = 'bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3';
+  const cardHeader = (title: string, status: string, statusClass: string) => (
+    <div className="flex items-center justify-between gap-3">
+      <span className="font-bold text-slate-700">{title}</span>
+      <span className={`text-xs font-bold ${statusClass}`}>{status}</span>
+    </div>
+  );
+  const stepHeader = (title: string, desc: string) => (
+    <div className="space-y-2">
+      <div className="flex gap-1.5" aria-hidden="true">
+        {GUIDE_STEPS.map((name, index) => (
+          <span key={name} className={`h-1 flex-1 rounded-full ${index < guideStep ? 'bg-violet-500' : 'bg-slate-200'}`} />
+        ))}
+      </div>
+      <p className="text-[11px] font-bold text-violet-600">
+        第 {guideStep} 步，共 {GUIDE_STEPS.length} 步 · {GUIDE_STEPS[guideStep - 1]}
+      </p>
+      <h4 className="text-base font-bold text-slate-800">{title}</h4>
+      <p className="text-xs leading-relaxed text-slate-500">{desc}</p>
+    </div>
+  );
+
+  const guideContent = guideStep === 0 ? (
+    <>
+      <AmsgIntroDemo />
+      <h4 className="text-base font-bold text-slate-800 text-center">App 关着，TA 也能来找你</h4>
+      <p className="text-xs leading-relaxed text-slate-500">
+        平时角色只能在你开着页面的时候说话，App 一被杀后台就什么都收不到了。主动消息 2.0 给你装一个一直醒着的云端小后台：到了时间，它替角色把话写好，再用通知送到你手机上。
+      </p>
+      <ul className="bg-violet-50 border border-violet-100 rounded-2xl p-4 space-y-2 text-xs leading-relaxed text-slate-600">
+        <li><strong>TA 自己约时间来找你</strong>，你也可以替 TA 定好每天几点发。</li>
+        <li><strong>你很久没说话时</strong>，TA 的「离开后消息」能直接推到手机上。</li>
+        <li><strong>聊天也能交给云端</strong>：发完消息就算把 App 杀后台，回复写好了也会推给你。</li>
+      </ul>
+      {/* 数据会进用户自己的 Worker 这件事，要在动手装之前就说，不能等装完才在折叠区里看到。 */}
+      <div className="space-y-1.5 text-xs leading-relaxed text-slate-500">
+        <p><strong className="text-slate-700">要准备：</strong>一个 Cloudflare 账号（免费版就能用），两三分钟。</p>
+        <p>
+          <strong className="text-slate-700">要知道：</strong>消息内容、提示词和 API Key 会存进这个后台和它的数据库。后台装在你自己的账号里，项目没有另接中心服务器；不接受的话就不要开。
+        </p>
+      </div>
+      <button
+        type="button"
+        onClick={() => setView('panel')}
+        className="w-full text-center text-[11px] font-bold text-slate-400"
+      >
+        跳过引导，直接看全部设置
+      </button>
+    </>
+  ) : guideStep === 1 ? (
+    <>
+      {stepHeader(
+        '装一个你自己的后端',
+        '页面关着的时候，得有个一直醒着的地方替角色写消息。它装在你自己的 Cloudflare 账号里，粘一枚 Token 就能自动装好。',
+      )}
+      {isConnected ? (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 space-y-1">
+          <p className="font-bold text-emerald-700">后端已经连上了</p>
+          <p className="text-[11px] font-mono text-emerald-700/80 break-all">{config.workerUrl}</p>
         </div>
+      ) : (
+        <>
+          {deployCard}
+          {/* 地址和密钥那几栏只在用得上时出现：选了手动配置，或者一键部署已经把地址填好、正在等它生效。 */}
+          {config.workerUrl?.trim() || manualSetupOpen ? (
+            <div className={cardClass}>{workerBody}</div>
+          ) : (
+            <>
+              {/* 地址栏还没出现时也要能开：大陆用户一键部署完，等 Worker 生效那一步就得走中转 */}
+              {relayToggle}
+              <button
+                type="button"
+                onClick={() => setView('panel')}
+                className="w-full text-center text-[11px] font-bold text-slate-400"
+              >
+                已经有后端地址？去全部设置里填
+              </button>
+            </>
+          )}
+        </>
+      )}
+    </>
+  ) : guideStep === 2 ? (
+    <>
+      {stepHeader(
+        '让消息能送到手机上',
+        '后端写好的消息靠系统通知送过来。点下面的按钮，浏览器问要不要允许通知时选「允许」。',
+      )}
+      <div className={mutedCardClass}>
+        {cardHeader(pushTitle, pushStatusText, pushStatusClass)}
+        {pushBody}
+      </div>
+    </>
+  ) : guideStep === 3 ? (
+    <>
+      {stepHeader('要不要把聊天也交给云端', '这一步可选，以后随时能回来改。')}
+      <div className={mutedCardClass}>
+        {cardHeader('即时对话（防杀后台）', instantStatusText, instantStatusClass)}
+        {instantBody}
+      </div>
+    </>
+  ) : (
+    <>
+      {/* 全局配好只是「能用」，角色那边的开关不开的话一条都不会来——引导在前一步就结束的话，
+          用户会以为装坏了。所以单独占一屏，不跟别的内容挤在一起。 */}
+      {stepHeader(
+        '在每个角色那里单独打开',
+        '前面装的后端和通知是所有角色共用的，但主动消息要一个角色一个角色地开。没开的角色不会来找你。',
+      )}
+      <ol className="bg-violet-50 border border-violet-100 rounded-2xl p-4 space-y-2 text-xs leading-relaxed text-slate-600 list-decimal list-outside pl-8">
+        <li>回到和 TA 的聊天。</li>
+        <li>点输入框旁边的<strong>「+」</strong>，打开功能菜单。</li>
+        <li>找到<strong>「主动消息 2.0」</strong>，把<strong>「启用主动消息 2.0」</strong>的开关打开。</li>
+      </ol>
+      <p className="text-xs leading-relaxed text-slate-500">
+        想让别的角色也来找你，就到那个角色的聊天里再开一次。即时对话也可以在同一个面板里按角色单独关掉。
+      </p>
+    </>
+  );
+
+  // ── 面板 ────────────────────────────────────────────────────────────────────
+
+  const cronPaused = cronState?.kind === 'known' && !cronState.enabled;
+  const panelContent = (
+    <>
+      {/* 后台任务暂停着的时候常驻这一条：下面的按钮在折叠区里，不然一眼看不出角色为什么都不响。 */}
+      {cronPaused ? (
+        <div className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs leading-relaxed text-amber-700">
+          后台任务已暂停，到点的消息先攒着，恢复后一起补发。
+        </div>
+      ) : null}
+      {isConnected ? (
+        <p className="px-1 text-[11px] leading-relaxed text-slate-400">
+          主动消息按角色单独开：在和 TA 的聊天里点「+」→「主动消息 2.0」。
+        </p>
+      ) : null}
+
+      {diagnosticsCard}
+      {deployCard}
+
+      <FoldCard
+        title="后端 Worker"
+        status={isConnected ? '已连接' : '未连接'}
+        statusClass={isConnected ? 'text-emerald-600' : 'text-amber-600'}
+        needsAttention={!isConnected || workerOutdated || workerVersion?.state === 'outdated' || cronPaused}
+      >
+        {workerBody}
+      </FoldCard>
+
+      <FoldCard
+        title={pushTitle}
+        status={pushStatusText}
+        statusClass={pushStatusClass}
+        needsAttention={Boolean(pushCheckError) || (pushStatus ? !pushStatus.hasSubscription : false)}
+        className="bg-slate-50 border-slate-200"
+      >
+        {pushBody}
+      </FoldCard>
+
+      {/* 不自动展开：「Worker 认不认即时对话」是异步探的，探到之前跟「不支持」分不出来，
+          按它展开的话每个正常用户打开面板都会被弹开一次。状态那几个字变黄已经够提醒了。 */}
+      <FoldCard
+        title="即时对话（防杀后台）"
+        status={instantStatusText}
+        statusClass={instantStatusClass}
+        className="bg-slate-50 border-slate-200"
+      >
+        {instantBody}
+      </FoldCard>
+
+      <FoldCard title="数据存在哪儿" className="bg-amber-50 border-amber-100">
+        <div className="text-xs leading-relaxed text-amber-700 space-y-2">
+          <p>开了 2.0 以后，主动消息内容、提示词、相关配置，都会进入你自己部署的 Worker 及其 D1 数据库。</p>
+          <p>这是你自己的 Worker、你自己的库，项目不会额外接一个中心服务器。但只要数据进库，能碰到这台 Worker / 数据库的人（也就是你自己）就能看到这些内容。</p>
+          <p>如果你不接受把私密提示词、API Key 放进自己部署的服务，就不要开 2.0。</p>
+        </div>
+      </FoldCard>
+
+      <FoldCard title="高级信息">{advancedBody}</FoldCard>
+
+      <button
+        type="button"
+        onClick={() => { setGuideStep(0); setView('guide'); }}
+        className="w-full text-center text-[11px] font-bold text-slate-400"
+      >
+        这个功能是做什么的？重看介绍
+      </button>
+    </>
+  );
+
+  const inGuide = view === 'guide';
+  const closeButton = (
+    <button
+      onClick={onClose}
+      className="flex-1 py-3 bg-slate-100 text-slate-500 font-bold rounded-2xl active:scale-95 transition-transform"
+    >
+      关闭
+    </button>
+  );
+
+  return (
+    <>
+    <Modal
+      isOpen={isOpen}
+      title="主动消息 2.0"
+      onClose={onClose}
+      footer={!inGuide ? closeButton : (
+        <>
+          {guideStep === 0 ? closeButton : (
+            <button
+              onClick={() => setGuideStep((step) => step - 1)}
+              className="flex-1 py-3 bg-slate-100 text-slate-500 font-bold rounded-2xl active:scale-95 transition-transform"
+            >
+              上一步
+            </button>
+          )}
+          {/* 第 1 步没连上就不放行：后面几步都要问这台后端，跳过去只会看到一排开不了的开关。 */}
+          <button
+            onClick={() => (guideStep < GUIDE_STEPS.length ? setGuideStep((step) => step + 1) : setView('panel'))}
+            disabled={guideStep === 1 && !isConnected}
+            className="flex-1 py-3 bg-violet-500 text-white font-bold rounded-2xl active:scale-95 transition-transform disabled:opacity-40"
+          >
+            {guideStep === 0 ? '开始配置'
+              : guideStep === 1 ? (isConnected ? '下一步' : '装好后继续')
+              : guideStep === 2 ? (pushStatus?.hasSubscription ? '下一步' : '先跳过')
+              : guideStep === 3 ? '下一步'
+              : '完成'}
+          </button>
+        </>
+      )}
+    >
+      <div ref={topRef} className="space-y-4 text-sm text-slate-600">
+        {configLoadError ? (
+          <div role="alert" className="bg-amber-50 border border-amber-200 rounded-2xl px-4 py-3 text-xs text-amber-700 space-y-2">
+            <p>{configLoadError}</p>
+            <button type="button" onClick={() => void refresh().catch(() => {})} className="font-bold underline">
+              重试读取配置
+            </button>
+          </div>
+        ) : null}
+        {inGuide ? guideContent : panelContent}
       </div>
     </Modal>
+    {/* 摆在 Modal 外面：它自己是全屏 fixed 定位，放进面板里会被面板的动画容器框住。 */}
+    <ConfirmDialog
+      isOpen={pauseConfirmOpen}
+      title="暂停后台任务"
+      message="暂停后，到点的主动消息和定时消息会先攒着，不会丢。点「恢复后台任务」之后，攒下的会一起补发。"
+      confirmText="暂停"
+      variant="warning"
+      onConfirm={() => void applyCronTrigger(false)}
+      onCancel={() => setPauseConfirmOpen(false)}
+    />
+    {/* 中转要在中间解开 TLS 才能转发，打开前强制读 5 秒，确认后才存盘 */}
+    <ConfirmDialog
+      isOpen={relayConfirmOpen}
+      title="打开大陆连接优化前请读完"
+      message={(
+        // 共用弹窗的正文默认是小号浅灰字；这份提醒要逐条读完，字号、颜色都提一档，重点加粗
+        <ul className="list-disc pl-4 space-y-2.5 text-[15px] leading-relaxed font-medium text-slate-700">
+          <li>请求会先到<strong className="font-bold text-slate-900">维护者在美国的中转服务器</strong>，再转给你的 Worker。</li>
+          <li>中转要在中间解开加密，<strong className="font-bold text-slate-900">技术上看得到经过的全部内容</strong>：聊天消息、提示词、API Key 和后端密钥。中转<strong className="font-bold text-slate-900">不保存这些内容</strong>，也不会把你的 IP 转给 Worker。</li>
+          <li>要先在 SullyOS 的 Discord 群里，用<strong className="font-bold text-slate-900">已验证的账号</strong>发 /中转令牌 领一个令牌。中转<strong className="font-bold text-slate-900">只按账号、按天记流量和请求次数</strong>，保存 90 天，你随时能查。令牌 30 天不用会失效，也可以随时重领。</li>
+          <li>这是<strong className="font-bold text-slate-900">维护者自费搭的</strong>，不保证一直能用，但会尽力维护。连不上的时候，关掉开关就恢复直连。</li>
+          <li className="text-red-600 marker:text-red-600"><strong className="font-bold">中转只允许正常主动消息使用。恶意滥用 Worker 会被禁止使用中转，严重的会被移出社区！</strong></li>
+          <li>介意的话请别打开，可以看 Worker 地址下面的直连教程。</li>
+        </ul>
+      )}
+      confirmText="我已了解，打开"
+      cancelText="先不开"
+      variant="warning"
+      confirmDelaySeconds={5}
+      onConfirm={() => {
+        setRelayConfirmOpen(false);
+        void saveRelay(true);
+      }}
+      onCancel={() => setRelayConfirmOpen(false)}
+    />
+    </>
   );
 };
 

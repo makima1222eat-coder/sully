@@ -1,5 +1,8 @@
+import {requestBeautyLibrary} from '../../utils/beautyNavigation';
+import {AppID} from '../../types';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { FileOrImageImport } from '../share/FileOrImageImport';
 import {
     ArrowCounterClockwise,
     Check,
@@ -7,7 +10,6 @@ import {
     DownloadSimple,
     Eye,
     GearSix,
-    UploadSimple,
     X,
 } from '@phosphor-icons/react';
 import { useOS } from '../../context/OSContext';
@@ -24,6 +26,7 @@ import {
 } from '../../utils/journalAppearance';
 import { runCssRenderabilityCheck, validateScopedCss } from '../../utils/scopedCss';
 import { shareOrDownloadFile } from '../../utils/shareExport';
+import { readShareText } from '../../utils/pngShare';
 import { JournalThemeThumbnail } from './JournalThemeArtwork';
 
 const CSS_SNIPPETS = [
@@ -107,10 +110,9 @@ const JournalAppearanceButton: React.FC<JournalAppearanceButtonProps> = ({
     onStartPreview,
     onCancelPreview,
 }) => {
-    const { theme, updateTheme, addToast } = useOS();
+    const { theme, updateTheme, addToast,openApp } = useOS();
     const [open, setOpen] = useState(false);
     const [copied, setCopied] = useState(false);
-    const cssImportRef = useRef<HTMLInputElement>(null);
     const appearanceButtonRef = useRef<HTMLButtonElement>(null);
     const [savedStyleBlocksButton, setSavedStyleBlocksButton] = useState(false);
     const [draft, setDraft] = useState<JournalAppearance>(() =>
@@ -260,7 +262,7 @@ const JournalAppearanceButton: React.FC<JournalAppearanceButtonProps> = ({
         const file = event.target.files?.[0];
         if (!file) return;
         try {
-            const css = (await file.text()).replace(/^\uFEFF/, '').trim();
+            const css = (await readShareText(file, 'journal-css')).replace(/^\uFEFF/, '').trim();
             if (!css) {
                 addToast('CSS 文件是空的', 'error');
                 return;
@@ -295,11 +297,13 @@ const JournalAppearanceButton: React.FC<JournalAppearanceButtonProps> = ({
         const fileName = `sullyos-exchange-diary-${dateKey}.css`;
         try {
             const result = await shareOrDownloadFile({
+                card: { kind: 'journal-css', title: '交换日记样式' },
                 content: css,
                 fileName,
                 mimeType: 'text/css;charset=utf-8',
-                shareTitle: 'SullyOS 交换日记样式',
+                shareTitle: 'SullyOS·糯米机 交换日记样式',
             });
+            if (result === 'cancelled') return;
             addToast(result === 'shared' ? '已打开 CSS 分享面板' : '完整 CSS 已导出', 'success');
         } catch (error: any) {
             if (error?.name !== 'AbortError') addToast('CSS 导出失败，请重试', 'error');
@@ -329,7 +333,7 @@ const JournalAppearanceButton: React.FC<JournalAppearanceButtonProps> = ({
                 <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-stone-200/80 bg-[#fbfaf8]/95 px-5 py-4 backdrop-blur">
                     <div>
                         <div className="text-[10px] font-bold uppercase tracking-[.22em] text-amber-600/70">Exchange diary skin</div>
-                        <h2 className="mt-0.5 text-base font-black">交换日记美化</h2>
+                        <h2 className="mt-0.5 text-base font-black">交换日记美化</h2><button className="text-xs text-violet-600 mt-2" onClick={()=>{setOpen(false);requestBeautyLibrary('journal');openApp(AppID.Appearance);}}>到外观 App 收藏与分享 ›</button>
                     </div>
                     <button
                         onClick={closePanel}
@@ -384,21 +388,9 @@ const JournalAppearanceButton: React.FC<JournalAppearanceButtonProps> = ({
                             </button>
                         </div>
 
-                        <div className="mb-3 grid grid-cols-3 gap-2">
-                            <input
-                                ref={cssImportRef}
-                                type="file"
-                                accept=".css,.txt,text/css,text/plain"
-                                className="hidden"
-                                onChange={importCss}
-                            />
-                            <button
-                                onClick={() => cssImportRef.current?.click()}
-                                className="flex min-h-11 items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-white px-2 text-[10px] font-bold text-slate-600"
-                            >
-                                <UploadSimple size={14} />
-                                导入 CSS
-                            </button>
+                        <div className="mb-3 grid grid-cols-2 gap-2">
+                            <FileOrImageImport onChange={importCss}
+                                className="flex min-h-11 items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-white px-2 text-[10px] font-bold text-slate-600" />
                             <button
                                 onClick={exportCss}
                                 className="flex min-h-11 items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-white px-2 text-[10px] font-bold text-slate-600"

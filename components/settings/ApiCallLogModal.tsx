@@ -173,16 +173,16 @@ const ApiCallLogModal: React.FC<ApiCallLogModalProps> = ({ isOpen, onClose }) =>
                     <div className="pt-2 border-t border-amber-200/60 space-y-2">
                         <p className="font-bold text-sky-700">带「☁️ 云端」的那些是什么</p>
                         <p>
-                            开了<span className="font-semibold">即时对话</span>之后，聊天不再由这个页面发出去，而是交给你自己那台 Worker 在云端发——发完就能关页面，回复照样回得来。这类调用一样记在这里，只是有几处看不到：
+                            开了主动消息 2.0 之后，<span className="font-semibold">即时对话、云端情绪评估、定时主动消息（含模型判定不发但实际消耗了额度的轮次）、后台门牌整理与主动消息诊断测试</span>都由你自己那台 Worker 在云端发起——发完就能关页面，跑完后结果与用量一并带回这里。这类调用有几处跟本地直连不同：
                         </p>
                         <p>
-                            <span className="font-semibold">「生成中」</span>：云端已经收下，回复还没回来。收到回复才会变成成功。
+                            <span className="font-semibold">「生成中」</span>：本地提交的任务云端已经收下，结果还没回来。收到结果才会变成成功。
                         </p>
                         <p>
-                            <span className="font-semibold">没有耗时、没有实际后端</span>：请求在云端发出，本地既量不到时间，也看不到对面自报的模型名。
+                            <span className="font-semibold">没有耗时、没有实际后端</span>：请求在云端发出，本地既量不到单次耗时，也不回传对面自报的模型名。
                         </p>
                         <p>
-                            <span className="font-semibold text-amber-600">「只算末轮」</span>：角色查了东西再接着说的那种，一轮里会调好几次模型，而云端只报得回最后一次的 token。这条记录上的数字<span className="font-semibold">比实际用量小</span>，别拿它去跟账单对齐。
+                            <span className="font-semibold text-amber-600">「只算末轮」</span>：角色查了东西再接着说的多轮调用里，如果有几轮服务商没有返回 token 用量，这条记录上的数字<span className="font-semibold">比实际用量小</span>，别拿它去跟账单对齐。
                         </p>
                         <p>
                             <span className="font-semibold">「已顶替」</span>：这条还没等到回复你就又发了一句，云端把两句合成一次回。这一轮不再单独等回复了。
@@ -308,6 +308,7 @@ const ApiCallLogModal: React.FC<ApiCallLogModalProps> = ({ isOpen, onClose }) =>
                                                 {/* 云端这一轮调了不止一次模型时，回传的用量只有最后那次。
                                                     不注明的话这个数拿去对账永远对不上，还会以为是被多扣了 */}
                                                 {e.tokensPartial && <span className="text-amber-500"> · 只算末轮</span>}
+                                                {(e.cacheReadTokens != null || e.cacheWriteTokens != null) && <span className="block text-emerald-600">缓存读取 {(e.cacheReadTokens ?? 0).toLocaleString('en-US')} · 缓存写入 {(e.cacheWriteTokens ?? 0).toLocaleString('en-US')}</span>}
                                             </span>
                                         </div>
                                     )}
@@ -389,7 +390,7 @@ async function downloadCaptureTxt(capture: ApiRequestCapture, content: string): 
         content: `\uFEFF${content}`,
         fileName: `SullyOS-LLM本次发送统计-${stamp}.txt`,
         mimeType: 'text/plain;charset=utf-8',
-        shareTitle: 'SullyOS LLM 本次发送统计',
+        shareTitle: 'SullyOS·糯米机 LLM 本次发送统计',
     });
 }
 
@@ -681,7 +682,7 @@ const OneShotCapturePanel: React.FC<{
                         <div className="mt-4 border-t border-slate-200/70 pt-3">
                             <div className="mb-2">
                                 <h4 className="text-[11px] font-bold text-slate-600">动态内容与请求配置</h4>
-                                <p className="mt-0.5 text-[9px] text-slate-400">按实际发送顺序列出；每段都标明来源和原始请求位置。</p>
+                                <p className="mt-0.5 text-[9px] text-slate-400">按实际发送顺序列出；分区与来源按正文标题识别。世界书正文中的小标题保留在原分区内，核对实际发送内容可查看完整请求 JSON。</p>
                             </div>
                             <div className="space-y-1.5">
                             {detailSections.map(renderSection)}

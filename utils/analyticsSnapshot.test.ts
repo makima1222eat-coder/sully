@@ -17,10 +17,14 @@ import {
     collectAppearance,
     collectCharSettings,
     collectFeatureFlags,
+    collectSARFeatureFlags,
     triState,
     type FeatureSources,
 } from './analyticsSnapshot';
 import { createBuiltinSullyLive2DConfig } from './builtinSullyLive2D';
+import { createFishingMarketState, FISHING_MARKET_STORAGE_KEY } from './vrWorld/fishingMarket';
+import { freshFamiliarity } from './vrWorld/sarFamiliarity/storageTypes';
+import { USER_LOCATION_STORAGE_KEY } from './userLocationPrivacy';
 
 /**
  * 毒药串：每一条都放进某个用户可填字段里。它们只要出现在上报里就是泄漏。
@@ -36,9 +40,18 @@ const POISON = {
     css: '.bubble{content:"我写的CSS"}',
 };
 
+it('聊天备注快照仅报开关，不含备注或非法开关内容', () => {
+    for (const value of [true, false, undefined, POISON.key]) {
+        const result = collectCharSettings([{ id: 'private', name: POISON.myName, description: POISON.token, chatShowRemark: value } as CharacterProfile], 'private');
+        expect(result.聊天显示备注).toBe(value === true ? '有人开' : '都没开');
+        for (const secret of Object.values(POISON)) expect(JSON.stringify(result)).not.toContain(secret);
+    }
+});
+
 /** 全部字段都塞了毒药的实时感知配置。 */
 function poisonedRealtimeConfig(overrides: Partial<RealtimeConfig> = {}): RealtimeConfig {
     return {
+        userHolidays: { enabled: true, countryCode: POISON.city, subdivisionCode: POISON.myName, timeZone: POISON.url },
         weatherEnabled: true,
         weatherApiKey: POISON.key,
         weatherCity: POISON.city,
@@ -98,6 +111,7 @@ function poisonedSources(overrides: Partial<FeatureSources> = {}): FeatureSource
         // Worker 地址和共享密钥同样是用户填的，一起塞毒药。即时对话开关是布尔，
         // 放个 true 让「即时对话」那一格也走一遍扫毒。
         amsg2Global: { workerUrl: POISON.url, initializedAt: 1_700_000_000_000, instantChatEnabled: true },
+        collaborationUsage: { sessions: 2, messages: 9, assets: 1 },
         ...overrides,
     };
 }
@@ -142,6 +156,28 @@ beforeEach(() => {
 });
 
 describe('当前功能启用 · 不泄漏配置内容', () => {
+    it('真实定位只报告开关，不报告坐标、Key、隐藏地点名或半径', () => {
+        const location = { enabled: true, provider: 'amap', amapKey: 'LOC-KEY-POISON-801', regions: [
+            { id: 'region-poison-802', name: '私密家庭地址-803', latitude: 31.123456, longitude: 121.654321, radiusKm: 3.456789 },
+        ] };
+        localStorage.setItem(USER_LOCATION_STORAGE_KEY, JSON.stringify(location));
+        const flags = collectFeatureFlags(poisonedSources());
+        expect(flags.真实定位).toBe('开');
+        for (const secret of [location.amapKey, ...Object.values(location.regions[0])]) {
+            expect(JSON.stringify(flags)).not.toContain(String(secret));
+        }
+        expectNoLeak(flags);
+        localStorage.setItem(USER_LOCATION_STORAGE_KEY, JSON.stringify({ ...location, enabled: false }));
+        expect(collectFeatureFlags(poisonedSources()).真实定位).toBe('关');
+    });
+    it('没有定位配置记关，坏配置记读取失败，不透传任何字段', () => {
+        expect(collectFeatureFlags(poisonedSources()).真实定位).toBe('关');
+        localStorage.setItem(USER_LOCATION_STORAGE_KEY, '{broken');
+        expect(collectFeatureFlags(poisonedSources()).真实定位).toBe('读取失败');
+        localStorage.setItem(USER_LOCATION_STORAGE_KEY, JSON.stringify({ enabled: POISON.key, regions: [], provider: POISON.url }));
+        const flags = collectFeatureFlags(poisonedSources());
+        expect(flags.真实定位).toBe('读取失败'); expectNoLeak(flags);
+    });
     it('所有配置塞满密钥地址名字，上报里一个片段都不出现', () => {
         localStorage.setItem('aetheros.mcp.servers', JSON.stringify([
             { id: 'a', name: POISON.myName, url: POISON.url, enabled: true, tools: [{ name: 'x' }] },
@@ -150,10 +186,6 @@ describe('当前功能启用 · 不泄漏配置内容', () => {
         localStorage.setItem('aetheros.mcd.mcpToken', POISON.token);
         localStorage.setItem('qqBridge:wsUrl', POISON.url);
         localStorage.setItem('study_api_config', JSON.stringify({ baseUrl: POISON.url, apiKey: POISON.key }));
-        localStorage.setItem('instant_push_config_v1', JSON.stringify({
-            enabled: true, workerUrl: 'https://my-private-worker.invalid', clientToken: POISON.token,
-        }));
-
         expectNoLeak(collectFeatureFlags(poisonedSources()));
     });
 
@@ -227,6 +259,26 @@ describe('当前功能启用 · 三态不能塌成两态', () => {
 });
 
 describe('当前功能启用 · 开关值的判定', () => {
+    it('智能语境区分全开、部分开和全关', () => {
+        expect(collectFeatureFlags(poisonedSources({
+            memoryPalaceConfig: { featureFlags: { recallRouter: true, interactionAdaptation: true, deepEngagement: true } },
+        })).智能语境).toBe('全开');
+        expect(collectFeatureFlags(poisonedSources({
+            memoryPalaceConfig: { featureFlags: { recallRouter: true } },
+        })).智能语境).toBe('部分开');
+        expect(collectFeatureFlags(poisonedSources({ memoryPalaceConfig: {} })).智能语境).toBe('全关');
+    });
+
+    it('协同工作只报 count 分桶，不读取窗口、消息或文件内容', () => {
+        const flags = collectFeatureFlags(poisonedSources({
+            collaborationUsage: { sessions: 2, messages: 18, assets: 1 },
+        }));
+        expect(flags.协同工作).toBe('用过');
+        expect(flags.协同窗口数).toBe('2-3');
+        expect(flags.协同消息数).toBe('4+');
+        expect(flags.协同文件数).toBe('1');
+    });
+
     it("QQ 桥的 enabled 存 '0' 时算关着，不能当成「有值就是开」", () => {
         localStorage.setItem('qqBridge:wsUrl', POISON.url);
         localStorage.setItem('qqBridge:enabled', '0');
@@ -234,14 +286,6 @@ describe('当前功能启用 · 开关值的判定', () => {
 
         localStorage.setItem('qqBridge:enabled', '1');
         expect(collectFeatureFlags(poisonedSources()).QQ桥接).toBe('开');
-    });
-
-    it('Instant Push 填了地址但没生成 VAPID 密钥 → 配了没开', () => {
-        localStorage.setItem('instant_push_config_v1', JSON.stringify({
-            enabled: true, workerUrl: 'https://my-worker.invalid',
-        }));
-        // push_vapid_v1 没设 → isPushVapidReady() 为 false
-        expect(collectFeatureFlags(poisonedSources()).InstantPush).toBe('配了没开');
     });
 
     it('MCP 分开数「配了几个 / 启用几个 / 连通几个」', () => {
@@ -303,12 +347,6 @@ describe('当前功能启用 · 开关值的判定', () => {
         }));
         expect(flags['单独关了即时对话的角色数']).toBe('1');
     });
-
-    it('不上报已经全局下线的主动消息 Push 加速', () => {
-        // 那一层 FORCE_DISABLED 恒为关，报出来会被误读成「没人用」。
-        localStorage.setItem('proactive_push_enabled_v1', 'true');
-        expect(collectFeatureFlags(poisonedSources())).not.toHaveProperty('主动消息Push加速');
-    });
 });
 
 describe('当前外观 · 不泄漏用户自己捏的东西', () => {
@@ -364,6 +402,15 @@ describe('当前角色设置 · 不泄漏角色内容', () => {
         expect(flags.记忆宫殿).toBe('有人开');
     });
 
+    it('离开后消息只要一个角色开了就算', () => {
+        expect(collectCharSettings([poisonedChar()], 'c1').离开后消息).toBe('都没开');
+        const flags = collectCharSettings(
+            [poisonedChar(), poisonedChar({ awayMessage: { enabled: true, delayMinutes: 90 } })],
+            'c1',
+        );
+        expect(flags.离开后消息).toBe('有人开');
+    });
+
     it('默认开的开关问「有没有人特意关掉」——否则答案永远是「有」', () => {
         const allDefault = collectCharSettings([poisonedChar(), poisonedChar()], 'c1');
         expect(allDefault.时间感知).toBe('都开着');
@@ -388,6 +435,16 @@ describe('当前角色设置 · 不泄漏角色内容', () => {
             'active',
         );
         expect(flags.定时消息任务数).toBe('4+');
+    });
+
+    it('日常聊天协同和粤语只报有没有角色使用，不报是哪个角色', () => {
+        const flags = collectCharSettings([
+            poisonedChar(),
+            poisonedChar({ chatCollaborationEnabled: true, chatVoiceLang: 'yue' }),
+        ], 'c1');
+        expect(flags.日常聊天协同).toBe('有人开');
+        expect(flags.粤语语音).toBe('有人选');
+        expectNoLeak(flags);
     });
 });
 
@@ -469,4 +526,102 @@ describe('当前角色设置 · 桌面陪伴与通话形象', () => {
         );
         expectNoLeak(flags);
     });
+});
+
+
+describe('SAR / 私聊 / 周年赠礼快照', () => {
+    it('无剧情存档算零，不新增本地记录', () => {
+        const before = localStorage.length;
+        expect(collectSARFeatureFlags()).toMatchObject({ 凯恩已触发对话数: '0', 艾文已触发对话数: '0' });
+        expect(localStorage.length).toBe(before);
+    });
+    it.each([[0,'0'],[1,'1–5'],[5,'1–5'],[6,'6–10'],[10,'6–10'],[11,'11–20'],[20,'11–20'],[21,'21–30'],[30,'21–30'],[31,'31–40'],[40,'31–40'],[41,'41+']] as const)('完成 %i 段收敛到 %s，不上传剧情或选择', (count, bucket) => {
+        const state = { ...createFishingMarketState(17), sarFamiliarity: freshFamiliarity() };
+        for (let i=0; i<count; i++) state.sarFamiliarity.npcs.caian.completed[`${POISON.key}-${i}`] = { at: 1, flags: { private: POISON.myName } };
+        localStorage.setItem(FISHING_MARKET_STORAGE_KEY, JSON.stringify(state));
+        const flags = collectSARFeatureFlags();
+        expect(flags).toMatchObject({ 凯恩已触发对话数: bucket, 艾文已触发对话数: '0' });
+        expectNoLeak(flags);
+    });
+    it('包含正在进行的剧情并去重，不计尚未开始的候选', () => {
+        const state = { ...createFishingMarketState(17), sarFamiliarity: freshFamiliarity() };
+        const p = state.sarFamiliarity.npcs.caian;
+        for (let i=1; i<=5; i++) p.completed[`C1-0${i}`] = { at: 1, flags: {} };
+        p.offerId = 'C1-07'; p.queuedSceneIds = ['C1-08'];
+        p.pending = { runId: POISON.key, sceneId: 'C1-05', nodeId: 'start', line: 0, revision: 0, startedAt: 1, flags: {}, drafts: {}, userName: POISON.myName };
+        localStorage.setItem(FISHING_MARKET_STORAGE_KEY, JSON.stringify(state));
+        expect(collectSARFeatureFlags().凯恩已触发对话数).toBe('1–5');
+        p.pending.sceneId = 'C1-06';
+        localStorage.setItem(FISHING_MARKET_STORAGE_KEY, JSON.stringify(state));
+        const flags = collectSARFeatureFlags();
+        expect(flags.凯恩已触发对话数).toBe('6–10');
+        expectNoLeak(flags);
+    });
+    it('损坏存档不会伪装成零，也不阻断其他快照', () => {
+        localStorage.setItem(FISHING_MARKET_STORAGE_KEY, POISON.key);
+        expect(collectSARFeatureFlags()).toMatchObject({ 凯恩已触发对话数: '读取失败', 艾文已触发对话数: '读取失败', SAR角色: '未选择' });
+    });
+    it('明确开关进入枚举快照，字段内容与用户输入不泄漏', () => {
+        localStorage.setItem('sully-chat-input-preferences-v1', JSON.stringify({ sendButtonGenerates: true, enterToSend: false, autoReply: true, private: POISON.key }));
+        localStorage.setItem('vr_sar_club_state_v1', JSON.stringify({ npcPreference: 'hide', roomView: 'characters-hidden', introReaction: POISON.myName }));
+        localStorage.setItem('vr_fishing_simple_mode', 'true');
+        localStorage.setItem('vr_sar_session_theme_v1', 'light');
+        localStorage.setItem('sullyos_first_anniversary_seen_v1', '1');
+        const flags = collectSARFeatureFlags();
+        expect(flags).toMatchObject({ 发送键生成: '开', 回车发送: '关', 自动回复: '开', SAR角色: '关', SAR房间显示: '隐藏角色', SAR简易钓鱼: '开', SAR对话配色: '浅色', 周年赠礼已阅: '是' });
+        expectNoLeak(flags);
+    });
+    it('各新来源都塞入毒药也只输出缺省枚举', () => {
+        localStorage.setItem('sully-chat-input-preferences-v1', JSON.stringify({ sendButtonGenerates: POISON.key, enterToSend: POISON.key, autoReply: POISON.key }));
+        localStorage.setItem('vr_sar_club_state_v1', JSON.stringify({ npcPreference: POISON.key, roomView: POISON.key }));
+        for (const key of ['vr_fishing_simple_mode','vr_sar_session_theme_v1','sullyos_first_anniversary_seen_v1']) localStorage.setItem(key, POISON.key);
+        const flags = collectSARFeatureFlags();
+        expect(flags).toMatchObject({ 发送键生成: '关', 回车发送: '开', 自动回复: '关', SAR角色: '未选择', SAR房间显示: '全部显示', SAR简易钓鱼: '关', SAR对话配色: '浅色', 周年赠礼已阅: '否' });
+        expectNoLeak(flags);
+    });
+});
+
+/**
+ * event_data 的行数守卫。
+ *
+ * umami 把事件的每个属性单独存成 event_data 表的一行，所以「一条事件挂几个 key」
+ * 直接就是「一次上报写几行」。这三条快照事件是全仓库仅有的、属性数量上双的事件，
+ * 加起来占了那张表九成的体积——其余五百多个事件全是 0~1 个属性，合计不到一成。
+ *
+ * 所以这里钉的不是正确性，是成本。加 key 一直有种免费的错觉：写的时候只多一行代码，
+ * 账单上是每个用户每次冷启动多一行。撞上限了别直接改这里的数字，先在那条事件里找找
+ * 有没有已经不看了的 key——腾一格出来比加一格便宜。
+ *
+ * 上限是「当前值 + 2」：留一点顺手加的余量，又不至于让人一路加到六十都没人吭声。
+ */
+describe('快照事件的属性宽度', () => {
+    const plainChar = (id: string) => ({ id, name: '小明' } as unknown as CharacterProfile);
+
+    it('当前外观', () => {
+        expect(Object.keys(collectAppearance({} as OSTheme, undefined)).length).toBeLessThanOrEqual(38);
+    });
+
+    it('当前角色设置', () => {
+        expect(Object.keys(collectCharSettings([plainChar('a')], 'a')).length).toBeLessThanOrEqual(38);
+    });
+
+    it('SAR 发布功能保持小快照', () => {
+        expect(Object.keys(collectSARFeatureFlags()).length).toBeLessThanOrEqual(10);
+    });
+
+    it('当前功能启用', () => {
+        expect(Object.keys(collectFeatureFlags(poisonedSources())).length).toBeLessThanOrEqual(35);
+    });
+});
+
+
+it('3D 家园快照只输出档位与内置配色，不泄漏用户内容',()=>{
+ const theme={skin:'homely',homelyPalette:POISON.key,homelyLockedCharacterId:POISON.dbId} as unknown as OSTheme;
+ const appearance=collectAppearance(theme,undefined);
+ expect(appearance.居家配色).toBe('custom');expect(appearance.居家锁定角色).toBe('开');
+ expect(collectAppearance({...theme,homelyPalette:'rose'},undefined).居家配色).toBe('rose');
+ expect(collectAppearance({...theme,skin:'default'},undefined).居家配色).toBe('未使用');
+ const chars=collectCharSettings([{id:POISON.dbId,name:POISON.myName,home3D:{rooms:[{name:POISON.city}],records:[{text:POISON.token}],autonomy:false,directSpeech:true},chibiStudio:{home3D:{state:{selected:{eyes:POISON.key}}}}} as unknown as CharacterProfile],POISON.dbId);
+ expect(chars['3D家园角色数']).toBe('1');
+ for(const secret of Object.values(POISON))expect(JSON.stringify([appearance,chars])).not.toContain(secret);
 });

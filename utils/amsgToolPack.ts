@@ -1,3 +1,5 @@
+import {cleanCharacterWeatherCities} from './characterWeather';
+import { normalizeFreeWeatherSource, type FreeWeatherSource } from './weatherSources';
 /**
  * amsgToolPack — 满血 v2 服务端工具循环的云端状态数据形状（前端 / amsg worker 共用）
  *
@@ -46,17 +48,20 @@ export interface AmsgToolPack {
  * worker 到点就静默拿 undefined（编译期一声不吭），正是窄接口想消灭的那类失配。
  */
 export interface AmsgToolConfig extends AgenticToolRealtimeConfig {
+  userHolidays?: RealtimeConfig['userHolidays'];
   v: 1;
   /** 搜索 / Notion / 飞书都经它转发；worker 端用 setProxyWorkerUrlOverride 注入。 */
   proxyWorkerUrl: string;
   /**
    * 实时天气：worker 到点自己去拉一次填进提示词（不是工具，是常驻注入，跟前台一样）。
-   * key 留空走免费的 Open-Meteo，所以只要开关加城市就够。
+   * key 留空走所选免费源，失败后自动尝试另一免费源。
    */
   weatherEnabled: boolean;
+  weatherCities?: Record<string, string>;
   weatherCity?: string;
   weatherApiKey?: string;
-  /** 中国热榜要拉哪几个平台（英国/全球模式改用 Brave News）。 */
+  weatherFreeSource?: FreeWeatherSource;
+  /** 热榜要拉哪几个平台（继承来的 newsEnabled 管开关）。留空 worker 用内置默认。 */
   newsPlatforms?: string[];
   /** 上云这份比工具侧多一个 cookie（lite 模式的登录态），并且两个开关字段是必填。 */
   xhsMcpConfig?: {
@@ -73,7 +78,7 @@ export interface AmsgToolConfig extends AgenticToolRealtimeConfig {
    * 见 mcpClient.collectMcpFireServers）。代理字段不上云——worker 直连没有 CORS。
    */
   mcpServers?: McpFireServer[];
-  /** 前台「兼容模式」同款开关：false = 中转拒 tools，worker 退到正文协议。缺省按 true。 */
+  /** 前台「原生 tools」开关：false = 中转拒 tools，worker 退到正文协议。缺省按 true。 */
   mcpUseNativeTools?: boolean;
 }
 
@@ -132,8 +137,11 @@ export const buildToolConfig = (
     v: 1,
     proxyWorkerUrl: getProxyWorkerUrl(),
     weatherEnabled: !!rc?.weatherEnabled,
+    ...(rc?.userHolidays ? { userHolidays: { ...rc.userHolidays, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone } } : {}),
+    ...(rc?.weatherCities ? {weatherCities: cleanCharacterWeatherCities(rc.weatherCities)} : {}),
     ...(rc?.weatherCity ? { weatherCity: rc.weatherCity } : {}),
     ...(rc?.weatherApiKey ? { weatherApiKey: rc.weatherApiKey } : {}),
+    weatherFreeSource: normalizeFreeWeatherSource(rc?.weatherFreeSource),
     newsEnabled: !!rc?.newsEnabled,
     ...(rc?.newsApiKey ? { newsApiKey: rc.newsApiKey } : {}),
     ...(rc?.newsPlatforms?.length ? { newsPlatforms: rc.newsPlatforms } : {}),
@@ -164,7 +172,8 @@ export const buildToolConfig = (
           },
         }
       : {}),
-    ...(mcp?.servers.length ? { mcpServers: mcp.servers, mcpUseNativeTools: mcp.useNativeTools } : {}),
+    ...(mcp ? { mcpUseNativeTools: mcp.useNativeTools } : {}),
+    ...(mcp?.servers.length ? { mcpServers: mcp.servers } : {}),
   };
 };
 
@@ -214,10 +223,11 @@ export const parseToolConfig = (value: string): AmsgToolConfig | null => {
     if (cleaned?.length) {
       parsed.mcpServers = cleaned;
     } else {
-      // 两个字段同进同退（与 buildToolConfig 一致）：没有服务器时留个开关没有意义。
+      // 原生 tools 是整个模型请求的传输偏好，排程工具也需要它。
       delete parsed.mcpServers;
-      delete parsed.mcpUseNativeTools;
     }
+    if (parsed.weatherCities !== undefined) parsed.weatherCities = cleanCharacterWeatherCities(parsed.weatherCities);
+    parsed.weatherFreeSource = normalizeFreeWeatherSource(parsed.weatherFreeSource);
     return parsed as AmsgToolConfig;
   } catch {
     return null;

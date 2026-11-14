@@ -43,7 +43,10 @@ vi.mock('./activeMsgStore', () => ({
   },
 }));
 
-import { ActiveMsgClient } from './activeMsgClient';
+import { ActiveMsgClient, requireAnthropicWorker } from './activeMsgClient';
+import { ActiveMsgStore } from './activeMsgStore';
+import { requestStartupUpdateCheck, STARTUP_UPDATE_CHECK_STORAGE_KEY } from './amsgAutoUpdateTrigger';
+import { AMSG_BUNDLE_VERSION } from './amsgBundleVersion';
 import { forgetAllCredIds } from './amsgLlmCredentials';
 import { clearInstantChatPending } from './amsgInstantChat';
 import { ChatPrompts } from './chatPrompts';
@@ -63,6 +66,8 @@ const capturedPayloads: any[] = [];
 /** 每次 POST 的返回，按顺序取；用完了就一直回最后一个。 */
 let scheduleResponses: Array<{ status: number; body: unknown }> = [];
 let postedPaths: string[] = [];
+/** 每次 POST 的明文外壳（即时对话那条的外壳是明文 JSON，里面才是信封）。 */
+let postedBodies: any[] = [];
 
 const respond = () => {
   const next = scheduleResponses.length > 1 ? scheduleResponses.shift()! : scheduleResponses[0];
@@ -76,8 +81,13 @@ const respond = () => {
 beforeEach(() => {
   capturedPayloads.length = 0;
   postedPaths = [];
+  postedBodies = [];
   scheduleResponses = [{ status: 200, body: { success: true, data: { uuid: 'remote-uuid', status: 'pending' } } }];
   globalConfig.llmCredentialsSupported = true;
+  delete globalConfig.anthropicMessagesSupported;
+  delete globalConfig.anthropicMessagesWorkerUrl;
+  delete globalConfig.initializedAt;
+  localStorage.removeItem(STARTUP_UPDATE_CHECK_STORAGE_KEY);
   forgetAllCredIds();
   reiClient.init.mockReset().mockResolvedValue(undefined);
   reiClient.putClientState.mockReset().mockResolvedValue({ success: true });
@@ -95,8 +105,9 @@ beforeEach(() => {
   vi.spyOn(ChatPrompts, 'buildMessageHistory').mockReturnValue({ apiMessages: [] } as any);
   vi.spyOn(ChatPrompts, 'filterVisibleEmojis').mockReturnValue({ emojis: [], categories: [] } as any);
   vi.spyOn(ActiveMsgClient, 'registerPushSubscription').mockResolvedValue(undefined);
-  vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+  vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
     postedPaths.push(String(url));
+    try { postedBodies.push(JSON.parse(String(init?.body ?? 'null'))); } catch { postedBodies.push(null); }
     return respond();
   }));
   clearInstantChatPending(CHAR_ID);
@@ -108,13 +119,73 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it('原生接口只提交给已确认支持且地址一致的 Worker，OpenAI 不受新门槛影响', async () => {
+  await expect(requireAnthropicWorker(['https://api.test/v1/chat/completions'])).resolves.toBeUndefined();
+  await expect(requireAnthropicWorker(['https://api.anthropic.com/v1/messages'])).rejects.toThrow('尚未就绪');
+  globalConfig.anthropicMessagesSupported=true;
+  globalConfig.anthropicMessagesWorkerUrl='https://other-worker.test';
+  await expect(requireAnthropicWorker(['https://api.anthropic.com/v1/messages'])).rejects.toThrow('尚未就绪');
+  globalConfig.anthropicMessagesWorkerUrl=globalConfig.workerUrl;
+  await expect(requireAnthropicWorker(['https://api.anthropic.com/v1/messages'])).resolves.toBeUndefined();
+});
+
+it('旧 Worker 的存量内联任务不会被更新成它不支持的原生凭据', async () => {
+  const update=vi.spyOn(ActiveMsgClient,'updatePendingTasksRemote');
+  await expect(ActiveMsgClient.refreshCharPendingAiTaskCredentials({char:CHAR,config:{enabled:true,tasks:[]},apiConfig:{...API,baseUrl:'https://api.anthropic.com',apiType:'anthropic'},tasks:[{taskUuid:'legacy',mode:'auto'} as any],remoteTasks:[{uuid:'legacy'}]})).rejects.toThrow('尚未就绪');
+  expect(update).not.toHaveBeenCalled();expect(reiClient.putLlmCredentials).not.toHaveBeenCalled();
+});
+
+it('新版冷启动自动更新 Worker 后复查原生能力，无需用户重连', async () => {
+  globalConfig.initializedAt=1;
+  vi.spyOn(ActiveMsgStore,'saveGlobalConfig').mockImplementation(async patch => Object.assign(globalConfig,patch) as any);
+  const connect=vi.spyOn(ActiveMsgClient,'connect');
+  let upgraded=false;
+  const network=vi.fn(async (url: string) => {
+    if (String(url).endsWith('/self-update')) {
+      upgraded=true;
+      return Response.json({success:true,data:{message:'updated'}});
+    }
+    expect(String(url)).toContain('/config-check');
+    return Response.json({success:true,data:{workerVersion:upgraded?AMSG_BUNDLE_VERSION:'old',instantTick:true,anthropicMessages:upgraded}});
+  });
+  vi.stubGlobal('fetch',network);
+  expect(await requestStartupUpdateCheck(Date.now(),'native-update-test')).toBe('updated');
+  expect(globalConfig.anthropicMessagesSupported).toBe(true);
+  expect(network).toHaveBeenCalledTimes(3);
+  await expect(requireAnthropicWorker(['https://api.anthropic.com/v1/messages'])).resolves.toBeUndefined();
+  expect(network).toHaveBeenCalledTimes(3);
+  expect(connect).not.toHaveBeenCalled();
+});
+
+it('自动部署晚于启动探测时，首次原生请求自动纠正旧的不支持结果', async () => {
+  globalConfig.anthropicMessagesSupported=false;
+  globalConfig.anthropicMessagesWorkerUrl=globalConfig.workerUrl;
+  vi.spyOn(ActiveMsgStore,'saveGlobalConfig').mockImplementation(async patch => Object.assign(globalConfig,patch) as any);
+  const network=vi.fn(async()=>Response.json({success:true,data:{workerVersion:AMSG_BUNDLE_VERSION,instantTick:true,anthropicMessages:true}}));
+  vi.stubGlobal('fetch',network);
+  await expect(requireAnthropicWorker(['https://api.anthropic.com/v1/messages'])).resolves.toBeUndefined();
+  await expect(requireAnthropicWorker(['https://api.anthropic.com/v1/messages'])).resolves.toBeUndefined();
+  expect(network).toHaveBeenCalledTimes(1);
+});
+
+it('登记凭据被拒时带出云端包在 cause 里的错误码，供调用方分流', async () => {
+  reiClient.putLlmCredentials.mockResolvedValue({
+    success: false,
+    error: { code: 'INTERNAL_ERROR', message: '服务器内部错误', cause: { code: 'CLOUD_OWNER_RETIRED', message: 'retired' } },
+  });
+  await expect(ActiveMsgClient.putLlmCredentials([{
+    credId: 'char:char-x/chat',
+    value: { apiUrl: 'https://api.test/v1/chat/completions', apiKey: 'k', primaryModel: 'm' },
+  }])).rejects.toMatchObject({ code: 'CLOUD_OWNER_RETIRED' });
+});
+
 /** 排程 POST 出去的那份任务载荷（云端状态那份没有 messageType，据此认出来）。 */
 const scheduledTask = () => capturedPayloads.filter((p) => p && 'messageType' in p).at(-1);
 /** 传上去的凭据行（扁平化所有批次）。 */
 const putRows = () => reiClient.putLlmCredentials.mock.calls.flatMap(([rows]: any[]) => rows);
 
-const schedule = (config: any = { enabled: true, tasks: [] }) => ActiveMsgClient.scheduleCharacterTask({
-  char: CHAR,
+const schedule = (config: any = { enabled: true, tasks: [] }, char = CHAR) => ActiveMsgClient.scheduleCharacterTask({
+  char,
   config,
   task: { mode: 'auto', firstSendTime: new Date(Date.now() + 3600_000).toISOString(), recurrenceType: 'none' },
   userProfile: { name: '小明' } as any,
@@ -139,6 +210,7 @@ describe('排程任务的凭据', () => {
 
     expect(putRows()).toEqual([{
       credId: `char:${CHAR_ID}/chat`,
+      owner: { type: 'character', id: CHAR_ID }, ownerGeneration: 0,
       value: {
         apiUrl: 'https://api.example.dev/v1/chat/completions',
         apiKey: 'sk-global',
@@ -149,7 +221,20 @@ describe('排程任务的凭据', () => {
       .toBeLessThan((globalThis.fetch as any).mock.invocationCallOrder.at(-1));
   });
 
-  it('角色开了单独 API → 那行写的是单独 API 的值', async () => {
+  it.each([true, false])('角色默认 API 进入实际排程载荷（凭据表支持=%s）', async supported => {
+    globalConfig.llmCredentialsSupported = supported;
+    const dialogueApi = { baseUrl: 'https://role.example/v1', apiKey: 'role-key', model: 'role-model' };
+    await schedule(undefined, { ...CHAR, dialogueApi });
+    const expected = { apiUrl: dialogueApi.baseUrl + '/chat/completions', apiKey: dialogueApi.apiKey, primaryModel: dialogueApi.model };
+    if (supported) {
+      expect(putRows()[0].value).toEqual(expected);
+      expect(scheduledTask()).not.toHaveProperty('apiKey');
+    } else {
+      expect(scheduledTask()).toMatchObject(expected);
+    }
+  });
+
+  it('旧角色的单独 API 不再参与排程', async () => {
     await schedule({
       enabled: true,
       tasks: [],
@@ -158,7 +243,7 @@ describe('排程任务的凭据', () => {
     });
 
     expect(putRows()[0].value).toEqual({
-      apiUrl: 'https://alt.example.dev/v1/chat/completions', apiKey: 'sk-alt', primaryModel: 'gpt-alt',
+      apiUrl: 'https://api.example.dev/v1/chat/completions', apiKey: 'sk-global', primaryModel: 'gpt-global',
     });
   });
 
@@ -273,6 +358,13 @@ describe('即时对话的凭据与情绪评估', () => {
     });
   });
 
+  it('秘密请求编号随加密评估配置保留，凭据引用仍不携带副 API key', async () => {
+    await send({emotionEval: {...EVAL_SPEC, homeSecretRequestId: 'secret-request'}});
+    expect(scheduledTask().metadata.amsgEmotionEval).toEqual({
+      prompt: EVAL_SPEC.prompt, homeSecretRequestId: 'secret-request',
+    });
+  });
+
   it('这一轮不评估 → 只带聊天那个引用（绝不出现单挂 emotion 的空壳）', async () => {
     await send();
 
@@ -290,6 +382,39 @@ describe('即时对话的凭据与情绪评估', () => {
     expect(task.apiKey).toBe('sk-global');
     expect(task.metadata.amsgEmotionEval).toEqual(EVAL_SPEC);
     expect(reiClient.putLlmCredentials).not.toHaveBeenCalled();
+  });
+
+  // 回归守卫：本地底账只记得「这个入口传过什么」。云端那行被别的入口（iOS 上 Safari
+  // 和主屏 App 各存各的）或别的 Worker 改成别的模型之后，底账还说「没变」，于是一轮
+  // 都不传，本地怎么切 API 云端都还用那份旧的。凭据必须每一轮都随请求交给 worker。
+  it('值没变的第二轮照样把这一轮的凭据随请求带上（不看底账）', async () => {
+    await send();
+    postedBodies = [];
+    capturedPayloads.length = 0;
+    reiClient.putLlmCredentials.mockClear();
+
+    await send();
+
+    expect(reiClient.putLlmCredentials, '底账说没变，单独登记那一步照旧省掉').not.toHaveBeenCalled();
+    const outer = postedBodies.find((b) => b && 'taskPayload' in b);
+    expect(outer.credPayload).toEqual({ iv: 'iv', authTag: 'tag', encryptedData: 'enc' });
+    const credBody = capturedPayloads.find((p) => p && 'credentials' in p);
+    expect(credBody.credentials).toEqual([{
+      credId: `char:${CHAR_ID}/instant`,
+      owner: { type: 'character', id: CHAR_ID }, ownerGeneration: 0,
+      value: {
+        apiUrl: 'https://api.example.dev/v1/chat/completions',
+        apiKey: 'sk-global',
+        primaryModel: 'claude-sonnet-4-thinking',
+      },
+    }]);
+  });
+
+  it('不达标的 worker（内联凭据）不带 credPayload', async () => {
+    globalConfig.llmCredentialsSupported = false;
+    await send();
+    const outer = postedBodies.find((b) => b && 'taskPayload' in b);
+    expect(outer).not.toHaveProperty('credPayload');
   });
 
   it('包装层回「引用的凭据不存在」→ 补传后重发一次', async () => {

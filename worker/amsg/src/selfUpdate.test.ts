@@ -1,8 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   buildDurableObjectPlan,
+  bundleFetchUrl,
+  resolveBundleUrl,
   resolveObservability,
   handleSelfUpdate,
+  locateScript,
   rebuildBindings,
   resolveScriptName,
 } from './selfUpdate';
@@ -212,5 +215,95 @@ describe('handleSelfUpdate 上传时带的 metadata', () => {
     const { calls } = await runSelfUpdate({ enabled: false });
 
     expect(uploadMetadata(calls)?.observability).toEqual({ enabled: false });
+  });
+});
+
+describe('locateScript', () => {
+  const failure = (code: number, message: string) => ({ success: false, errors: [{ code, message }] });
+  const INVALID_TOKEN = failure(9109, 'Invalid access token');
+
+  const locate = async (env: Record<string, string>, respond: (path: string) => unknown) => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: any) =>
+      new Response(JSON.stringify(respond(new URL(String(url)).pathname)))) as any;
+    try {
+      return await locateScript(env, 'cf-token', 'sullyos-amsg');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  };
+
+  it('多个账号时逐个找，用读得到这个 Worker 的那个', async () => {
+    const located = await locate({}, (path) => {
+      if (path.endsWith('/accounts')) return { success: true, result: [{ id: 'acc-1' }, { id: 'acc-2' }] };
+      return path.includes('/acc-2/')
+        ? { success: true, result: { bindings: [] } }
+        : failure(10007, 'workers.api.error.script_not_found');
+    });
+
+    expect(located).toMatchObject({ ok: true, accountId: 'acc-2' });
+  });
+
+  it('查账号列表时 token 无效：让用户换 token，不把 CF_ACCOUNT_ID 当成解法', async () => {
+    const located = await locate({}, () => INVALID_TOKEN);
+
+    expect(located.ok).toBe(false);
+    if (located.ok) return;
+    expect(located.message).toContain('Cloudflare 不认这枚 CF_API_TOKEN');
+    expect(located.message).toContain('9109: Invalid access token');
+    expect(located.message).not.toContain('即可跳过');
+  });
+
+  it('配了 CF_ACCOUNT_ID 时 token 无效：同样让用户换 token', async () => {
+    const located = await locate({ CF_ACCOUNT_ID: 'acc-1' }, () => INVALID_TOKEN);
+
+    expect(located.ok).toBe(false);
+    if (located.ok) return;
+    expect(located.message).toContain('Cloudflare 不认这枚 CF_API_TOKEN');
+    expect(located.message).not.toContain('读不到这个 Worker');
+  });
+
+  it('同样是 9109，权限不够时不算 token 失效', async () => {
+    const located = await locate({}, () => failure(9109, 'Unauthorized to access requested resource'));
+
+    expect(located.ok).toBe(false);
+    if (located.ok) return;
+    expect(located.message).toContain('问不到账号列表');
+    expect(located.message).toContain('CF_ACCOUNT_ID');
+  });
+});
+
+describe('resolveBundleUrl', () => {
+  const official = 'https://raw.githubusercontent.com/Tosd0/sullyos-workers/main/amsg/worker.bundle.js';
+
+  it('不配就是官方成品包', () => {
+    expect(resolveBundleUrl({})).toBe(official);
+    expect(resolveBundleUrl({ AMSG_BUNDLE_URL: '   ' })).toBe(official);
+  });
+
+  it('配了 https 地址就取那儿（fork / 测试 Worker 用）', () => {
+    expect(resolveBundleUrl({ AMSG_BUNDLE_URL: 'https://example.com/x/worker.bundle.js' })).toBe('https://example.com/x/worker.bundle.js');
+  });
+
+  it('不是 https 一律回落到官方，别把明文 http 或乱填的东西当成品包源', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(resolveBundleUrl({ AMSG_BUNDLE_URL: 'http://example.com/w.js' })).toBe(official);
+    expect(resolveBundleUrl({ AMSG_BUNDLE_URL: 'not a url' })).toBe(official);
+  });
+});
+
+describe('bundleFetchUrl', () => {
+  /**
+   * 回归守卫：取包地址必须带随时间变的参数。GitHub raw 前面的 CDN 按完整 URL 缓存，
+   * 不带的话推新包后几分钟内还会吐旧包——自动更新按指纹比，吃到旧包就把新代码换回去。
+   */
+  it('地址挂上时间参数，同一份地址两次取不一样', () => {
+    const base = 'https://raw.githubusercontent.com/x/y/main/amsg/worker.bundle.js';
+    expect(bundleFetchUrl(base, 1000)).toBe(`${base}?t=1000`);
+    expect(bundleFetchUrl(base, 1000)).not.toBe(bundleFetchUrl(base, 2000));
+  });
+
+  it('原地址本来就带参数也不冲掉', () => {
+    expect(bundleFetchUrl('https://example.com/w.js?token=abc', 5)).toBe('https://example.com/w.js?token=abc&t=5');
   });
 });

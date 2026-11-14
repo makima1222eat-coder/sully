@@ -1,4 +1,4 @@
-// 群聊 LLM 输出解析 —— 两层容错（家规：严格层失败后进宽松层，绝不静默丢整轮输出）。
+// 群聊 LLM 输出解析：严格 JSON → 逐对象恢复 → 按群成员姓名恢复正文。
 // 纯函数、无副作用，便于 vitest 直测。
 
 export interface DirectorAction {
@@ -6,9 +6,16 @@ export interface DirectorAction {
     content: string;
 }
 
-/** 剥掉 markdown 代码围栏（```json / ```yaml / ``` 等），LLM 很爱裹这个 */
+/**
+ * 剥掉模型输出外面的包装：
+ * - 思考块 <think> / <thinking> / <thought>（含没写完就断掉的）：推理模型和用户世界书里的
+ *   CoT 都会让模型先想一段，不剥的话会被当成群聊发言，或者里面打的草稿被当成正式输出。
+ * - markdown 代码围栏（```json / ```yaml / ``` 等），LLM 很爱裹这个。
+ */
 const stripFences = (raw: string): string =>
     String(raw ?? '')
+        .replace(/<(think|thinking|thought)>[\s\S]*?<\/\1>/gi, '')
+        .replace(/<(?:think|thinking|thought)>[\s\S]*$/gi, '')
         .replace(/```[a-zA-Z]*\r?\n?/g, '')
         .replace(/```/g, '')
         .trim();
@@ -26,9 +33,10 @@ const normalizeAction = (a: any): DirectorAction | null => {
  * 解析导演模式输出的 JSON 动作数组。
  * 第一层（严格）：剥围栏 → 截取最外层 [ ... ] → JSON.parse 整体。
  * 第二层（宽松）：正则逐个抠出含 "charId" 的对象逐个 parse，能救一个是一个。
- * 两层皆空时返回 []，由调用方决定是否提示用户。
+ * 第三层：由调用方传入群成员，按唯一姓名识别「名字：正文」；不猜无署名内容的作者。
+ * 皆空时返回 []，由调用方决定是否提示用户。
  */
-export function parseDirectorActions(raw: string): DirectorAction[] {
+export function parseDirectorActions(raw: string, members: ReadonlyArray<{id: string; name: string}> = []): DirectorAction[] {
     const text = stripFences(raw);
     if (!text) return [];
 
@@ -52,15 +60,68 @@ export function parseDirectorActions(raw: string): DirectorAction[] {
             if (action) rescued.push(action);
         } catch { /* 这个对象坏了，跳过它救别的 */ }
     }
-    return rescued;
+    if (rescued.length) return rescued;
+    return parseNamedDialogue(text, members);
+}
+
+/** Recover history-shaped replies only when the speaker is an unambiguous member.
+ * Never assign unlabelled prose, user turns, or reasoning to an arbitrary character.
+ */
+function parseNamedDialogue(text: string, members: ReadonlyArray<{id: string; name: string}>): DirectorAction[] {
+    const names = new Map<string, string | null>();
+    for (const member of members) {
+        const name = member.name.trim();
+        if (name) names.set(name, names.has(name) ? null : member.id);
+    }
+    const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const alternatives = [...names.keys()].sort((a, b) => b.length - a.length).map(escape).join('|');
+    if (!alternatives) return [];
+    // A model may put several [Name: content] bubbles on one line.
+    const lines = text.replace(new RegExp(`\\[(${alternatives})[：:]`, 'g'), '\n[$1：')
+        .replace(/\[(?:约\s*)?\d+\s*(?:秒|分钟|小时|天)前\]\s*/g, '\n')
+        .replace(/\[([^\]\n]+?)\s+引用了\s+([^\]\n]+?)说的「([\s\S]*?)」\s*[，,]?\s*并回复了\s*↓\]/g,
+            '\n$1：[[QUOTE: $3]]\n')
+        .split(/\r?\n/);
+    const header = new RegExp(`^\\[?(${alternatives})[：:]\\s*([\\s\\S]*)$`);
+    const actions: DirectorAction[] = [];
+    let current: DirectorAction | undefined;
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        const match = line.match(header);
+        if (match) {
+            const charId = names.get(match[1]);
+            current = undefined;
+            if (!charId) continue;
+            const content = (line.startsWith('[') ? match[2].replace(/\]$/, '') : match[2]).trim();
+            const previous = actions[actions.length - 1];
+            // Keep a recovered quote attached to the next bubble from its author.
+            if (previous?.charId === charId && /^\[\[QUOTE: [\s\S]*\]\]$/.test(previous.content)) {
+                previous.content += '\n' + content;
+                current = previous;
+            } else {
+                current = {charId, content};
+                actions.push(current);
+            }
+        } else if (/^\[?[^：:\n]{1,80}[：:]/.test(line)) {
+            current = undefined; // Unknown speaker / user: do not absorb into last member.
+        } else if (current) {
+            current.content += '\n' + line;
+        }
+    }
+    return actions.filter(action => action.content && !/^\[\[QUOTE: [\s\S]*\]\]$/.test(action.content));
 }
 
 /**
- * [[SKIP]] 输出剥离兜底（提示词已不再教这个标记——轮询模式现在要求每位成员必发言）：
- * 模型若仍吐出 [[SKIP]] 或空内容，剥净后没剩正文 = 本轮跳过该成员。
+ * 轮询模式单个成员的输出清理：剥思考块 / 围栏 / [[SKIP]]，再剥模型自作主张加的
+ * 「名字：」前缀（提示词禁止了，但仍要兜底；放在剥思考块之后，前缀才露得出来）。
+ * 剥净后没剩正文 = 本轮跳过该成员。
  */
-export function stripSkipMarker(raw: string): { skipped: boolean; content: string } {
-    const content = stripFences(raw).replace(/\[\[\s*SKIP\s*\]\]/gi, '').trim();
+export function stripSkipMarker(raw: string, speakerName = ''): { skipped: boolean; content: string } {
+    let content = stripFences(raw).replace(/\[\[\s*SKIP\s*\]\]/gi, '').trim();
+    if (speakerName && (content.startsWith(`${speakerName}:`) || content.startsWith(`${speakerName}：`))) {
+        content = content.slice(speakerName.length + 1).trim();
+    }
     return { skipped: content === '', content };
 }
 
@@ -83,11 +144,7 @@ export interface GroupTopicBoxParsed {
  * 三层皆空返回 null，由调用方决定是否提示用户。
  */
 export function parseGroupTopicBox(raw: string): GroupTopicBoxParsed | null {
-    const text = String(raw ?? '')
-        .replace(/<think>[\s\S]*?<\/think>/gi, '') // 推理模型的思考块，会把 JSON 冲垮
-        .replace(/```[a-zA-Z]*\r?\n?/g, '')
-        .replace(/```/g, '')
-        .trim();
+    const text = stripFences(raw); // 推理模型的思考块会把 JSON 冲垮，一并剥掉
     if (!text) return null;
 
     const fromObj = (p: any): GroupTopicBoxParsed | null => {

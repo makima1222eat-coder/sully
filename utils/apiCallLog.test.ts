@@ -12,12 +12,16 @@ import {
     isApiRequestCaptureArmed,
     isFixedPromptBlockLabel,
     isSameCoreModel,
+    recordCompletedCloudApiCall,
+    resolveApiCallMeta,
     scanSseForLog,
     setApiRequestCaptureArmed,
     setApiCallAmbientContext,
     summarizeApiRequestCaptureDuplicates,
     updateApiRequestCaptureUsage,
 } from './apiCallLog';
+import { setCharNameRegistry } from './charNameRegistry';
+import { formatWorldbookSection, resolveWorldbookEntries } from './worldbook';
 
 describe('one-shot full API request capture', () => {
     it('uses the in-memory armed flag on the disabled hot path instead of reading localStorage per request', () => {
@@ -87,6 +91,46 @@ describe('one-shot full API request capture', () => {
         expect(capture.sections
             .filter(section => section.messageIndex != null)
             .reduce((sum, section) => sum + section.chars, 0)).toBe(content.length);
+    });
+
+    it('keeps a worldbook section whole even when entries carry their own markdown headings', () => {
+        // 用 formatWorldbookSection 真拼一段，跟线上发出去的形状保持一致
+        const worldbook = formatWorldbookSection(resolveWorldbookEntries([
+            { id: 'a', title: '破甲', content: '开头几行\n## 第一部分\n正文一\n### 第二部分\n正文二', category: '测试', sourceUid: 1 },
+            { id: 'b', title: '设定', content: '## 第二条的小标题\n第二条正文', category: '测试', sourceUid: 2 },
+        ]), '扩展设定集 (Worldbooks)');
+        const content = `### 你的身份 (Character)\n设定\n\n${worldbook}### 表达底线 (Anti-Filler)\n规则`;
+        const capture = buildApiRequestCapture({
+            url: 'https://example.com/v1/chat/completions',
+            body: { model: 'gpt-test', messages: [{ role: 'system', content }] },
+        });
+
+        const promptLabels = capture.sections.filter(section => section.messageIndex != null).map(section => section.label);
+        expect(promptLabels).toEqual([
+            '你的身份 (Character)',
+            '扩展设定集 (Worldbooks)',
+            '表达底线 (Anti-Filler)',
+        ]);
+        const worldbookSection = capture.sections.find(section => section.kind === 'worldbook')!;
+        const text = getApiRequestCaptureSectionContent(capture, worldbookSection);
+        expect(text).toContain('正文二');
+        expect(text).toContain('第二条正文');
+        expect(text).not.toContain('表达底线');
+
+        expect(buildPromptBreakdown({ messages: [{ role: 'system', content }] })!.map(block => block.label)).toEqual([
+            '你的身份 (Character)',
+            '扩展设定集 (Worldbooks)',
+            '表达底线 (Anti-Filler)',
+        ]);
+    });
+
+    it('still splits after a worldbook-looking heading that has no section ending', () => {
+        const capture = buildApiRequestCapture({
+            url: 'https://example.com/v1/chat/completions',
+            body: { model: 'gpt-test', messages: [{ role: 'system', content: '## 世界书\n设定\n## 记忆召回\n昨天\n## 行为规范\n规则' }] },
+        });
+        expect(capture.sections.filter(section => section.messageIndex != null).map(section => section.label))
+            .toEqual(['世界书', '记忆召回', '行为规范']);
     });
 
     it('classifies embedded full conversation history separately from system prompts', () => {
@@ -475,5 +519,92 @@ describe('buildPromptBreakdown · 落单围栏', () => {
         const labels = buildPromptBreakdown({ messages: [{ role: 'system', content: sys }, { role: 'user', content: 'hi' }] })!
             .map(b => b.label);
         expect(labels).toEqual(['规则', '下一块', '聊天历史·用户消息 ×1']);
+    });
+});
+
+it('没有标准收尾的世界书文本仍按标题拆分，所有消息分区可还原全文', () => {
+    const content = '### 扩展设定集 (Worldbooks)\n开头几行\n### 自定义规则\n' + '完整规则正文\n'.repeat(500) + '末尾标记';
+    const capture = buildApiRequestCapture({
+        url: 'https://example.com/v1/chat/completions',
+        body: JSON.stringify({ messages: [{ role: 'system', content }] }),
+    });
+    const parts = capture.sections.filter(s => s.messageIndex === 0);
+    expect(parts.length).toBeGreaterThan(1);
+    expect(parts.map(s => getApiRequestCaptureSectionContent(capture, s)).join('')).toBe(content);
+    expect(JSON.stringify(capture.payload)).toContain('末尾标记');
+});
+
+describe('resolveApiCallMeta · 归属补全与前台上下文隔离', () => {
+    it('显式传入无角色的 meta 时，绝不混入前台打开的私聊角色', () => {
+        setApiCallAmbientContext({ appId: 'chat', appName: '消息', charId: 'char-fg', charName: '前台角色' });
+        const resolved = resolveApiCallMeta({ appId: 'settings', purpose: '测试连接' });
+        expect(resolved).toEqual({
+            appId: 'settings',
+            appName: '设置',
+            charId: undefined,
+            charName: undefined,
+            purpose: '测试连接',
+        });
+    });
+
+    it('只传 appId 与 charId 时自动补齐中文 App 名与已注册角色名', () => {
+        setCharNameRegistry([{ id: 'char-mp', name: 'Sully' }]);
+        const resolved = resolveApiCallMeta({ appId: 'memorypalace', charId: 'char-mp', purpose: '记忆消化' });
+        expect(resolved).toEqual({
+            appId: 'memorypalace',
+            appName: '记忆宫殿',
+            charId: 'char-mp',
+            charName: 'Sully',
+            purpose: '记忆消化',
+        });
+    });
+
+    it('未传显式 meta 时仍退回前台环境快照', () => {
+        setApiCallAmbientContext({ appId: 'chat', appName: '消息', charId: 'char-fg', charName: '前台角色' });
+        expect(resolveApiCallMeta(undefined)).toMatchObject({
+            appId: 'chat',
+            appName: '消息',
+            charId: 'char-fg',
+            charName: '前台角色',
+        });
+    });
+});
+
+describe('recordCompletedCloudApiCall · 单阶段云端调用落账', () => {
+    it('一次写齐渠道、角色用途与总 Token 且不挂 pending', async () => {
+        const { DB } = await import('./db');
+        const logged: any[] = [];
+        const spy = vi.spyOn(DB, 'appendApiCallLog').mockImplementation(async (entry: any) => {
+            logged.push(entry);
+        });
+        try {
+            recordCompletedCloudApiCall({
+                id: 'cloud-proactive-task-1:1700000000000',
+                route: 'cloud-proactive',
+                baseUrl: 'https://api.example.com/v1',
+                model: 'claude-sonnet-4-5',
+                ok: true,
+                timestamp: 1700000000000,
+                promptTokens: 3200,
+                completionTokens: 180,
+                meta: { appId: 'chat', charId: 'char-mp', purpose: '主动消息' },
+            });
+            await vi.waitFor(() => expect(logged).toHaveLength(1));
+            expect(logged[0]).toMatchObject({
+                id: 'cloud-proactive-task-1:1700000000000',
+                route: 'cloud-proactive',
+                pending: false,
+                ok: true,
+                baseUrl: 'https://api.example.com/v1',
+                model: 'claude-sonnet-4-5',
+                promptTokens: 3200,
+                completionTokens: 180,
+                totalTokens: 3380,
+                appName: '消息',
+                purpose: '主动消息',
+            });
+        } finally {
+            spy.mockRestore();
+        }
     });
 });

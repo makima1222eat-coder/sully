@@ -20,6 +20,11 @@ const Gallery: React.FC = () => {
     const { closeApp, characters, apiConfig, addToast } = useOS();
     const [view, setView] = useState<'albums' | 'grid' | 'detail'>('albums');
     const [activeCharId, setActiveCharId] = useState<string | null>(null);
+    useAppShortcut(ShortcutAppID.Gallery, intent => {
+        if (activeCharId !== intent.characterId) setImages([]);
+        setSelectedImage(null); setActiveCharId(intent.characterId || null);
+        setView(intent.characterId ? 'grid' : 'albums');
+    });
     const [images, setImages] = useState<GalleryImage[]>([]);
     const [selectedImage, setSelectedImage] = useState<GalleryImage | null>(null);
     const [isReviewing, setIsReviewing] = useState(false);
@@ -211,8 +216,9 @@ CRITICAL: Stay in character. If there's conversation context, your comment shoul
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${apiConfig.apiKey}`
                 },
-                body: JSON.stringify(payload)
-            });
+                body: JSON.stringify(payload),
+                __sullyMeta: { appId: 'gallery', appName: '相册', charId: char.id, charName: char.name, purpose: '照片看图点评' },
+            } as RequestInit);
 
             if (!response.ok) {
                 let errorMsg = `HTTP Error ${response.status}`;
@@ -481,3 +487,5 @@ CRITICAL: Stay in character. If there's conversation context, your comment shoul
 };
 
 export default Gallery;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

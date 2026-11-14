@@ -1,4 +1,5 @@
 import type { Message } from '../types';
+import { stripDateVoiceTranslations } from './dateVoiceText';
 
 export type DateHistoryView = 'encounter' | 'date';
 export type DateHistorySortOrder = 'newest' | 'oldest';
@@ -9,9 +10,9 @@ export interface DateHistoryGroup {
     startAt: number;
     endAt: number;
     messages: Message[];
-    /** 按日期查看时，表示当天能识别到的见面开场数。 */
+    /** 按日期查看时，表示当天能识别到的见面次数。 */
     encounterCount: number;
-    /** 旧记录可能没有 isOpening，UI 用它提示这是兼容分组。 */
+    /** 有场次 ID 或旧版开场锚点；否则 UI 提示这是兼容分组。 */
     hasOpeningAnchor: boolean;
 }
 
@@ -40,7 +41,8 @@ const sortMessagesChronologically = (messages: Message[]): Message[] => (
 /**
  * 按“真实的一次见面”切分。
  *
- * 新记录以 isOpening 作为可靠开场锚点：从该开场到下一条开场，无论相隔多久、
+ * 新记录按 dateEncounterId 分组，直接见面无需开场白也有独立边界。
+ * 旧记录以 isOpening 作为可靠开场锚点：从该开场到下一条开场，无论相隔多久、
  * 是否跨过午夜，都仍属于同一次见面。旧版没有锚点的记录只能按自然日期兼容分组，
  * 但不会再使用 30 分钟等容易误拆的间隔阈值。
  */
@@ -49,6 +51,7 @@ export function splitDateEncounters(messages: Message[]): DateHistoryGroup[] {
     const groups: DateHistoryGroup[] = [];
     let current: Message[] = [];
     let currentHasOpening = false;
+    const encounters = new Map<string, Message[]>();
 
     const flush = () => {
         if (current.length === 0) return;
@@ -68,6 +71,14 @@ export function splitDateEncounters(messages: Message[]): DateHistoryGroup[] {
     };
 
     for (const message of ordered) {
+        const encounterId = message.metadata?.dateEncounterId;
+        if (typeof encounterId === 'string' && encounterId) {
+            flush();
+            const bucket = encounters.get(encounterId) || [];
+            bucket.push(message);
+            encounters.set(encounterId, bucket);
+            continue;
+        }
         const isOpening = message.metadata?.isOpening === true;
         if (isOpening) {
             flush();
@@ -89,7 +100,14 @@ export function splitDateEncounters(messages: Message[]): DateHistoryGroup[] {
     }
 
     flush();
-    return groups;
+    for (const [id, bucket] of encounters) {
+        groups.push({
+            id: `encounter-${id}`, dateKey: getLocalDateKey(bucket[0].timestamp),
+            startAt: bucket[0].timestamp, endAt: bucket[bucket.length - 1].timestamp,
+            messages: bucket, encounterCount: 1, hasOpeningAnchor: true,
+        });
+    }
+    return groups.sort((a, b) => a.startAt - b.startAt || a.messages[0].id - b.messages[0].id);
 }
 
 export function groupDateMessagesByDate(messages: Message[]): DateHistoryGroup[] {
@@ -108,8 +126,9 @@ export function groupDateMessagesByDate(messages: Message[]): DateHistoryGroup[]
         startAt: bucket[0].timestamp,
         endAt: bucket[bucket.length - 1].timestamp,
         messages: bucket,
-        encounterCount: bucket.filter(message => message.metadata?.isOpening === true).length,
-        hasOpeningAnchor: bucket.some(message => message.metadata?.isOpening === true),
+        encounterCount: new Set(bucket.map(message => message.metadata?.dateEncounterId).filter(Boolean)).size
+            + bucket.filter(message => !message.metadata?.dateEncounterId && message.metadata?.isOpening === true).length,
+        hasOpeningAnchor: bucket.some(message => message.metadata?.dateEncounterId || message.metadata?.isOpening === true),
     }));
 }
 
@@ -133,7 +152,7 @@ const exportedContent = (message: Message): string => {
     }
     if (message.type === 'emoji') return message.content?.trim() ? `[表情] ${message.content.trim()}` : '[表情]';
     if (message.type === 'voice') return message.content?.trim() ? `[语音] ${message.content.trim()}` : '[语音]';
-    return message.content?.trim() || '(无内容)';
+    return stripDateVoiceTranslations(message.content || '') || '(无内容)';
 };
 
 export function formatDateHistoryExport(

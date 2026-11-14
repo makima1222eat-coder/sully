@@ -1,3 +1,4 @@
+import { loadCharacterContextMessages } from '../../utils/chatContextRange';
 
 import React, { useState, useEffect, useRef } from 'react';
 import { BankShopState, CharacterProfile, UserProfile, APIConfig, ShopStaff } from '../../types';
@@ -91,6 +92,7 @@ const BankShopScene: React.FC<Props> = ({
 
     // Handle Invite Logic - Enhanced with context + chat history
     const handleInvite = async () => {
+
         const COST = 30;
         if (shopState.actionPoints < COST) {
             addToast(`AP不足 (需${COST})`, 'error');
@@ -105,13 +107,13 @@ const BankShopScene: React.FC<Props> = ({
         try {
             const char = characters[Math.floor(Math.random() * characters.length)];
             await injectMemoryPalace(char);
-            const context = ContextBuilder.buildCoreContext(char, userProfile, true);
+            const characterContextInput = { char, user: userProfile, includeDetailedMemories: true };
+
 
             // Load recent chat history for richer context
-            const recentMsgs = await DB.getRecentMessagesByCharId(char.id, 40);
+            const recentMsgs = await loadCharacterContextMessages(char);
             const chatSnippet = recentMsgs
                 .filter(m => m.type === 'text')
-                .slice(-20)
                 .map(m => `${m.role === 'user' ? userProfile.name : char.name}: ${m.content.substring(0, 80)}`)
                 .join('\n');
 
@@ -119,7 +121,7 @@ const BankShopScene: React.FC<Props> = ({
             const pet = getVisitorPet(char.id);
             const hasPetHere = !!pet;
 
-            let prompt = `${context}
+            let prompt = `
 
 ### Recent Chat History (for context only)
 ${chatSnippet || '(No recent chats)'}
@@ -161,8 +163,9 @@ Language: Chinese.`;
             const res = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: 'user', content: prompt }] })
-            });
+                body: JSON.stringify({ model: apiConfig.model, messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [{ role: 'user', content: prompt }])) }),
+                __sullyMeta: { appId: 'bank', appName: '银行', charId: char.id, charName: char.name, purpose: '咖啡馆邀约互动' },
+            } as RequestInit);
 
             if (res.ok) {
                 const data = await safeResponseJson(res);

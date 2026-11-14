@@ -240,7 +240,7 @@ const Live2DActionSettings: React.FC<Live2DActionSettingsProps> = ({
   }), [actions]);
 
   return (
-    <div className="absolute inset-0 z-[90] flex flex-col bg-[#08070d]/95 text-white backdrop-blur-xl">
+    <div className="sully-stage-dark [color-scheme:dark] absolute inset-0 z-[90] flex flex-col bg-[#08070d]/95 text-white backdrop-blur-xl">
       <div className="flex shrink-0 items-center justify-between border-b border-white/10 px-5 pb-3" style={{ paddingTop: 'max(1.25rem, var(--safe-top))' }}>
         <div className="min-w-0">
           <div className="text-[10px] tracking-[0.2em] text-white/35">{setupMode === 'import' ? 'LIVE2D IMPORT · WARDROBE SETUP' : 'LIVE2D ACTION LIBRARY · ADVANCED'}</div>
@@ -619,7 +619,7 @@ const Live2DActionSettings: React.FC<Live2DActionSettingsProps> = ({
                       setFocusedParamId(event.target.value);
                       setShowTargetPreview(true);
                     }}
-                    className="mt-3 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-[10px] text-white/65 outline-none"
+                    className="mt-3 w-full rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-[10px] text-white/65 [color-scheme:dark] [&_option]:bg-[#12101b] [&_option]:text-white [&>optgroup]:bg-[#12101b] [&>optgroup]:text-white/70 outline-none"
                   >
                     {!meta && <option value={param.id}>{param.id}</option>}
                     {groupedParameters.map(group => (
@@ -721,7 +721,7 @@ const Live2DActionSettings: React.FC<Live2DActionSettingsProps> = ({
             const selectedWardrobeId = normalizedActions.some(action => action.id === activeWardrobeActionId && action.wardrobe)
               ? activeWardrobeActionId
               : normalizedActions.find(action => action.wardrobe)?.id;
-            onSave({ ...config, framing, actions: normalizedActions, activeWardrobeActionId: selectedWardrobeId });
+            onSave({ ...config, actionPolicyVersion: 2, framing, actions: normalizedActions, activeWardrobeActionId: selectedWardrobeId });
           }}
           className="flex w-full items-center justify-center gap-2 rounded-2xl py-3 text-sm font-semibold text-white active:scale-[0.98]"
           style={{ background: `linear-gradient(90deg, ${accentColor}aa, ${accentColor})`, boxShadow: `0 0 20px ${accentColor}44` }}

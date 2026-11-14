@@ -1,3 +1,4 @@
+import { ContextBuilder } from '../context';
 /**
  * Memory Palace — 房间门牌（Room Plates）
  *
@@ -18,6 +19,7 @@
  * 定义只存在于质地的负空间里。prompt 层约束 + mergePlateEntries 兜底过滤。
  */
 
+import { readMaintenanceSettings } from './maintenanceMode';
 import type { MemoryNode, PlateRoom, RoomPlate } from './types';
 import { PLATE_ROOMS, PLATE_TITLES } from './types';
 import { MemoryNodeDB, RoomPlateDB, loadOrCreatePlate, mutatePlate } from './db';
@@ -56,13 +58,14 @@ import { isPlateRoom, mergePlateEntries } from './roomPlateCore';
  * 提示词与解析共用 roomPlateCore，跟云端那条路一字不差。
  */
 async function callPlateLLM(
+    charId: string,
     charName: string,
     userName: string,
     plates: RoomPlate[],
     materials: PlateMaterial[],
     llmConfig: LightLLMConfig,
     identityContext: string,
-): Promise<PlateLLMItem[]> {
+    ): Promise<PlateLLMItem[]> {
     const systemPrompt = buildPlateConsolidationPrompt({
         charName,
         userName,
@@ -90,7 +93,7 @@ async function callPlateLLM(
                 stream: false,
             }),
         },
-        2, PLATE_LLM_TIMEOUT_MS, { appName: '记忆宫殿', purpose: '门牌整理' }
+        2, PLATE_LLM_TIMEOUT_MS, { appId: 'memorypalace', appName: '记忆宫殿', charId, charName, purpose: '门牌整理' }
     );
 
     return parsePlateLlmReply(data.choices?.[0]?.message?.content || '');
@@ -175,19 +178,19 @@ async function consolidatePlates(
 
     // 身份上下文：直接走 ContextBuilder.buildCoreContext(char, user, false)——
     // 与全 App 统一的人设口径（身份/核心指令/世界观/用户画像/印象/核心记忆），不重复造轮子。
-    // includeDetailedMemories=false：不带详细日志与向量召回，整理 LLM 用不上。
+    // includeDetailedMemories=false：只省略神经链接详细日志；已有向量召回仍统一注入。
     // 尤其是回填场景，材料横跨几个月，没有人设参照时蒸馏视角会飘。
+
     let identityContext = '';
     try {
         const { DB } = await import('../db');
-        const { ContextBuilder } = await import('../context');
         const chars = await DB.getAllCharacters();
         const profile = chars.find(c => c.id === charId);
         const up = await DB.getUserProfile();
-        if (profile && up) identityContext = ContextBuilder.buildCoreContext(profile, up, false);
+        if (profile && up) identityContext = (await ContextBuilder.buildCoreContext(profile, up, false));
     } catch { /* 拿不到就裸跑，prompt 里仍有名字与身份确认段 */ }
 
-    if (preferCloud) {
+    if (preferCloud && !readMaintenanceSettings().enabled) {
         const cloud = await tryCloudConsolidation({
             charId, charName, userName, identityContext, plates, materials, llmConfig, prioritySubmissions, snapshotAt,
         });
@@ -200,11 +203,13 @@ async function consolidatePlates(
 
     let items: PlateLLMItem[] = [];
     try {
-        items = await callPlateLLM(charName, userName, plates, materials, llmConfig, identityContext);
+        items = await callPlateLLM(charId, charName, userName, plates, materials, llmConfig, identityContext);
     } catch (e: any) {
+        if (llmConfig.deferPlateMaintenance) throw e;
         console.warn(`🚪 [RoomPlate] LLM 整理调用失败: ${e?.message || e}`);
     }
     if (items.length === 0) {
+        if (llmConfig.deferPlateMaintenance) throw new Error('门牌整理没有返回有效内容，请稍后重试');
         console.warn(`🚪 [RoomPlate] LLM 未返回有效条目，门牌保持不动`);
         if (prioritySubmissions) {
             return withRescued(await fallbackMergeSubmissions(plates, prioritySubmissions, Date.now()));

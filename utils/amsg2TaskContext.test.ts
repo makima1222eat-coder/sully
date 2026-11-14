@@ -1,25 +1,21 @@
 // utils/amsg2TaskContext.test.ts
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('./db', () => ({
-  DB: { getRecentMessagesByCharId: vi.fn() },
-}));
 vi.mock('./activeMsgStore', () => ({
   ActiveMsgStore: {
-    upsertExpiredNotices: vi.fn().mockResolvedValue([]),
     getExpiredNotices: vi.fn().mockResolvedValue([]),
   },
 }));
 
 import {
-  AMSG2_TASK_LOOKBACK_MS,
   buildAmsg2NoticesText,
   buildAmsg2TaskContextText,
   buildUserCancelledNotices,
   collectAmsg2TaskContext,
+  collectInPersonNotices,
 } from './amsg2TaskContext';
-import { DB } from './db';
 import { ActiveMsgStore } from './activeMsgStore';
+import { buildAmsg2ChatScheduleBrief, buildFireScheduleBlock } from './amsgFireSchedule';
 import type { ActiveMsg2TaskRecord, Amsg2ExpiredNoticeRecord, CharacterProfile } from '../types';
 
 const H = 3600_000;
@@ -43,7 +39,8 @@ describe('buildAmsg2TaskContextText', () => {
     expect(text).toContain('schedule_active_message');
     expect(text).toContain('排成真任务'); // 嘴上许了就要排成真任务
     expect(text).toContain('不要只在正文里答应'); // 承诺不能只停在台词里
-    expect(text).toContain('优先排下来'); // 有自然联系的倾向时往执行侧推半步
+    expect(text).toContain('会就排');     // 真想联系就排
+    expect(text).toContain('随口一想');   // 拿不准的不排：每一条都要花一次 API
     expect(text).toContain('硬排');       // 人设优先，不为排而排
     expect(text).toContain('自己的日程'); // 内容从角色自己的生活里长出来
     expect(text).not.toContain('进行中：');
@@ -55,6 +52,20 @@ describe('buildAmsg2TaskContextText', () => {
     const text = buildAmsg2TaskContextText([pendingTask], [], Date.now(), undefined);
     expect(text).toContain('schedule_active_message');
     expect(text).toContain('进行中：');
+  });
+
+  it('本地与即时对话共用完整的自主联系说明，保留用户名与不打扰约束', () => {
+    const local = buildAmsg2TaskContextText([], [], Date.now(), undefined, undefined, '条条');
+    const brief = buildAmsg2ChatScheduleBrief('条条');
+    for (const mode of ['native', 'text'] as const) {
+      const cloud = buildFireScheduleBlock(mode, {
+        nowMs: Date.now(), tz: { tzId: 'Asia/Tokyo' }, context: 'chat', targetName: '条条',
+      });
+      expect(local).toContain(brief);
+      expect(cloud).toContain(brief);
+      expect(cloud).toContain('条条明确说别打扰');
+      expect(cloud).not.toContain('这条消息发完，如果还有话');
+    }
   });
 
   it('用 ChatApp 用户名称呼对方，不再使用泛称', () => {
@@ -70,17 +81,18 @@ describe('buildAmsg2TaskContextText', () => {
     expect(text).toContain('问问考试结果');
     expect(text).not.toContain('已作废');
   });
-  it('作废段包含三选一引导、时机约束、renew 与重建引导、不复述约束', () => {
+  it('没发段引导新建一次性任务，不再续期已销账任务', () => {
     const text = buildAmsg2TaskContextText([], [expired], Date.now(), undefined)!;
-    expect(text).toContain('已作废');
-    expect(text).toContain('renew_active_message');
-    expect(text).toContain('cancel_active_message + schedule_active_message');
+    expect(text).toContain('到点没发出去：');
+    expect(text).toContain('schedule_active_message');
+    expect(text).not.toContain('renew_active_message');
+    expect(text).not.toContain('cancel_active_message + schedule_active_message');
     expect(text).toContain('强行转移');
     expect(text).toContain('不要向对方复述');
   });
 
-  // 回归守卫：防复述约束以前只挂在作废那一段里，「仅进行中」形态整块裸奔——
-  // 短 id、「遇忙作废」这些系统腔会被角色照着念出来。
+  // 回归守卫：防复述约束只挂在回执那一段里的话，「仅进行中」形态整块裸奔——
+  // 短 id、「到点看情况」这些系统腔会被角色照着念出来。
   it('只有进行中任务时也带防复述约束', () => {
     const text = buildAmsg2TaskContextText([pendingTask], [], Date.now(), undefined)!;
     expect(text).toContain('不要向对方复述');
@@ -98,9 +110,10 @@ describe('buildAmsg2TaskContextText', () => {
       ...expired, id: `${expired.id}:cancelled`, kind: 'user-cancelled',
     };
     const text = buildAmsg2NoticesText([expired, cancelled], undefined, '条条')!;
-    expect(text).toContain('已作废（到点时对话正在进行');
+    expect(text).toContain('到点没发出去：');
     expect(text).toContain('已被手动取消');
-    expect(text).toContain('renew_active_message');
+    expect(text).toContain('schedule_active_message');
+    expect(text).not.toContain('renew_active_message');
     expect(text).not.toContain('你和条条的联系');   // 常驻简介不搭车
     expect(text).not.toContain('进行中：');
     expect(text.trimEnd().endsWith('不要向条条复述或提及这份排程信息本身的存在。')).toBe(true);
@@ -119,8 +132,8 @@ describe('buildAmsg2TaskContextText', () => {
     expect(text).toContain('已被手动取消');
     expect(text).toContain('[aabbccdd]');
     expect(text).toContain('不必向用户求证');
-    // 手动取消不该混进「自动作废」那段的三选一引导里（续期对它没有意义）
-    expect(text).not.toContain('到点时对话正在进行');
+    // 手动取消不该混进「到点没发」那段的三选一引导里（续期对它没有意义）
+    expect(text).not.toContain('到点没发出去');
   });
 
   it('两类回执同时存在 → 各占一段', () => {
@@ -128,8 +141,19 @@ describe('buildAmsg2TaskContextText', () => {
       ...expired, id: 'bbbbbbbb-0000-0000-0000-000000000000:cancelled', kind: 'user-cancelled',
     };
     const text = buildAmsg2TaskContextText([], [expired, cancelled], Date.now(), undefined)!;
-    expect(text).toContain('已作废（到点时对话正在进行');
+    expect(text).toContain('到点没发出去：');
     expect(text).toContain('已被手动取消');
+  });
+
+  // 没发的原因是云端给的，照着说：角色自己决定不说的、被频率规矩拦下的、没写出来的，
+  // 接下来该怎么处理不一样。
+  it('没发的那一行带上云端给的原因', () => {
+    const line = (reason: Amsg2ExpiredNoticeRecord['reason']) =>
+      buildAmsg2TaskContextText([], [{ ...expired, reason }], Date.now(), undefined, undefined, '小明');
+    expect(line('declined')).toContain('——你当时看了对话，决定不说');
+    expect(line('daily-limit')).toContain('——被小明定的主动消息频率规矩拦下了');
+    expect(line('empty-generation')).toContain('——当时没写出要说的话');
+    expect(line('stale')).toContain('——到点时服务中断了');
   });
 
   // 回归守卫：工具循环的第二轮起，这份清单是现算的，里面会有角色本轮刚排好的任务。
@@ -197,94 +221,63 @@ describe('buildUserCancelledNotices', () => {
   });
 });
 
-// 回归守卫：送达证据以前只在「最近 200 条」里找。重度用户 48h 聊过 200 条之后，
-// 已经发出去的那条主动消息被挤出窗口 → 检出侧把它当成作废 → 角色把发过的事再来一遍。
-describe('collectAmsg2TaskContext 的送达证据窗口', () => {
-  const NOW = Date.UTC(2026, 7, 2, 12, 0);
-  const CLIENT_TASK_ID = 'cid-morning';
-  const TASK_UUID = 'aabbccdd-1111-4111-8111-111111111111';
-
-  /** 触发时刻（2h 前）+ 任务创建时刻（3h 前）。 */
-  const occurrenceMs = NOW - 2 * H;
-  const createdAtMs = NOW - 3 * H;
-
-  /**
-   * 送达证据（这一次确实发出去了）在最老的位置，后面压着一大堆用户消息。
-   *
-   * 用户消息落在触发时刻之后的热聊窗内——闸认的就是「到点前后十分钟在不在聊」，
-   * 落在窗外的话这一批根本不会被检出作废，两条用例都测不到想测的东西。
-   */
-  const buildHistory = (chatterCount: number) => {
-    const delivered = {
-      id: 1, role: 'assistant', timestamp: occurrenceMs + 60_000,
-      metadata: { activeMsg2: { taskId: 'remote-1' }, amsgClientTaskId: CLIENT_TASK_ID },
-    };
-    const chatter = Array.from({ length: chatterCount }, (_, i) => ({
-      id: i + 2, role: 'user',
-      timestamp: occurrenceMs + 2 * 60_000 + i * 1_000,
-      metadata: {},
-    }));
-    return [delivered, ...chatter];
-  };
-
-  const charWithTask = (): CharacterProfile => ({
-    id: 'char-heavy', name: '重度聊天',
-    activeMsg2Config: {
-      enabled: true,
-      tasks: [{
-        taskUuid: TASK_UUID, clientTaskId: CLIENT_TASK_ID, mode: 'auto',
-        firstSendTime: new Date(occurrenceMs).toISOString(), recurrenceType: 'none',
-        expirePolicy: 'expire',
-        source: 'character', status: 'scheduled', createdAt: createdAtMs,
-      }],
-    },
-  } as unknown as CharacterProfile);
+// 「到点没发」只认台账：没发的原因和时刻由云端回结果写进来（amsgFireSkipResultApply），
+// 这里不再对着聊天记录推断。
+describe('collectAmsg2TaskContext', () => {
+  const char = {
+    id: 'char-1', name: '小明',
+    activeMsg2Config: { enabled: true, tasks: [pendingTask] },
+  } as unknown as CharacterProfile;
 
   beforeEach(() => {
-    vi.setSystemTime(NOW);
-    (ActiveMsgStore.upsertExpiredNotices as any).mockClear();
+    (ActiveMsgStore.getExpiredNotices as any).mockReset();
+  });
+
+  it('台账上未告知的回执进这一轮，已告知的不再重复', async () => {
+    (ActiveMsgStore.getExpiredNotices as any).mockResolvedValue([
+      { ...expired, id: 'fresh', reason: 'declined' },
+      { ...expired, id: 'told', notifiedAt: 1 },
+    ]);
+    const result = await collectAmsg2TaskContext(char);
+    expect(result.expiredIds).toEqual(['fresh']);
+    expect(result.text).toContain('到点没发出去：');
+    expect(result.text).toContain('进行中：');
+  });
+
+  it('台账是空的 → 没有回执段，哪怕任务到点时用户正在聊天', async () => {
     (ActiveMsgStore.getExpiredNotices as any).mockResolvedValue([]);
-  });
-
-  it('近史超过 200 条、送达证据在 200 条之外 → 不再误判成作废', async () => {
-    const history = buildHistory(260);
-    (DB.getRecentMessagesByCharId as any).mockImplementation(
-      async (_id: string, limit: number) => history.slice(-limit));
-
-    const result = await collectAmsg2TaskContext(charWithTask());
-
-    // 修复前：固定取 200 条 → 证据被挤出窗口 → 这里会攒下一条作废回执
-    expect(ActiveMsgStore.upsertExpiredNotices).not.toHaveBeenCalled();
+    const result = await collectAmsg2TaskContext(char);
     expect(result.expiredIds).toEqual([]);
-  });
-
-  it('真的没送达（证据不存在）照旧检出作废', async () => {
-    const history = buildHistory(260).filter((m) => m.role !== 'assistant');
-    (DB.getRecentMessagesByCharId as any).mockImplementation(
-      async (_id: string, limit: number) => history.slice(-limit));
-
-    await collectAmsg2TaskContext(charWithTask());
-
-    expect(ActiveMsgStore.upsertExpiredNotices).toHaveBeenCalledTimes(1);
-    const [, records] = (ActiveMsgStore.upsertExpiredNotices as any).mock.calls[0];
-    expect(records).toHaveLength(1);
-    expect(records[0].kind).toBe('expired');
-  });
-
-  it('历史不足一页时不空转多要一次', async () => {
-    (DB.getRecentMessagesByCharId as any).mockClear();
-    (DB.getRecentMessagesByCharId as any).mockResolvedValue(buildHistory(10));
-
-    await collectAmsg2TaskContext(charWithTask());
-
-    expect(DB.getRecentMessagesByCharId).toHaveBeenCalledTimes(1);
+    expect(result.text).not.toContain('到点没发出去');
   });
 });
 
-// 回看期必须明确短于作废台账的 TTL（48h）：一样长的话，边界那天的触发会在台账
-// 刚清掉它的下一轮被重新检出，同一件事给角色说第二遍。
-describe('回看期与台账 TTL 的关系', () => {
-  it('回看期 < 48h', () => {
-    expect(AMSG2_TASK_LOOKBACK_MS).toBeLessThan(48 * H);
+// 见面期间作废的主动消息：只交给见面下一轮，只写想说的事，不写时间（见面可能是架空时间线）。
+describe('collectInPersonNotices', () => {
+  beforeEach(() => {
+    (ActiveMsgStore.getExpiredNotices as any).mockReset();
+  });
+
+  it('只取见面中作废、还没告知的；没有内容的也销账但不进文案', async () => {
+    (ActiveMsgStore.getExpiredNotices as any).mockResolvedValue([
+      { ...expired, id: 'date-1', reason: 'in-person', promptHint: '问问药吃了没' },
+      { ...expired, id: 'date-auto', reason: 'in-person', mode: 'auto', promptHint: undefined },
+      { ...expired, id: 'date-told', reason: 'in-person', notifiedAt: 1 },
+      { ...expired, id: 'declined', reason: 'declined' },
+    ]);
+    const result = await collectInPersonNotices('c1', '小明');
+    expect(result.ids).toEqual(['date-1', 'date-auto']);
+    expect(result.text).toContain('- 问问药吃了没');
+    expect(result.text).toContain('不提就算了');
+    expect(result.text).not.toMatch(/\d{1,2}:\d{2}/);
+  });
+
+  it('全是没内容的 → 不出文案', async () => {
+    (ActiveMsgStore.getExpiredNotices as any).mockResolvedValue([
+      { ...expired, id: 'date-auto', reason: 'in-person', mode: 'auto', promptHint: undefined },
+    ]);
+    const result = await collectInPersonNotices('c1');
+    expect(result.text).toBeNull();
+    expect(result.ids).toEqual(['date-auto']);
   });
 });

@@ -1,17 +1,14 @@
 /**
  * agenticTools — 二轮 LLM 数据工具的纯函数封装
  *
- * Phase 2 Round 1 (2d) 抽出: 把 applyAssistantPostProcessing.ts 1810 行里的 9 个
- * "read 类" 工具的 data-fetch 部分集中起来, 作为单一 dispatch 入口。
+ * 把 "read 类" 工具的 data-fetch 部分集中起来: 本地聊天的 applyAssistantPostProcessing
+ * 直接 import 具体 run* 函数, 主动消息 2.0 的 worker 工具循环走 dispatchAgenticTool。
  *
  * - 每个 run* 返回 `{ ok: true, ... } | { ok: false, reason, message? }`
- * - 不调 2nd-pass LLM (这是 applyAssistantPostProcessing / instantToolRunner 的事)
+ * - 不调 2nd-pass LLM (这是 applyAssistantPostProcessing / worker 工具循环的事)
  * - 不修改 aiContent (调用方负责)
  * - 不 toast / setStatus (调用方负责)
  * - XHS 工具会修改 ctx.xhsCaches + ctx.lastXhsNotesRef (跨 tool 共享状态)
- *
- * Phase 2 Round 2 会在 `utils/instantToolRunner.ts` 里复用同一组函数, 接收 worker 发来的
- * tool-request, 把 `detailText` / `resultsText` 等 JSON.stringify 后 POST /continue。
  */
 
 // 值 import 只允许环境无关叶子（realtimeFetchCore / xhsMcpClient / localDate）——这份文件会被
@@ -131,6 +128,7 @@ export interface AgenticToolMemory {
 }
 
 export interface AgenticToolCtx {
+    signal?: AbortSignal;
     char: AgenticToolChar;
     userProfile: UserProfile;
     realtimeConfig?: AgenticToolRealtimeConfig;
@@ -210,7 +208,7 @@ export async function runSearch(
     if (!realtimeConfig?.newsEnabled || !realtimeConfig?.newsApiKey) {
         return { ok: false, reason: 'no_api_key', query: args.query };
     }
-    const searchResult = await performSearch(args.query, realtimeConfig.newsApiKey);
+    const searchResult = await performSearch(args.query, realtimeConfig.newsApiKey, ctx.signal);
     // 「请求没跑通」和「搜过了但没结果」得分开（同 runXhsSearch）。performSearch 的
     // success:false 两种都包：断网、代理 5xx、返回不是 JSON，跟真的零结果混在一起。
     // 都归 no_results 的话，角色会把一次根本没发出去的搜索说成「我刚搜了下，没什么新鲜的」。
@@ -252,7 +250,7 @@ export async function runReadDiary(
         realtimeConfig.notionApiKey,
         realtimeConfig.notionDatabaseId,
         char.name,
-        targetDate,
+        targetDate, ctx.signal,
     );
 
     // 「查不动」和「那天真没写」是两回事：Notion 凭据过期 / 代理挂了都会走 success:false，
@@ -271,7 +269,7 @@ export async function runReadDiary(
     for (const entry of findResult.entries) {
         const readResult = await notionReadDiaryContent(
             realtimeConfig.notionApiKey,
-            entry.id,
+            entry.id, ctx.signal,
         );
         if (readResult.success) {
             diaryContents.push(`📔「${entry.title}」(${entry.date})\n${readResult.content}`);
@@ -319,7 +317,7 @@ export async function runFsReadDiary(
         realtimeConfig.feishuBaseId,
         realtimeConfig.feishuTableId,
         char.name,
-        targetDate,
+        targetDate, ctx.signal,
     );
 
     // 同 runReadDiary：飞书 token 拿不到 / 接口报错都是 success:false，跟「那天没写」分开。
@@ -360,7 +358,7 @@ export async function runReadNote(
         realtimeConfig.notionApiKey,
         realtimeConfig.notionNotesDatabaseId,
         args.keyword,
-        3,
+        3, ctx.signal,
     );
 
     // 同 runReadDiary：搜不动 ≠ 对方没写过这篇笔记。
@@ -377,7 +375,7 @@ export async function runReadNote(
     for (const entry of findResult.entries) {
         const readResult = await notionReadNoteContent(
             realtimeConfig.notionApiKey,
-            entry.id,
+            entry.id, ctx.signal,
         );
         if (readResult.success) {
             noteContents.push(`📝「${entry.title}」(${entry.date})\n${readResult.content}`);
@@ -395,15 +393,15 @@ export async function runReadNote(
 
 // ─── XHS helpers (private, used by run* below) ──────────────────────────────
 
-async function xhsSearchImpl(conf: { mcpUrl: string }, keyword: string): Promise<{ success: boolean; notes: XhsNote[]; message?: string }> {
-    const r = await XhsMcpClient.search(conf.mcpUrl, keyword);
+async function xhsSearchImpl(conf: { mcpUrl: string }, keyword: string, signal?: AbortSignal): Promise<{ success: boolean; notes: XhsNote[]; message?: string }> {
+    const r = await XhsMcpClient.search(conf.mcpUrl, keyword, undefined, signal);
     if (!r.success) return { success: false, notes: [], message: r.error };
     const raw = extractNotesFromMcpData(r.data);
     return { success: true, notes: raw.map(n => normalizeNote(n) as XhsNote) };
 }
 
-async function xhsBrowseImpl(conf: { mcpUrl: string }): Promise<{ success: boolean; notes: XhsNote[]; message?: string }> {
-    const r = await XhsMcpClient.getRecommend(conf.mcpUrl);
+async function xhsBrowseImpl(conf: { mcpUrl: string }, signal?: AbortSignal): Promise<{ success: boolean; notes: XhsNote[]; message?: string }> {
+    const r = await XhsMcpClient.getRecommend(conf.mcpUrl, signal);
     if (!r.success) return { success: false, notes: [], message: r.error };
     const unwrapped = r.data?.data && typeof r.data.data === 'object' && !Array.isArray(r.data.data) ? r.data.data : r.data;
     console.log(`📕 [XHS] getRecommend 响应类型: ${typeof r.data}, 是否有 data 嵌套: ${unwrapped !== r.data}, unwrapped keys: ${unwrapped && typeof unwrapped === 'object' ? Object.keys(unwrapped).join(',') : 'N/A'}`);
@@ -447,7 +445,7 @@ export async function runXhsSearch(
     if (!xhsConf.enabled) {
         return { ok: false, reason: 'not_enabled', keyword: args.keyword };
     }
-    const result = await xhsSearchImpl(xhsConf, args.keyword);
+    const result = await xhsSearchImpl(xhsConf, args.keyword, ctx.signal);
     // 「连不上」和「搜过了但没结果」得分开：两者都归成 no_results 的话，角色会把一次
     // 根本没发生的搜索说成「我刚在小红书搜了下，没啥好东西」——一句没发生的事说成
     // 发生过。后台触发时服务器多半就在用户自己电脑上（关机 / 不在同一网络），这条最常走。
@@ -480,7 +478,7 @@ export async function runXhsBrowse(
     if (!xhsConf.enabled) {
         return { ok: false, reason: 'not_enabled', category: args.category };
     }
-    const result = await xhsBrowseImpl(xhsConf);
+    const result = await xhsBrowseImpl(xhsConf, ctx.signal);
     console.log('📕 [XHS] 浏览结果:', result.success, result.message, result.notes?.length || 0);
     // 同 runXhsSearch：连不上 ≠ 刷了但首页是空的。
     if (!result.success) {
@@ -527,7 +525,7 @@ export async function runXhsMyProfile(
             console.log(`📕 [XHS] 用 getUserProfile(${userId}) 获取主页...`);
             ctx.onProgress?.('xhs', '正在获取主页信息...');
             try {
-                const profileResult = await XhsMcpClient.getUserProfile(xhsConf.mcpUrl, userId, xhsConf.userXsecToken);
+                const profileResult = await XhsMcpClient.getUserProfile(xhsConf.mcpUrl, userId, xhsConf.userXsecToken, ctx.signal);
                 if (profileResult.success && profileResult.data) {
                     const d = profileResult.data;
                     if (typeof d === 'string') {
@@ -584,7 +582,7 @@ export async function runXhsMyProfile(
         }
         console.log(`📕 [XHS] 降级: 用昵称「${nickname}」搜索...`);
         ctx.onProgress?.('xhs', '正在搜索你的笔记...');
-        const searchResult = await xhsSearchImpl(xhsConf, nickname);
+        const searchResult = await xhsSearchImpl(xhsConf, nickname, ctx.signal);
         if (!searchResult.success) {
             return { ok: false, reason: 'unreachable', message: searchResult.message };
         }
@@ -625,14 +623,14 @@ export async function runXhsDetail(
     let xsecToken = findXsecToken(ctx.xhsCaches, lastNotes, args.noteId);
     console.log(`📕 [XHS] AI要查看笔记详情:`, args.noteId, xsecToken ? '(有xsecToken)' : '(无xsecToken)');
 
-    let result = await XhsMcpClient.getNoteDetail(xhsConf.mcpUrl, args.noteId, xsecToken, { loadAllComments: true });
+    let result = await XhsMcpClient.getNoteDetail(xhsConf.mcpUrl, args.noteId, xsecToken, { loadAllComments: true }, ctx.signal);
 
         if (!result.success || !result.data) {
             const cachedTitle = ctx.xhsCaches?.noteTitleCache.get(args.noteId);
             if (cachedTitle) {
                 console.log(`📕 [XHS] 详情失败，尝试重新搜索「${cachedTitle}」以刷新 xsecToken...`);
                 ctx.onProgress?.('xhs', '正在刷新访问凭证...');
-                const refreshResult = await xhsSearchImpl(xhsConf, cachedTitle);
+                const refreshResult = await xhsSearchImpl(xhsConf, cachedTitle, ctx.signal);
                 if (refreshResult.success && refreshResult.notes.length > 0) {
                     cacheXsecTokensImpl(ctx.xhsCaches, refreshResult.notes);
                     if (ctx.lastXhsNotesRef) ctx.lastXhsNotesRef.current = refreshResult.notes;
@@ -641,7 +639,7 @@ export async function runXhsDetail(
                         xsecToken = refreshedNote.xsecToken;
                         console.log(`📕 [XHS] 拿到新 xsecToken，重试 detail...`);
                         ctx.onProgress?.('xhs', '正在查看笔记详情...');
-                        result = await XhsMcpClient.getNoteDetail(xhsConf.mcpUrl, args.noteId, xsecToken, { loadAllComments: true });
+                        result = await XhsMcpClient.getNoteDetail(xhsConf.mcpUrl, args.noteId, xsecToken, { loadAllComments: true }, ctx.signal);
                     } else {
                         console.warn(`📕 [XHS] 重新搜索结果中未找到 noteId=${args.noteId}`);
                     }
@@ -700,6 +698,8 @@ export async function runXhsDetail(
                     author: detailNote.author || matched?.author || '',
                     authorId: detailNote.authorId || matched?.authorId || '',
                     xsecToken: detailNote.xsecToken || detailToken || xsecToken || matched?.xsecToken,
+                    url: matched?.url || detailNote.url,
+                    xsecSource: matched?.xsecSource || detailNote.xsecSource,
                     comments: detailNote.comments || matched?.comments,
                 };
                 const index = ctx.lastXhsNotesRef.current.findIndex(n => n.noteId === args.noteId);
@@ -814,11 +814,11 @@ export function parseDiaryDate(dateInput: string): string {
     return '';
 }
 
-// ─── Dispatch (Round 2 instantToolRunner 用) ───────────────────────────────
+// ─── Dispatch (worker 工具循环用) ───────────────────────────────────────────
 
 /**
- * Round 2 instantToolRunner 通过 tool name 调度. Round 1 客户端不使用此入口,
- * 直接 import 具体 run* 函数; 留在这里是为了 Round 2 即插即用。
+ * 按 tool name 调度。主动消息 2.0 的 worker 工具循环（worker/amsg/src/index.ts）走这里；
+ * 本地聊天不经过此入口, 直接 import 具体 run* 函数。
  */
 export async function dispatchAgenticTool(
     toolName: string,

@@ -62,7 +62,8 @@ export function buildGroupTopicPrompt(
     }).join('\n\n');
     const logs = batch.map(m => {
         const time = new Date(m.timestamp).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-        return `[${time}] ${nameOf(m)}: ${messageLogText(m)}`;
+        const prefix = group.timeAwarenessEnabled !== false ? `[${time}] ` : '';
+        return `${prefix}${nameOf(m)}: ${messageLogText(m)}`;
     }).join('\n');
     return `你是群聊档案整理员。请把下面一段已经离开近期上下文的群聊，整理成一张所有成员共享的“公共话题盒”。
 

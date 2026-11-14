@@ -1,3 +1,5 @@
+import { ContextBuilder, type ContextMessage } from '../utils/context';
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useOS } from '../context/OSContext';
@@ -28,23 +30,29 @@ import {
     Cards,
 } from '@phosphor-icons/react';
 import TokenImg from '../components/os/TokenImg';
+import type { ApiCallMeta } from '../utils/apiCallLog';
 
 // --- Helper: Generate ID ---
 const genId = () => Math.random().toString(36).slice(2, 10);
 
 // --- Helper: API Call ---
-async function callAPI(apiConfig: { baseUrl: string; apiKey: string; model: string }, prompt: string): Promise<string> {
+async function callAPI(
+    apiConfig: { baseUrl: string; apiKey: string; model: string },
+    messages: ContextMessage[],
+    meta: ApiCallMeta,
+): Promise<string> {
     const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
         body: JSON.stringify({
             model: apiConfig.model,
-            messages: [{ role: 'user', content: prompt }],
+            messages,
             temperature: 0.9,
             max_tokens: 4000,
             stream: false,
         }),
-    });
+        __sullyMeta: { appId: 'guidebook', appName: '攻略本', ...meta },
+    } as RequestInit);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const text = await response.text();
     let json: any;
@@ -54,11 +62,10 @@ async function callAPI(apiConfig: { baseUrl: string; apiKey: string; model: stri
     return json?.choices?.[0]?.message?.content?.trim() || '';
 }
 
-// --- Helper: Fetch recent messages as text (uses char.contextLimit) ---
-async function fetchRecentMessages(charId: string, limit: number): Promise<string> {
-    if (limit <= 0) return '';
+// --- Helper: Fetch the shared character context range as text ---
+async function fetchRecentMessages(charId: string): Promise<string> {
     try {
-        const msgs = await DB.getRecentMessagesByCharId(charId, limit);
+        const msgs = await loadCharacterContextMessages(charId);
         const privateMsgs = msgs.filter(m => !m.groupId && (m.type === 'text' || m.type === 'voice'));
         if (privateMsgs.length === 0) return '';
         return privateMsgs.map(m =>
@@ -601,6 +608,9 @@ const GuidebookApp: React.FC = () => {
 
     // Setup State
     const [selectedCharId, setSelectedCharId] = useState('');
+    useAppShortcut(ShortcutAppID.Guidebook, intent => {
+        setSelectedCharId(intent.characterId || ''); setView(intent.characterId ? 'setup' : 'lobby');
+    });
     const [initialAffinity, setInitialAffinity] = useState(50);
     const [maxRounds, setMaxRounds] = useState(5);
     const [scenarioHint, setScenarioHint] = useState('');
@@ -637,6 +647,7 @@ const GuidebookApp: React.FC = () => {
 
     // End card / warnings
     const [showEndCard, setShowEndCard] = useState(false);
+    const sendingToChat = useRef(false);
     const [showExceedWarning, setShowExceedWarning] = useState(false);
 
     // Round context menu
@@ -678,6 +689,7 @@ const GuidebookApp: React.FC = () => {
 
     // --- Start Game ---
     const handleStartGame = async () => {
+
         if (!selectedCharId) { addToast('请先选择角色', 'error'); return; }
 
         trackEvent('开始一局攻略');
@@ -685,8 +697,7 @@ const GuidebookApp: React.FC = () => {
         setError('');
 
         const char = characters.find(c => c.id === selectedCharId)!;
-        const contextLimit = char.contextLimit || 500;
-        const recentMsgs = await fetchRecentMessages(selectedCharId, contextLimit);
+        const recentMsgs = await fetchRecentMessages(selectedCharId);
         setCachedRecentMsgs(recentMsgs);
 
         const newSession: GuidebookSession = {
@@ -708,7 +719,11 @@ const GuidebookApp: React.FC = () => {
         try {
             await injectMemoryPalace(char, undefined, scenarioHint || undefined);
             const prompt = buildOpeningPrompt(char, userProfile, initialAffinity, scenarioHint, 'manual', recentMsgs, char.guidebookInsights);
-            const raw = await callAPI(apiConfig, prompt);
+            const raw = await callAPI(
+                apiConfig,
+                (await ContextBuilder.buildCharacterRequest({ char, user: userProfile }, [{ role: 'user', content: prompt }])),
+                { charId: char.id, charName: char.name, purpose: '攻略本开篇' },
+            );
             let data = extractJson(raw);
 
             // Flexible segment extraction: try multiple paths
@@ -771,6 +786,7 @@ const GuidebookApp: React.FC = () => {
 
     // --- AI Assist ---
     const handleAIAssist = async () => {
+
         if (!session || !selectedChar) return;
         trackEvent('让 AI 帮写本回合选项');
         setIsLoading(true);
@@ -778,12 +794,15 @@ const GuidebookApp: React.FC = () => {
         const wc = extractWorldContext(session.openingSequence);
         try {
             await injectMemoryPalace(selectedChar, undefined, session.scenarioHint || undefined);
-            const prompt = buildOptionAssistPrompt(
-                selectedChar, userProfile, session.currentAffinity,
+            const prompt = buildOptionAssistPrompt(selectedChar, userProfile, session.currentAffinity,
                 session.currentRound + 1, session.rounds, session.scenarioHint || '',
                 cachedRecentMsgs, wc, nextDirectionHint || undefined
             );
-            const raw = await callAPI(apiConfig, prompt);
+            const raw = await callAPI(
+                apiConfig,
+                (await ContextBuilder.buildCharacterRequest({ char: selectedChar, user: userProfile }, [{ role: 'user', content: prompt }])),
+                { charId: selectedChar.id, charName: selectedChar.name, purpose: '攻略本灵感建议' },
+            );
             const data = extractJson(raw);
             // Flexible: try data.options, or any array field with 3+ items that have text
             let opts: any[] | null = null;
@@ -866,6 +885,7 @@ const GuidebookApp: React.FC = () => {
     };
 
     const handleSubmitRound = async () => {
+
         if (!session || !selectedChar) return;
         if (optionTexts.some(t => !t.trim())) { addToast('请填写所有选项', 'error'); return; }
         setIsLoading(true);
@@ -876,12 +896,15 @@ const GuidebookApp: React.FC = () => {
 
         try {
             await injectMemoryPalace(selectedChar, undefined, roundScenario || session.scenarioHint || undefined);
-            const prompt = buildRoundPrompt(
-                selectedChar, userProfile, session.currentAffinity,
+            const prompt = buildRoundPrompt(selectedChar, userProfile, session.currentAffinity,
                 roundNum, session.maxRounds, options, session.rounds, session.scenarioHint || '',
                 cachedRecentMsgs, wc, nextDirectionHint || undefined, roundScenario || undefined
             );
-            const raw = await callAPI(apiConfig, prompt);
+            const raw = await callAPI(
+                apiConfig,
+                (await ContextBuilder.buildCharacterRequest({ char: selectedChar, user: userProfile }, [{ role: 'user', content: prompt }])),
+                { charId: selectedChar.id, charName: selectedChar.name, purpose: '攻略本剧情推进' },
+            );
             const data = extractJson(raw);
             const choice = data?.choice;
             // Accept number, string number, or letter A/B/C
@@ -947,6 +970,7 @@ const GuidebookApp: React.FC = () => {
 
     // --- End Game ---
     const handleEndGame = async () => {
+
         if (!session || !selectedChar) return;
         trackEvent('结束本局出结算卡');
         setIsLoading(true);
@@ -955,12 +979,15 @@ const GuidebookApp: React.FC = () => {
 
         try {
             await injectMemoryPalace(selectedChar, undefined, session.scenarioHint || undefined);
-            const prompt = buildEndCardPrompt(
-                selectedChar, userProfile,
+            const prompt = buildEndCardPrompt(selectedChar, userProfile,
                 session.initialAffinity, session.currentAffinity, session.rounds,
                 cachedRecentMsgs
             );
-            const raw = await callAPI(apiConfig, prompt);
+            const raw = await callAPI(
+                apiConfig,
+                (await ContextBuilder.buildCharacterRequest({ char: selectedChar, user: userProfile }, [{ role: 'user', content: prompt }])),
+                { charId: selectedChar.id, charName: selectedChar.name, purpose: '攻略本结局结算' },
+            );
             const data = extractJson(raw);
 
             if (data) {
@@ -999,7 +1026,12 @@ const GuidebookApp: React.FC = () => {
 
     // --- Send to Chat ---
     const handleSendToChat = async () => {
-        if (!session?.endCard || !selectedChar) return;
+        if (!session?.endCard || sendingToChat.current) return;
+        if (!selectedChar || selectedChar.id !== session.charId) {
+            addToast('这份存档的角色已不存在，无法发送到聊天', 'error');
+            return;
+        }
+        sendingToChat.current = true;
         const card = session.endCard;
 
         const cardData = {
@@ -1026,6 +1058,7 @@ const GuidebookApp: React.FC = () => {
             addToast('已发送到聊天', 'success');
             setShowEndCard(false);
         } catch (e: any) { addToast('发送失败: ' + e.message, 'error'); }
+        finally { sendingToChat.current = false; }
     };
 
     // --- Delete Session ---
@@ -1054,7 +1087,7 @@ const GuidebookApp: React.FC = () => {
         } else {
             setCachedRecentMsgs('');
             const resumeChar = characters.find(c => c.id === s.charId);
-            fetchRecentMessages(s.charId, resumeChar?.contextLimit || 500).then(setCachedRecentMsgs);
+            fetchRecentMessages(s.charId).then(setCachedRecentMsgs);
             setView('playing');
         }
     };
@@ -1183,7 +1216,7 @@ const GuidebookApp: React.FC = () => {
 
                                             {/* Description line */}
                                             <div className="text-white/50 text-[10px] mt-0.5 leading-tight max-w-[85%] truncate">
-                                                {c.description ? c.description.slice(0, 25) : '等待攻略…'}
+                                                {c.description ? c.description.slice(0, 25) : '这次，轮到 ta 来攻略你。'}
                                             </div>
 
                                             {/* Session badge */}
@@ -1707,7 +1740,14 @@ const GuidebookApp: React.FC = () => {
 
             {/* Replay footer */}
             {isReplay && (
-                <div className="shrink-0 p-3" style={{ background: 'linear-gradient(0deg, rgba(236,230,233,0.9) 0%, transparent 100%)' }}>
+                <div className="shrink-0 p-3 space-y-2" style={{ background: 'linear-gradient(0deg, rgba(236,230,233,0.9) 0%, transparent 100%)' }}>
+                    {session?.endCard && (
+                        <button onClick={() => selectedChar ? setShowEndCard(true) : addToast('这份存档的角色已不存在，无法发送到聊天', 'error')}
+                            className="w-full py-2.5 text-white text-sm font-bold rounded-xl active:scale-95 transition-transform shadow-sm"
+                            style={{ background: 'linear-gradient(135deg, #b8909a, #a07880)' }}>
+                            查看结算 · 发送到聊天
+                        </button>
+                    )}
                     <button onClick={backToLobby}
                         className="w-full py-2.5 bg-white/70 text-sm font-bold rounded-xl active:scale-95 transition-transform shadow-sm" style={{ color: '#8b7a7e', border: '1px solid rgba(200,185,190,0.3)' }}>
                         返回列表
@@ -1903,3 +1943,5 @@ const GuidebookApp: React.FC = () => {
 };
 
 export default GuidebookApp;
+import { useAppShortcut } from '../utils/appShortcutLaunch';
+import { AppID as ShortcutAppID } from '../types';

@@ -12,14 +12,16 @@ import type {
 } from '../types';
 import nightScreeningV627 from '../assets/presets/night-screening-v6.14.sully.json';
 import {
-    formatWorldbookSection,
-    resolveWorldbookEntries,
-    splitWorldbookSections,
     type WorldbookScanMessage,
 } from './worldbook';
 import { shareOrDownloadFile } from './shareExport';
+import { hasReliableMessageTimestamp } from './storyTheaterTimeline';
 
 export type StoryApiRole = 'system' | 'user' | 'assistant';
+export function hasStoryTheaterParticipant(entry: StoryTheaterEntry, characters: CharacterProfile[]): boolean {
+    return characters.some(char => entry.characterIds.includes(char.id)
+        || (!entry.writesToCharacterMemory && entry.mask?.type === 'character' && entry.mask.id === char.id));
+}
 export interface StoryApiMessage { role: StoryApiRole; content: string; }
 
 export interface StoryPromptSlots {
@@ -213,10 +215,11 @@ export const normalizeStoryTheater = (entry: StoryTheaterEntry): StoryTheaterEnt
         characterIds: Array.isArray(entry.characterIds) ? entry.characterIds.filter(Boolean) : [],
         writesToCharacterMemory: entry.writesToCharacterMemory === true,
         characterMemoryDates: entry.characterMemoryDates || {},
-        carryCharacterMemory: entry.writesToCharacterMemory ? true : entry.carryCharacterMemory !== false,
+        carryCharacterMemory: entry.writesToCharacterMemory ? true : entry.carryCharacterMemory === true,
         characterContextLimits: entry.characterContextLimits || {},
         archiveAfter,
         archiveKeepRecent,
+        archiveMode: entry.archiveMode === 'manual' ? 'manual' : 'auto',
         archiveStrategy: entry.archiveStrategy === 'vector' ? 'vector' : 'summary',
         archives: Array.isArray(entry.archives) ? entry.archives : [],
         selectedWorldbookIds: Array.isArray(entry.selectedWorldbookIds) ? entry.selectedWorldbookIds.filter(Boolean) : [],
@@ -300,6 +303,9 @@ const normalizeDocument = (value: any, fallbackName: string): StoryTheaterPreset
         enabled: prompt?.enabled !== false,
         role: normalizeRole(prompt?.role),
         content: String(prompt?.content || ''),
+        ...(prompt?.section?.id && ['start', 'end'].includes(prompt.section.edge) ? {
+            section: { id: String(prompt.section.id), name: String(prompt.section.name || '自定义分组'), edge: prompt.section.edge },
+        } : {}),
         ...(NATIVE_MARKERS.includes(prompt?.marker) ? { marker: prompt.marker } : {}),
     }));
     if (prompts.length === 0) throw new Error('预设中没有提示词条目');
@@ -416,7 +422,15 @@ const mergeNightScreeningBackstageAndDebts = (document: StoryTheaterPresetDocume
             if (prompt.id === 'nmj-v3-scene-header') return {
                 ...prompt,
                 content: replacePromptLine(
-                    prompt.content,
+                    replacePromptLine(
+                        replacePromptLine(
+                            prompt.content,
+                            '- 先从角色卡、世界资料、场景和聊天历史寻找已经成立的日期、星期与时刻；不得覆盖已有时间；',
+                            '- 先从当前剧情（前提、常驻事件盒、本剧情共享档案）、本剧场聊天历史（上一层剧场正文的 <scene_header><time>）及用户最新推进中寻找已经成立的本故事时间；角色资料中携带的既有记忆、日程或往期聊天日期仅作过往背景，不得当成当前剧场的基准时间；',
+                        ),
+                        '- 第一轮自行确定的时间从此成为故事事实。之后根据对话、移动、等待、睡眠与时间跳跃实际经过的时长推进，不得每轮重新随机日期；',
+                        '- 第一轮自行确定的时间从此成为故事事实。之后优先服从用户在本轮明确写出的时间推进或新日期锚点（如“推进剧情到X天后”“现在是X月X日”），未指定跳时则根据对话、移动、等待与睡眠实际经过的时长推进，不得被角色既有记忆中的现实日期拉回，也不得每轮重新随机日期；',
+                    ),
                     '正文结束后，依次输出',
                     '正文结束后，依次输出已启用的“幕后与余波”（幕后暗格后紧接镜头债）、世界线、小剧场、回复选项和多角色双向关系温度。',
                 ),
@@ -581,6 +595,7 @@ export interface StoryPresetPromptGroup {
     startIndex: number;
     endIndex: number;
     protected: boolean;
+    customSectionId?: string;
 }
 
 const STORY_PRESET_GROUP_SPECS = [
@@ -595,7 +610,7 @@ const STORY_PRESET_GROUP_SPECS = [
     { key: 'exit', label: '出口与收尾', description: '出口检查、核心续写与定义增强', start: 'nmj-v64-section-exit-start', end: 'enhanceDefinitions' },
 ] as const;
 
-export const isStoryPresetSectionMarker = (prompt: StoryTheaterPresetPrompt): boolean => /^nmj-v6[45]-section-.+-(start|end)$/.test(prompt.id);
+export const isStoryPresetSectionMarker = (prompt: StoryTheaterPresetPrompt): boolean => Boolean(prompt.section) || /^nmj-v6[45]-section-.+-(start|end)$/.test(prompt.id);
 
 export const isProtectedStoryPrompt = (prompt: StoryTheaterPresetPrompt): boolean => Boolean(
     prompt.marker || prompt.id === 'nmj-v64-section-sources-start' || prompt.id === 'nmj-v64-section-sources-end'
@@ -609,7 +624,7 @@ export const getStoryPresetPromptGroups = (document: StoryTheaterPresetDocument)
     for (const spec of STORY_PRESET_GROUP_SPECS) {
         const startIndex = prompts.findIndex(prompt => prompt.id === spec.start);
         const endIndex = prompts.findIndex(prompt => prompt.id === spec.end);
-        if (startIndex < 0 || endIndex < startIndex) continue;
+        if (startIndex < 0 || endIndex < startIndex || claimed.has(startIndex) || claimed.has(endIndex)) continue;
         const indexes = Array.from({ length: endIndex - startIndex + 1 }, (_, offset) => startIndex + offset);
         indexes.forEach(index => claimed.add(index));
         groups.push({
@@ -621,6 +636,15 @@ export const getStoryPresetPromptGroups = (document: StoryTheaterPresetDocument)
             endIndex,
             protected: 'protected' in spec && spec.protected === true,
         });
+    }
+    for (let startIndex = 0; startIndex < prompts.length; startIndex++) {
+        const section = prompts[startIndex].section;
+        if (section?.edge !== 'start' || claimed.has(startIndex)) continue;
+        const endIndex = prompts.findIndex((prompt, index) => index > startIndex && prompt.section?.id === section.id && prompt.section.edge === 'end');
+        if (endIndex < 0 || prompts.slice(startIndex + 1, endIndex).some(prompt => prompt.section) || Array.from({ length: endIndex - startIndex + 1 }, (_, offset) => startIndex + offset).some(index => claimed.has(index))) continue;
+        const indexes = Array.from({ length: endIndex - startIndex + 1 }, (_, offset) => startIndex + offset);
+        indexes.forEach(index => claimed.add(index));
+        groups.push({ key: `section:${section.id}`, label: section.name, description: '自定义分组 · 可添加提示词、调整顺序', promptIds: indexes.map(index => prompts[index].id), startIndex, endIndex, protected: false, customSectionId: section.id });
     }
     let cursor = 0;
     while (cursor < prompts.length) {
@@ -640,6 +664,37 @@ export const getStoryPresetPromptGroups = (document: StoryTheaterPresetDocument)
         cursor += 1;
     }
     return groups.sort((a, b) => a.startIndex - b.startIndex);
+};
+
+export const addStoryPresetGroup = (document: StoryTheaterPresetDocument, name: string): StoryTheaterPresetDocument => {
+    const id = makeStoryTheaterId();
+    return { ...document, prompts: [...document.prompts, ...(['start', 'end'] as const).map(edge => ({
+        id: makeStoryTheaterId(), name: name.trim() || '自定义分组', enabled: false, role: 'system' as const, content: '',
+        section: { id, name: name.trim() || '自定义分组', edge },
+    }))] };
+};
+
+export const renameStoryPresetGroup = (document: StoryTheaterPresetDocument, sectionId: string, name: string): StoryTheaterPresetDocument => ({
+    ...document, prompts: document.prompts.map(prompt => prompt.section?.id === sectionId
+        ? { ...prompt, section: { ...prompt.section, name } } : prompt),
+});
+
+export const ungroupStoryPresetGroup = (document: StoryTheaterPresetDocument, sectionId: string): StoryTheaterPresetDocument => ({
+    ...document, prompts: document.prompts.filter(prompt => prompt.section?.id !== sectionId),
+});
+
+export const moveStoryPresetPromptToGroup = (document: StoryTheaterPresetDocument, promptId: string, groupKey: string): StoryTheaterPresetDocument => {
+    const groups = getStoryPresetPromptGroups(document);
+    const source = groups.find(group => group.promptIds.includes(promptId));
+    const target = groups.find(group => group.key === groupKey);
+    const prompt = document.prompts.find(item => item.id === promptId);
+    if (!prompt || !target || target.protected || source?.protected || source?.key === target.key || isProtectedStoryPrompt(prompt) || isStoryPresetSectionMarker(prompt)) return document;
+    const next = { ...document, prompts: document.prompts.filter(item => item.id !== promptId) };
+    const destination = getStoryPresetPromptGroups(next).find(group => group.key === groupKey);
+    if (!destination) return document;
+    const last = next.prompts[destination.endIndex];
+    next.prompts.splice(isStoryPresetSectionMarker(last) ? destination.endIndex : destination.endIndex + 1, 0, prompt);
+    return next;
 };
 
 export const applyStoryPresetChoice = (
@@ -750,6 +805,101 @@ export const appendStoryAffinityInputs = (content: string, inputs: StoryAffinity
     return `${content}\n\n<u_affinity_updates>\n${rows.join('\n')}\n</u_affinity_updates>`;
 };
 
+interface StoryAffinityScoreState {
+    cToU: number;
+    uToC: number;
+}
+
+const affinityTagValue = (source: string, tag: string): string => (
+    new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}\\s*>`, 'i').exec(source)?.[1]?.replace(/<[^>]+>/g, '').trim() || ''
+);
+
+const affinityInteger = (value: unknown, fallback: number): number => {
+    const parsed = Number(String(value ?? '').replace(/[^+\d.-]/g, ''));
+    return Number.isFinite(parsed) ? Math.round(parsed) : fallback;
+};
+
+const clampAffinityScore = (value: number): number => Math.max(0, Math.min(100, Math.round(value)));
+const clampAffinityDelta = (value: number): number => Math.max(-100, Math.min(100, Math.round(value)));
+const affinityIdentityKey = (value: string): string => value.trim().toLocaleLowerCase().normalize('NFKC');
+
+const setAffinityTagValue = (source: string, tag: string, value: string): string => {
+    const pattern = new RegExp(`(<${tag}\\b[^>]*>)[\\s\\S]*?(<\\/${tag}\\s*>)`, 'i');
+    if (pattern.test(source)) return source.replace(pattern, `$1${value}$2`);
+    return `${source.trimEnd()}\n<${tag}>${value}</${tag}>`;
+};
+
+const readAffinityScoreStates = (
+    content: string,
+    actors: Array<{ id: string; name: string }>,
+): Map<string, StoryAffinityScoreState> => {
+    const states = new Map<string, StoryAffinityScoreState>();
+    const personPattern = /<affinity_person\b[^>]*>([\s\S]*?)<\/affinity_person\s*>/gi;
+    for (const match of content.matchAll(personPattern)) {
+        const body = match[1];
+        const state = {
+            cToU: clampAffinityScore(affinityInteger(affinityTagValue(body, 'c_to_u_score'), 50)),
+            uToC: clampAffinityScore(affinityInteger(affinityTagValue(body, 'u_to_c_score'), 50)),
+        };
+        const id = affinityIdentityKey(affinityTagValue(body, 'character_id'));
+        const name = affinityIdentityKey(affinityTagValue(body, 'character_name'));
+        if (id) states.set(`id:${id}`, state);
+        if (name) states.set(`name:${name}`, state);
+    }
+    // 兼容升级前的单角色根级面板；多人时绝不猜这一个旧槽属于谁。
+    if (states.size === 0 && actors.length === 1) {
+        const cScore = affinityTagValue(content, 'c_score');
+        const uScore = affinityTagValue(content, 'u_score');
+        if (cScore || uScore) {
+            const state = {
+                cToU: clampAffinityScore(affinityInteger(cScore, 50)),
+                uToC: clampAffinityScore(affinityInteger(uScore, 50)),
+            };
+            states.set(`id:${affinityIdentityKey(actors[0].id)}`, state);
+            states.set(`name:${affinityIdentityKey(actors[0].name)}`, state);
+        }
+    }
+    return states;
+};
+
+/**
+ * 模型只决定“本轮变化多少”，绝对值由前端按上一轮 + delta 复算。
+ * 这样 U→C 的用户输入与 C→U 的模型变化都不会再依赖 LLM 心算。
+ */
+export const reconcileStoryAffinityScores = (
+    generated: string,
+    previousAssistantContent: string,
+    inputs: StoryAffinityInput[],
+    actors: Array<{ id: string; name: string }>,
+): string => {
+    const previous = readAffinityScoreStates(previousAssistantContent, actors);
+    const actorById = new Map(actors.map(actor => [affinityIdentityKey(actor.id), actor]));
+    const actorByName = new Map(actors.map(actor => [affinityIdentityKey(actor.name), actor]));
+    const inputById = new Map(inputs.filter(input => input.characterId).map(input => [affinityIdentityKey(input.characterId || ''), input]));
+    const inputByName = new Map(inputs.filter(input => input.characterName).map(input => [affinityIdentityKey(input.characterName || ''), input]));
+    const personPattern = /(<affinity_person\b[^>]*>)([\s\S]*?)(<\/affinity_person\s*>)/gi;
+
+    return generated.replace(personPattern, (_whole, opening: string, rawBody: string, closing: string) => {
+        const rawId = affinityIdentityKey(affinityTagValue(rawBody, 'character_id'));
+        const rawName = affinityIdentityKey(affinityTagValue(rawBody, 'character_name'));
+        const actor = actorById.get(rawId) || actorByName.get(rawName);
+        const id = affinityIdentityKey(actor?.id || rawId);
+        const name = affinityIdentityKey(actor?.name || rawName);
+        const prior = previous.get(`id:${id}`) || previous.get(`name:${name}`) || { cToU: 50, uToC: 50 };
+        const input = inputById.get(id) || inputByName.get(name);
+        const cDelta = clampAffinityDelta(affinityInteger(affinityTagValue(rawBody, 'c_to_u_delta'), 0));
+        const uDelta = clampAffinityDelta(input?.delta == null ? 0 : affinityInteger(input.delta, 0));
+        const cScore = clampAffinityScore(prior.cToU + cDelta);
+        const uScore = clampAffinityScore(prior.uToC + uDelta);
+        let body = rawBody;
+        body = setAffinityTagValue(body, 'c_to_u_score', String(cScore));
+        body = setAffinityTagValue(body, 'c_to_u_delta', cDelta >= 0 ? `+${cDelta}` : String(cDelta));
+        body = setAffinityTagValue(body, 'u_to_c_score', String(uScore));
+        body = setAffinityTagValue(body, 'u_to_c_delta', uDelta >= 0 ? `+${uDelta}` : String(uDelta));
+        return `${opening}${body}${closing}`;
+    });
+};
+
 export const buildStoryMultiAffinityGuide = (characters: Array<{ id: string; name: string }>): string => {
     if (characters.length === 0) return '';
     const cast = characters.map(character => `- ${character.id}：${character.name}`).join('\n');
@@ -764,6 +914,7 @@ export const buildStoryMultiAffinityGuide = (characters: Array<{ id: string; nam
         '- C→U 与 trust、security、possessive_pull、emotional_pressure、repair_will 只读取对应角色的亲历事实、性格、处境与后果；不得用某个角色的变化影响另一位角色。',
         '- 最新 <u_affinity_updates> 只出现本轮由用户填写变化的角色。某角色没有对应更新时，其 U→C 绝对值保持不变，delta 记 +0，原因写“本轮未填写”。',
         '- U→C 新值 = 该角色上一轮 U→C + 对应 delta，并限制在 0—100。不得用某个角色的变化影响另一位角色。',
+        '- 你只需正确决定每个 delta；前端会依据上一轮绝对值复算 C→U 与 U→C score，防止心算错误。',
         '- 察觉规则只作用于同一条 u_affinity 指向的角色；其他角色不会因为同伴被选择为“已察觉”而共享透视。',
         '',
         '【输出】',
@@ -837,6 +988,7 @@ export const buildStoryIdentityGuard = (
         '- 生成回复的一方不属于故事人物。系统指令为方便表达而出现的“你”，只是执行语法，不能据此把生成端写进故事，也不能把故事里的“你”解释成生成端自己。',
         '- 用户最新输入仍按实际句法辨认说话人与受话人；但在最终输出的叙事旁白、场景条和关系面板中，未另行点名的“你／你的”只允许指用户侧剧情身份。',
         perspectiveRule,
+        '- 剧场时间线锚点：<scene_header><time> 只承接本剧场「当前剧情／常驻事件盒／上一层剧场正文」已确立的故事时间，并优先执行用户在本轮明确写出的时间推进或新日期设定（如“推进剧情到X天后”“现在是X月X日”）；角色资料与既有记忆里的日期只代表人物过去背景，不得覆盖本剧场的时间线。',
         '- 历史助手回复只是已经发生的旧剧情：继承事实，不继承它过去使用的第一、第二或第三人称。当前启用的人称模式是本轮唯一标准。',
     ].join('\n');
 };
@@ -863,6 +1015,7 @@ const pushPromptMessage = (messages: StoryApiMessage[], role: StoryApiRole, cont
 export const compileStoryPreset = (input: {
     preset?: StoryTheaterPreset | null;
     slots: StoryPromptSlots;
+    historyMessages?: StoryApiMessage[];
     userName: string;
     characterNames: string[];
 }): { messages: StoryApiMessage[]; settings: StoryGenerationSettings; assistantPrefill?: StoryApiMessage } => {
@@ -897,11 +1050,15 @@ export const compileStoryPreset = (input: {
             );
             injectedMarkers.add('world_before');
         }
-        if (!prompt.enabled) continue;
+        if (!prompt.enabled || prompt.section) continue;
         let raw = prompt.content;
         if (prompt.marker) {
             if (injectedMarkers.has(prompt.marker)) continue;
             injectedMarkers.add(prompt.marker);
+            if (prompt.marker === 'history' && input.historyMessages) {
+                messages.push(...input.historyMessages);
+                continue;
+            }
             raw = slotForMarker(prompt.marker, slots);
         }
         if (!raw.trim()) continue;
@@ -1002,26 +1159,6 @@ export const buildStoryWorldbookScanMessages = (
         ...(historyLimit > 0 ? history.slice(-historyLimit) : []),
         { role: 'user', content: current },
     ];
-};
-
-export const buildTheaterWorldbookSlots = (
-    books: MountedWorldbook[],
-    scanMessages: WorldbookScanMessage[],
-    userName: string,
-    characterNames: string[] = [],
-): { worldBefore: string; worldAfter: string } => {
-    const resolved = splitWorldbookSections(resolveWorldbookEntries(books, scanMessages, characterNames.join('、'), userName));
-    return {
-        worldBefore: formatWorldbookSection(resolved.beforeCharacter, '剧情沙盒世界书 · 角色设定前'),
-        worldAfter: [
-            formatWorldbookSection(resolved.afterCharacter, '剧情沙盒世界书'),
-            formatWorldbookSection(resolved.beforeExamples, '剧情沙盒世界书 · 示例前'),
-            formatWorldbookSection(resolved.afterExamples, '剧情沙盒世界书 · 示例后'),
-            formatWorldbookSection(resolved.authorsNoteTop, '剧情沙盒世界书 · 作者注释顶部'),
-            formatWorldbookSection(resolved.authorsNoteBottom, '剧情沙盒世界书 · 作者注释底部'),
-            formatWorldbookSection(resolved.atDepth, '剧情沙盒世界书 · 当前场景'),
-        ].filter(Boolean).join('\n'),
-    };
 };
 
 export const buildBareTheaterActorContext = (char: CharacterProfile): string => [
@@ -1263,14 +1400,23 @@ export const formatActorRecentMessages = (
     messages: Message[],
     originalUserName?: string,
     currentIdentityName?: string,
+    options?: { includeTimestamps?: boolean },
 ): string => {
     if (messages.length === 0) return '';
     const originalUser = originalUserName?.trim() || '你';
     const currentIdentity = currentIdentityName?.trim() || originalUser;
+    const withTimestamps = options?.includeTimestamps === true && char.timeAwarenessEnabled !== false;
     const rows = messages.map(message => {
         const speaker = message.role === 'user' ? `记忆中的你（${originalUser}）` : message.role === 'assistant' ? char.name : '系统';
-        const clean = String(message.content || '').replace(/data:[^\s]+/gi, '[媒体]').slice(0, 4000);
-        return `- [${new Date(message.timestamp).toLocaleString()}] ${speaker}：${clean}`;
+        const clean = String(message.content || '')
+            .replace(/<scene_header\b[^>]*>[\s\S]*?<\/scene_header\s*>/gi, '')
+            .replace(/data:[^\s]+/gi, '[媒体]')
+            .trim()
+            .slice(0, 4000);
+        const prefix = withTimestamps && hasReliableMessageTimestamp(message)
+            ? `[${new Date(message.timestamp).toLocaleString()}] `
+            : '';
+        return `- ${prefix}${speaker}：${clean}`;
     });
     const identityReminder = currentIdentity === originalUser
         ? ''
@@ -1333,20 +1479,36 @@ export const describeEmptyStoryCompletion = (data: unknown): string => {
     return `没有生成正文${finishReason ? `（finish_reason=${finishReason}）` : '：上游返回了空内容'}，请重试`;
 };
 
-export const memoryTimestampForCharacter = (entry: StoryTheaterEntry, charId: string, realTimestamp: number): number => {
+/** 仅表示设定中的剧情时间，禁止写入 Message.timestamp 或用于现实互动间隔。 */
+export const storyTimelineTimestampForCharacter = (entry: StoryTheaterEntry, charId: string, realTimestamp: number): number => {
     const anchorText = entry.characterMemoryDates?.[charId];
     const storyAnchor = anchorText ? new Date(anchorText).getTime() : NaN;
     if (!Number.isFinite(storyAnchor)) return realTimestamp;
     return storyAnchor + Math.max(0, realTimestamp - entry.createdAt);
 };
 
+/** 现实时间用于共享历史排序；角色的剧情时间单独保存，不改变消息收发时间。 */
+export const createStoryTheaterMirrorMessage = (
+    entry: StoryTheaterEntry,
+    charId: string,
+    central: Pick<Message, 'id' | 'role' | 'content' | 'timestamp'>,
+): Omit<Message, 'id'> => ({
+    charId, role: central.role, type: 'text', content: central.content, timestamp: central.timestamp,
+    metadata: {
+        source: 'story_theater_memory', theaterId: entry.id, theaterTitle: entry.title,
+        theaterCentralId: central.id, theaterTimestampVersion: 1, theaterReceivedAt: central.timestamp,
+        theaterTimelineTimestamp: storyTimelineTimestampForCharacter(entry, charId, central.timestamp),
+    },
+});
+
 export const makeStoryPresetFileName = (name: string): string => {
     const safeName = name.replace(/[\\/:*?"<>|]/g, '_').trim().slice(0, 80) || '剧情预设';
     return `${safeName}.json`;
 };
 
-export const downloadStoryPreset = async (preset: StoryTheaterPreset): Promise<'shared' | 'downloaded'> => (
+export const downloadStoryPreset = async (preset: StoryTheaterPreset): Promise<'shared' | 'downloaded' | 'cancelled'> => (
     shareOrDownloadFile({
+        card: { kind: 'story', title: preset.name || '剧情预设' },
         content: JSON.stringify(preset.document, null, 2),
         fileName: makeStoryPresetFileName(preset.name),
         mimeType: 'application/json',

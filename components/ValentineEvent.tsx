@@ -1,3 +1,4 @@
+import { loadCharacterContextMessages } from '../utils/chatContextRange';
 
 /**
  * ValentineEvent.tsx
@@ -507,6 +508,7 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
 
     /** 生成情人节特别消息 */
     const generateValentineMessage = async (cId: string) => {
+
         const c = characters.find(ch => ch.id === cId);
         if (!c) { setErrorMsg('找不到角色'); setPhase('error'); return; }
 
@@ -520,15 +522,15 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
 
         try {
             // 获取聊天历史摘要
-            const msgs = await DB.getMessagesByCharId(cId);
-            const limit = c.contextLimit || 500;
-            const recentMsgs = msgs.slice(-Math.min(limit, 80)).map(m => {
+            const msgs = await loadCharacterContextMessages(c);
+            const recentMsgs = msgs.map(m => {
                 const content = m.type === 'image' ? '[图片]' : m.content;
                 return `${m.role}: ${content}`;
             }).join('\n');
 
             await injectMemoryPalace(c, undefined, '情人节 我们在一起的回忆');
-            const baseContext = ContextBuilder.buildCoreContext(c, userProfile, true);
+            const characterContextInput = { char: c, user: userProfile, includeDetailedMemories: true };
+
 
             // 根据角色获取可用表情列表
             const availableEmotions = getAvailableEmotions(c);
@@ -570,13 +572,19 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
                 body: JSON.stringify({
                     model: apiConfig.model,
-                    messages: [
-                        { role: 'system', content: baseContext },
+                    messages: (await ContextBuilder.buildCharacterRequest(characterContextInput, [
                         { role: 'user', content: `[最近记录 (Previous Context)]:\n${recentMsgs}\n\n---\n\n${valentinePrompt}` }
-                    ],
+                    ])),
                     temperature: 0.88
-                })
-            });
+                }),
+                __sullyMeta: {
+                    appId: 'special-moments',
+                    appName: '情人节企划',
+                    charId: c.id,
+                    charName: c.name,
+                    purpose: '情人节剧情生成',
+                },
+            } as RequestInit);
 
             if (!response.ok) throw new Error(`API 错误: ${response.status}`);
             const data = await safeResponseJson(response);

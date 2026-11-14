@@ -1,3 +1,5 @@
+import {meetingAppearance} from '../../utils/meetingAppearance';
+import MeetingAppearanceControl from './MeetingAppearanceControl';
 
 import React, { useState, useRef, useEffect } from 'react';
 import { useOS } from '../../context/OSContext';
@@ -8,6 +10,12 @@ import { pickDateFallbackSprite } from '../../utils/dateSprites';
 import TokenImg from '../os/TokenImg';
 import { DATE_STYLE_PRESETS } from '../../utils/datePrompts';
 import ObserveSettings from './ObserveSettings';
+import DateExtraPresets from './DateExtraPresets';
+import DateExtraEditor from './DateExtraEditor';
+import { isAwayCloudRoute } from '../../utils/awayMessage';
+import {
+    DATE_LEAVE_MAX_MINUTES, DATE_LEAVE_MIN_MINUTES, disarmDateLeaveReminder, resolveDateLeaveDelayMinutes,
+} from '../../utils/dateLeaveReminder';
 
 // 标准情绪列表
 const REQUIRED_EMOTIONS = ['normal', 'happy', 'angry', 'sad', 'shy'];
@@ -29,9 +37,109 @@ const Section: React.FC<{ title: string; defaultOpen?: boolean; children: React.
     </details>
 );
 
+/** 见面离开提醒：见面对话中途走开多久，角色在私聊里找对方（见 docs/date-leave-reminder.md）。 */
+const LeaveReminderSection: React.FC<{ char: CharacterProfile }> = ({ char }) => {
+    const { updateCharacter } = useOS();
+    const enabled = !!char.dateLeaveReminder?.enabled;
+    const savedDelay = resolveDateLeaveDelayMinutes(char);
+    const [delay, setDelay] = useState(savedDelay);
+    useEffect(() => setDelay(savedDelay), [savedDelay]);
+    const [cloud, setCloud] = useState<boolean | null>(null);
+    useEffect(() => {
+        let cancelled = false;
+        void isAwayCloudRoute(char).then(v => { if (!cancelled) setCloud(v); });
+        return () => { cancelled = true; };
+    }, [char]);
+
+    // 关掉或改了时长都撤掉已经备好的那条（它带着旧时长），见面对话里会按新设置重新备好。
+    const save = (next: { enabled: boolean; delayMinutes: number }) => {
+        void disarmDateLeaveReminder({ char, updateCharacter });
+        updateCharacter(char.id, { dateLeaveReminder: next });
+    };
+    // 拖动时只改显示，松手才保存：每一格都保存会反复撤掉、新建云端任务。
+    const commitDelay = () => { if (delay !== savedDelay) save({ enabled, delayMinutes: delay }); };
+
+    return (
+        <Section title="离开提醒">
+            <div className="space-y-4">
+                <div className="flex items-center justify-between gap-4">
+                    <p className="text-[11px] text-slate-400 leading-relaxed">见面聊到一半走开，过一会儿 {char.name} 会在私聊里找你。点结束离开的不算。</p>
+                    <button
+                        onClick={() => save({ enabled: !enabled, delayMinutes: delay })}
+                        type="button"
+                        role="switch"
+                        aria-checked={enabled}
+                        aria-label="切换离开提醒"
+                        className={`w-12 h-7 shrink-0 rounded-full transition-colors relative ${enabled ? 'bg-primary' : 'bg-slate-200'}`}
+                    >
+                        <div className={`absolute top-0.5 w-6 h-6 bg-white rounded-full shadow-md transition-transform ${enabled ? 'translate-x-5' : 'translate-x-0.5'}`}></div>
+                    </button>
+                </div>
+                {enabled && (
+                    <>
+                        <div>
+                            <div className="flex justify-between text-[10px] text-slate-500 mb-2"><span>走开多久后</span><span>{delay} 分钟</span></div>
+                            <input
+                                type="range" min={DATE_LEAVE_MIN_MINUTES} max={DATE_LEAVE_MAX_MINUTES} step={1} value={delay}
+                                aria-label="走开多久后提醒"
+                                onChange={e => setDelay(parseInt(e.target.value, 10))}
+                                onPointerUp={commitDelay} onKeyUp={commitDelay} onBlur={commitDelay}
+                                className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-primary"
+                            />
+                        </div>
+                        {cloud !== null && (
+                            <p className="text-[11px] text-slate-400 leading-relaxed">
+                                {cloud
+                                    ? `${char.name} 开着主动消息 2.0：切出 SullyOS 也会推送给你，不受主动频率里的上限拦。`
+                                    : `只在 SullyOS 开着时提醒，切出 SullyOS 或锁屏就不发了。开启主动消息 2.0 后切出去也能收到。`}
+                            </p>
+                        )}
+                    </>
+                )}
+            </div>
+        </Section>
+    );
+};
+
 const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
     const { updateCharacter, addToast, userProfile } = useOS();
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const pageRef = useRef<HTMLDivElement>(null);
+    const scrollRef = useRef<HTMLDivElement>(null);
+    const [previewOpen, setPreviewOpen] = useState(true);
+    useEffect(() => {
+        const viewport = window.visualViewport;
+        let frame = 0;
+        const sync = () => {
+            if (viewport && viewport.scale !== 1) return;
+            const page = pageRef.current;
+            if (!page) return;
+            const bottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
+            page.style.maxHeight = `${Math.max(0, bottom - page.getBoundingClientRect().top)}px`;
+            cancelAnimationFrame(frame);
+            frame = requestAnimationFrame(() => {
+                const focused = document.activeElement;
+                const scroll = scrollRef.current;
+                if (!(focused instanceof HTMLInputElement || focused instanceof HTMLTextAreaElement || focused instanceof HTMLSelectElement) || !scroll?.contains(focused)) return;
+                const field = focused.getBoundingClientRect(), area = scroll.getBoundingClientRect();
+                if (field.top < area.top || field.height > area.height) scroll.scrollTop += field.top - area.top - 8;
+                else if (field.bottom > area.bottom) scroll.scrollTop += field.bottom - area.bottom + 8;
+            });
+        };
+        sync();
+        viewport?.addEventListener('resize', sync);
+        viewport?.addEventListener('scroll', sync);
+        window.addEventListener('resize', sync);
+        pageRef.current?.addEventListener('focusin', sync);
+        const page = pageRef.current;
+        return () => {
+            cancelAnimationFrame(frame);
+            viewport?.removeEventListener('resize', sync);
+            viewport?.removeEventListener('scroll', sync);
+            window.removeEventListener('resize', sync);
+            page?.removeEventListener('focusin', sync);
+        };
+    }, []);
     // 背景字段存的是 blobref 令牌（二进制在 IndexedDB），CSS url() 喂不了令牌，
     // 先在这里解析成能直接用的地址。非令牌值（旧 data: / 外链）原样透传。
     const dateBackgroundUrl = useBlobRefUrl(char.dateBackground);
@@ -39,6 +147,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
     // 文风与叙事（即时生效：system prompt 每次请求重建，存上就影响下一条回复）
     const styleConfig = char.dateStyleConfig || {};
     const [extraDraft, setExtraDraft] = useState(styleConfig.extra || '');
+    const [extraEditorOpen, setExtraEditorOpen] = useState(false);
     useEffect(() => { setExtraDraft(char.dateStyleConfig?.extra || ''); }, [char.id]);
     const patchStyleConfig = (patch: Partial<DateStyleConfig>) => {
         updateCharacter(char.id, { dateStyleConfig: { ...(char.dateStyleConfig || {}), ...patch } });
@@ -49,6 +158,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
         patchStyleConfig({ extra: trimmed || undefined });
         addToast(trimmed ? '补充要求已保存' : '补充要求已清空', 'success');
     };
+    const readingAppearance = meetingAppearance(char.dateAppearance);
     const userName = userProfile?.name || '用户';
     const POV_OPTIONS: { id: DateStyleConfig['pov']; label: string; example: string }[] = [
         { id: undefined, label: '默认', example: '不额外指定，随模型发挥' },
@@ -124,7 +234,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                 // Upload to a specific skin set
                 const key = targetEmotionKey.trim().toLowerCase();
                 const skinId = editingSkinId;
-                if (!key || !skinId) { addToast('参数丢失', 'error'); return; }
+                if (!key || !skinId) { addToast('未选中要替换的皮肤或情绪', 'error'); return; }
                 const updatedSets = (char.dateSkinSets || []).map(s =>
                     s.id === skinId ? { ...s, sprites: { ...s.sprites, [key]: ref } } : s
                 );
@@ -133,7 +243,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                 setTargetEmotionKey('');
             } else {
                 const key = targetEmotionKey.trim().toLowerCase();
-                if (!key) { addToast('情绪Key丢失', 'error'); return; }
+                if (!key) { addToast('未指定要替换的情绪名称', 'error'); return; }
                 const newSprites = { ...(char.sprites || {}), [key]: ref };
                 updateCharacter(char.id, { sprites: newSprites });
                 addToast(`立绘 [${key}] 已保存`, 'success');
@@ -235,7 +345,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
     };
 
     return (
-        <div className="h-full w-full bg-slate-50 flex flex-col">
+        <div ref={pageRef} className="h-full min-h-0 w-full bg-slate-50 text-slate-800 flex flex-col overflow-hidden">
             <div className="h-16 flex items-center justify-between px-4 border-b border-slate-200 bg-white shrink-0 z-20">
                 <button onClick={onBack} className="p-2 -ml-2 text-slate-600 active:scale-95 transition-transform">
                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" /></svg>
@@ -244,8 +354,15 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                 <div className="w-8"></div>
             </div>
             
+            <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto overscroll-contain" data-testid="date-settings-scroll">
+            <MeetingAppearanceControl surface="date" characterId={char.id} />
+            <button type="button" onClick={() => setPreviewOpen(open => !open)} aria-expanded={previewOpen}
+                className="w-full px-5 py-3 text-left text-xs font-bold text-slate-500 bg-white border-b border-slate-100">
+                {previewOpen ? '收起场景预览' : '展开场景预览'}
+            </button>
             {/* Live Preview Area */}
-            <div className="h-64 bg-black relative overflow-hidden shrink-0 border-b border-slate-200">
+            {previewOpen && <div className="h-64 bg-black relative overflow-hidden shrink-0 border-b border-slate-200">
+                {readingAppearance.id!=='none'&&<div className="absolute inset-0 z-10 px-8 py-6 font-serif leading-8" style={{background:readingAppearance.background,color:readingAppearance.ink}}><small className="text-xs opacity-50">{readingAppearance.name} · 阅读预览</small><p className="mt-4">窗边的灯亮了，书页上留下了一小片暖色。</p><p>“今天读到哪里了？”</p><p>他把书签夹好，慢慢合上书。</p></div>}
                     <div className="absolute inset-0 bg-cover bg-center opacity-60" style={{ backgroundImage: dateBackgroundUrl ? `url("${dateBackgroundUrl}")` : 'none' }}></div>
                     <div className="absolute inset-0 flex items-end justify-center pointer-events-none">
                         <TokenImg
@@ -257,9 +374,9 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                         />
                     </div>
                     <div className="absolute top-2 left-2 bg-black/50 text-white text-[10px] px-2 py-1 rounded backdrop-blur-sm">预览 (Preview)</div>
-            </div>
+            </div>}
 
-            <div className="flex-1 overflow-y-auto p-5 space-y-8 pb-20">
+            <div className="p-5 space-y-8">
                 <Section title="立绘位置调整">
                     <div className="space-y-6">
                         <div>
@@ -277,7 +394,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                     </div>
                 </Section>
 
-                <section className="bg-white rounded-2xl border border-slate-100 shadow-sm divide-y divide-slate-100">
+                {readingAppearance.id=== 'none' && <section className="bg-white rounded-2xl border border-slate-100 shadow-sm divide-y divide-slate-100">
                     <div className="flex items-center justify-between gap-4 p-4">
                         <div className="min-w-0">
                             <h3 className="text-xs font-bold text-slate-400 uppercase">浅色阅读模式</h3>
@@ -310,9 +427,11 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                             <div className={`absolute top-0.5 w-6 h-6 bg-white rounded-full shadow-md transition-transform ${char.dateReadingShowAvatars ? 'translate-x-5' : 'translate-x-0.5'}`}></div>
                         </button>
                     </div>
-                </section>
+                </section>}
 
                 <ObserveSettings char={char} />
+
+                <LeaveReminderSection char={char} />
 
                 <Section title="文风与叙事 (Writing Style)">
                     <p className="text-[11px] text-slate-400 mt-1 mb-4">调整见面时 AI 的写作风格与叙事人称，修改后从下一条回复开始生效。</p>
@@ -363,7 +482,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                     <div className="mb-5 flex items-center justify-between">
                         <div className="pr-4">
                             <label className="text-[11px] text-slate-500 font-bold block">细节深挖引导</label>
-                            <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">教 AI 从任何一句话里挖出可写的细节，并每轮给一条不同的聚焦线索，减少空话和模型口癖。</p>
+                            <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">从已有对话和现场细节中寻找可选线索，减少空话；不相关时可以跳过，也允许简短回应。</p>
                         </div>
                         <button
                             onClick={() => patchStyleConfig({ digDeeper: styleConfig.digDeeper === false ? undefined : false })}
@@ -376,13 +495,21 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                     {/* 自定义补充 */}
                     <div>
                         <label className="text-[11px] text-slate-500 font-bold mb-2 block">自定义补充（可选）</label>
+                        <DateExtraPresets key={char.id} presets={char.dateExtraPresets || []} value={extraDraft}
+                            onApply={content => { setExtraDraft(content); patchStyleConfig({ extra: content }); }}
+                            onChange={dateExtraPresets => updateCharacter(char.id, { dateExtraPresets })} />
+                        <div className="relative">
                         <textarea
+                            aria-label="自定义补充"
                             value={extraDraft}
                             onChange={e => setExtraDraft(e.target.value)}
                             onBlur={saveExtraDraft}
                             placeholder="比如：多写环境互动；不要写心理活动；对话占比多一些……"
-                            className="w-full h-20 px-4 py-3 bg-slate-100 rounded-xl text-sm resize-none focus:ring-1 focus:ring-primary/30 outline-none transition-all leading-relaxed"
+                            className="w-full h-28 px-4 pt-3 pb-11 bg-slate-100 text-slate-800 placeholder:text-slate-400 rounded-xl text-sm resize-none focus:ring-1 focus:ring-primary/30 outline-none transition-all leading-relaxed"
                         />
+                        <button type="button" aria-label="展开自定义补充" onClick={() => setExtraEditorOpen(true)}
+                            className="absolute bottom-2 right-2 px-3 py-1.5 rounded-lg bg-white text-xs font-semibold text-primary shadow-sm">↗ 展开</button>
+                        </div>
                         <p className="text-[10px] text-slate-300 mt-1">点别处会自动保存；这段会照原样用上，比上面的风格优先。</p>
                     </div>
                 </Section>
@@ -462,7 +589,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                             onChange={e => setNewEmotionName(e.target.value)}
                             onKeyDown={e => { if (e.key === 'Enter') handleAddCustomEmotion(); }}
                             placeholder="输入情绪名 (如 scared, excited...)"
-                            className="flex-1 px-4 py-3 bg-slate-100 rounded-xl text-sm focus:ring-1 focus:ring-primary/30 outline-none transition-all"
+                            className="flex-1 px-4 py-3 bg-slate-100 text-slate-800 placeholder:text-slate-400 rounded-xl text-sm focus:ring-1 focus:ring-primary/30 outline-none transition-all"
                         />
                         <button
                             onClick={handleAddCustomEmotion}
@@ -559,7 +686,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                             onChange={e => setNewSkinName(e.target.value)}
                             onKeyDown={e => { if (e.key === 'Enter') handleCreateSkinSet(); }}
                             placeholder="皮肤名称 (如 冬装、泳装...)"
-                            className="flex-1 px-4 py-3 bg-slate-100 rounded-xl text-sm focus:ring-1 focus:ring-primary/30 outline-none transition-all"
+                            className="flex-1 px-4 py-3 bg-slate-100 text-slate-800 placeholder:text-slate-400 rounded-xl text-sm focus:ring-1 focus:ring-primary/30 outline-none transition-all"
                         />
                         <button
                             onClick={handleCreateSkinSet}
@@ -574,10 +701,13 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                 <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleFileUpload} />
             </div>
 
+            {extraEditorOpen && <DateExtraEditor key={char.id} value={extraDraft} onChange={setExtraDraft}
+                onClose={() => { saveExtraDraft(); setExtraEditorOpen(false); }} />}
+
             {/* URL Input Modal */}
             {showUrlModal && (
                 <div className="fixed inset-0 z-[300] bg-black/40 backdrop-blur-sm flex items-center justify-center p-6" onClick={() => setShowUrlModal(false)}>
-                    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden" onClick={e => e.stopPropagation()}>
+                    <div className="bg-white text-slate-800 rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden" onClick={e => e.stopPropagation()}>
                         <div className="p-4 border-b border-slate-100">
                             <h3 className="font-bold text-slate-700 text-sm">通过 URL 添加立绘</h3>
                             <p className="text-[11px] text-slate-400 mt-1">{urlTargetSkinId ? `目标: ${skinSets.find(s => s.id === urlTargetSkinId)?.name}` : '目标: 默认立绘'}</p>
@@ -588,7 +718,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                                 <select
                                     value={skinUrlEmotionKey}
                                     onChange={e => setSkinUrlEmotionKey(e.target.value)}
-                                    className="w-full px-3 py-2.5 bg-slate-100 rounded-xl text-sm outline-none"
+                                    className="w-full px-3 py-2.5 bg-slate-100 text-slate-800 rounded-xl text-sm outline-none"
                                 >
                                     <option value="">选择情绪...</option>
                                     {[...REQUIRED_EMOTIONS, ...(char.customDateSprites || [])].map(k => (
@@ -603,7 +733,7 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                                     value={skinUrlInput}
                                     onChange={e => setSkinUrlInput(e.target.value)}
                                     placeholder="https://example.com/sprite.png"
-                                    className="w-full px-3 py-2.5 bg-slate-100 rounded-xl text-sm outline-none focus:ring-1 focus:ring-primary/30"
+                                    className="w-full px-3 py-2.5 bg-slate-100 text-slate-800 placeholder:text-slate-400 rounded-xl text-sm outline-none focus:ring-1 focus:ring-primary/30"
                                 />
                             </div>
                             {skinUrlInput && skinUrlInput.startsWith('http') && (
@@ -620,10 +750,11 @@ const DateSettings: React.FC<DateSettingsProps> = ({ char, onBack }) => {
                 </div>
             )}
 
-            <div className="p-4 border-t border-slate-200 bg-white/90 backdrop-blur-sm sticky bottom-0 z-20">
+            <div className="p-4 pb-safe border-t border-slate-200 bg-white/90">
                 <button onClick={handleSaveSettings} className="w-full py-3 bg-primary text-white font-bold rounded-2xl shadow-lg active:scale-95 transition-transform">
                     保存当前布置
                 </button>
+            </div>
             </div>
         </div>
     );

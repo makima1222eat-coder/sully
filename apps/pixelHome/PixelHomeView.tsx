@@ -36,9 +36,10 @@ interface Props {
   charAvatar?: string;
   userName: string;
   onBack: () => void;
+  navigation?: React.ReactNode;
 }
 
-const PixelHomeView: React.FC<Props> = ({ charId, charName, charAvatar, userName, onBack }) => {
+const PixelHomeView: React.FC<Props> = ({ charId, charName, charAvatar, userName, onBack, navigation }) => {
   const { addToast, apiConfig, characters, userProfile, remoteVectorConfig } = useOS();
   const char = characters.find(c => c.id === charId);
   const [viewMode, setViewMode] = useState<PixelHomeViewMode>('map');
@@ -177,7 +178,8 @@ const PixelHomeView: React.FC<Props> = ({ charId, charName, charAvatar, userName
   const handleExport = useCallback(async () => {
     if (!homeState) return;
     const name = charName + '的家';
-    await downloadPreset(homeState, assets, name, userName);
+    const result = await downloadPreset(homeState, assets, name, userName);
+    if (result === 'cancelled') return;
     addToast?.('预设已导出', 'success');
     trackEvent('导出像素家园预设');
   }, [homeState, assets, charName, userName, addToast]);
@@ -287,6 +289,7 @@ const PixelHomeView: React.FC<Props> = ({ charId, charName, charAvatar, userName
             pendingSlotRef.current = null;
             setViewMode('map');
           }}
+          aria-label={viewMode === 'map' ? '返回角色房间' : '返回像素地图'}
           className="p-2 -ml-2 rounded-full hover:bg-slate-700 active:scale-90 transition-all">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5 text-slate-300">
             <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" />
@@ -301,6 +304,7 @@ const PixelHomeView: React.FC<Props> = ({ charId, charName, charAvatar, userName
         </span>
         <div className="w-8" />
       </div>}
+      {viewMode === 'map' && navigation && <div className="shrink-0 px-4">{navigation}</div>}
 
       {/* 主内容区 */}
       <div className="flex-1 overflow-hidden relative">
@@ -363,7 +367,7 @@ const PixelHomeView: React.FC<Props> = ({ charId, charName, charAvatar, userName
             <BottomTab label="捏我" onClick={() => { setEditorTarget('user'); setViewMode('charEditor'); trackEvent('打开像素捏人器', { target: 'user' }); }} />
             <BottomTab label="导入" onClick={() => importInputRef.current?.click()} />
           </div>
-          <input ref={importInputRef} type="file" accept=".json" className="hidden"
+          <input ref={importInputRef} type="file" accept=".json,.png,application/json,image/png" className="hidden"
             onChange={e => { if (e.target.files?.[0]) { handleImportFile(e.target.files[0]); e.target.value = ''; } }} />
         </div>
       )}

@@ -1,3 +1,5 @@
+import { deriveUserEncryptionKey, decryptPayload, encryptPayload } from '@rei-standard/amsg-server/cloudflare';
+import { INSTANT_INPUT_NAMESPACE } from './instantInput';
 /**
  * 即时对话（instant chat）：把「用户按下发送」这一轮聊天当成一条立刻执行的任务。
  *
@@ -12,14 +14,16 @@
  * 上下文，角色会对着旧对话回话）。放在客户端串两个请求的话，中间断网就会留下一条
  * 注定答错的任务；放在这里，客户端只有一次「成了 / 没成」。
  *
- * 加密由客户端做完，这里只搬运：两个信封原样转发给上游，上游照常解密和鉴权，
- * 它仍然是权威。包装层不碰用户密钥，也解不开这两个信封。
+ * 客户端先加密，包装层用同一租户密钥解开并将输入绑定到唯一记录，再重新加密转发。
+ * 上游照常解密、鉴权和校验容量；凭据行仍走独立引用。
  *
  * 零浏览器依赖（这份代码会被打进 worker bundle）。
  */
 
 import {
   AMSG_FIRE_PACK_KEY,
+  parseFirePack,
+  unpackStateValue,
   amsgStateNamespace,
   buildUserClockHint,
   formatFireTimeFull,
@@ -40,12 +44,7 @@ export const INSTANT_TOTAL_TIMEOUT_MS = 600_000;
 
 // ─── 任务身份 ───
 
-/** 任务 metadata 里标即时对话的那个键（客户端排任务时写、worker 到点读）。 */
-export const AMSG_INSTANT_CHAT_FLAG = 'amsgInstantChat';
-
-/** 这条任务是不是即时对话（客户端刚发完消息在等回复）。 */
-export const isInstantChatTask = (metadata: Record<string, unknown> | undefined | null): boolean =>
-  !!metadata && metadata[AMSG_INSTANT_CHAT_FLAG] === true;
+export { AMSG_INSTANT_CHAT_FLAG, isInstantChatTask } from '../../../utils/amsgTaskKinds';
 
 // ─── fire 时追加的「时效信息」块 ───
 
@@ -202,6 +201,7 @@ export interface InstantTickNamespace {
 
 interface InstantChatEnv {
   AMSG_SERVER_TOKEN?: string;
+  AMSG_MASTER_KEY?: string;
   /** 没有它就没法起跳；老版本 Worker 上是 undefined，见 kickInstantTick。 */
   INSTANT_TICK?: InstantTickNamespace;
 }
@@ -338,8 +338,7 @@ const GZIP_MAGIC = [0x1f, 0x8b];
  * 顶层 import 了 Node 的 `crypto`，这个 worker 是明确不开 `nodejs_compat` 的。
  *
  * 判据是**魔数不是头**。`Content-Encoding` 是标准头，链路上的边缘节点会替你把请求体
- * 解开却把头留着（SullyOS 在 instant-push 那条路上实测过这件事，那边索性换了个自定义
- * 头来躲开）——只看头的话，这种时候会拿明文去喂解压器，报出来是一句让人找不着北的
+ * 解开却把头留着（SullyOS 实测遇到过）——只看头的话，这种时候会拿明文去喂解压器，报出来是一句让人找不着北的
  * 「请求体不是合法的 JSON」。看魔数则三种情形都对：没解过的解开、替我们解过的原样读、
  * 压根没压的原样读。
  */
@@ -368,7 +367,8 @@ const isEncryptedEnvelope = (value: unknown): boolean => {
  * `POST /instant-chat` 的处理：鉴权 → 严格顺序转发 → 202 → 立刻起一跳。
  *
  * 顺序不能换：云端状态先落地，任务才允许存在。反过来的话，状态那一步失败时 D1 里
- * 已经躺着一条注定拿旧上下文答话的任务，而且没人拦得住它。
+ * 已经躺着一条注定拿旧上下文答话的任务，而且没人拦得住它。带了 credPayload 的话，
+ * 凭据行同样要在建任务之前覆盖好。
  *
  * 任务体带 `immediate: true`（客户端 sendInstantChat 固定写）：上游落库即到期，
  * 202 之后的那一跳直接就能捡走；顶替上一条也在任务体里（`supersedesUuid`，
@@ -402,7 +402,7 @@ export const handleInstantChat = async (args: {
   if (!userId) return fail(400, 'USER_ID_REQUIRED', '缺少用户标识符');
   if (!UUID_V4_RE.test(userId)) return fail(400, 'INVALID_USER_ID_FORMAT', 'X-User-Id 必须是 UUID v4 格式');
 
-  // ── 外壳是明文 JSON，里头两个信封是客户端加密好的，包装层只搬不看。
+  // ── 外壳是明文 JSON，里头两个信封是客户端加密好的。
   //    body 超阈值时客户端会先 gzip 再发（这条路上的正文是整轮聊天，最大的一份），
   //    所以读之前先过一道解压。
   let body: Record<string, unknown>;
@@ -419,6 +419,45 @@ export const handleInstantChat = async (args: {
   }
   if (!isEncryptedEnvelope(body.taskPayload)) {
     return fail(400, 'INVALID_TASK_PAYLOAD', 'taskPayload 必须是加密信封（iv / authTag / encryptedData）');
+  }
+  if (body.credPayload !== undefined && !isEncryptedEnvelope(body.credPayload)) {
+    return fail(400, 'INVALID_CRED_PAYLOAD', 'credPayload 必须是加密信封（iv / authTag / encryptedData）');
+  }
+
+  // 绑定不可变输入后再写任何共享状态。旧客户端也走这条转换，凭据仍独立热更新。
+  let inputKey = '';
+  try {
+    if (!env.AMSG_MASTER_KEY) throw new Error('Worker 缺少 AMSG_MASTER_KEY');
+    const key = await deriveUserEncryptionKey(userId, env.AMSG_MASTER_KEY);
+    const [state, task] = await Promise.all([
+      decryptPayload(body.statePayload as any, key), decryptPayload(body.taskPayload as any, key),
+    ]);
+    const charId = task?.metadata?.charId;
+    if (typeof charId !== 'string' || !charId || !Array.isArray(state?.entries)) throw new Error('缺少角色状态');
+    const inputEntry = state.entries.find((entry: any) => entry.namespace === amsgStateNamespace(charId) && entry.key === AMSG_FIRE_PACK_KEY);
+    const firePack = inputEntry && typeof inputEntry.value === 'string'
+      ? parseFirePack(await unpackStateValue(inputEntry.value)) : null;
+    if (!firePack?.chat) throw new Error('即时输入缺少有效 fire_pack.chat');
+    inputKey = crypto.randomUUID();
+    task.taskInput = {
+      firePackRef: { namespace: INSTANT_INPUT_NAMESPACE, key: inputKey },
+      firePackUpdatedAt: inputEntry.updatedAt,
+    };
+    // 完整输入仍走 5 MiB 大值分块，不塞进不到 1 MiB 的任务行。每次受理独立 key，
+    // 凭据或排任务失败只留下可过期清理的孤儿，不会改掉旧任务或旧客户端读的 shared chat。
+    state.entries = state.entries.filter((entry: any) => entry !== inputEntry);
+    state.entries.push({
+      ...inputEntry, namespace: INSTANT_INPUT_NAMESPACE, key: inputKey,
+      value: JSON.stringify({ v: 1, charId, packedFirePack: inputEntry.value }),
+      owner: { type: 'character', id: charId },
+      kind: 'instant-input',
+      updatedAt: Date.now(),
+    });
+    [body.statePayload, body.taskPayload] = await Promise.all([
+      encryptPayload(state, key), encryptPayload(task, key),
+    ]);
+  } catch (error) {
+    return fail(400, 'INVALID_INSTANT_INPUT', error instanceof Error ? error.message : '即时输入无法解密');
   }
 
   // ── 内部转发：路径跟着本次请求的挂载点走（上游按后缀匹配，worker 可能挂在子路径下）。
@@ -443,32 +482,43 @@ export const handleInstantChat = async (args: {
     try { return await response.json(); } catch { return null; }
   };
 
-  // ① 云端状态必须先落地：这一步失败就绝不落任务（否则任务到点会拿旧上下文答话）。
-  //    5xx 是 D1 冷启动那类瞬时错误的典型长相，按梯子重试几次（见 STATE_FORWARD_BACKOFF_MS）；
-  //    4xx 是上游判出来的业务错（体积超限、时间戳不合法……），重试多少次都是同一个答案，立刻打回。
-  let stateResponse!: Response;
-  let stateBody: unknown = null;
-  let stateCause: string | null = null;
-  for (let attempt = 0; attempt < stateBackoffMs.length; attempt += 1) {
-    if (attempt > 0) {
-      console.warn(`[amsg:instant-chat] 云端状态第 ${attempt} 次没写进去（${stateCause ?? stateResponse.status}），重试`);
-      await sleep(stateBackoffMs[attempt]);
+  /**
+   * 转发一个幂等的 upsert，5xx 按梯子重试（见 STATE_FORWARD_BACKOFF_MS）。
+   * 4xx 是上游判出来的业务错（体积超限、时间戳不合法……），重试多少次都是同一个答案，立刻打回。
+   * 响应体只能读一次，这里读完一起交回：失败分支要拿它报原因，成功分支还要查里面的字段。
+   */
+  const forwardIdempotentPut = async (path: string, envelope: unknown, label: string) => {
+    let response!: Response;
+    let responseBody: unknown = null;
+    let cause: string | null = null;
+    for (let attempt = 0; attempt < stateBackoffMs.length; attempt += 1) {
+      if (attempt > 0) {
+        console.warn(`[amsg:instant-chat] ${label}第 ${attempt} 次没写进去（${cause ?? response.status}），重试`);
+        await sleep(stateBackoffMs[attempt]);
+      }
+      response = await upstream.fetch(
+        new Request(internalUrl(path), {
+          method: 'PUT',
+          headers: encryptedHeaders,
+          body: JSON.stringify(envelope),
+        }),
+        env,
+      );
+      responseBody = await readBody(response);
+      cause = readUpstreamCause(response.status, responseBody);
+      if (response.status < 500) break;
     }
-    stateResponse = await upstream.fetch(
-      new Request(internalUrl('/client-state'), {
-        method: 'PUT',
-        headers: encryptedHeaders,
-        body: JSON.stringify(body.statePayload),
-      }),
-      env,
-    );
-    // 响应体只能读一次，这里读完存着：失败分支要拿它报原因，成功分支要拿它查 skippedEntries。
-    stateBody = await readBody(stateResponse);
-    stateCause = readUpstreamCause(stateResponse.status, stateBody);
-    if (stateResponse.status < 500) break;
-  }
-  if (!stateResponse.ok) {
-    return json(stateResponse.status, {
+    return { response, body: responseBody, cause };
+  };
+
+  // ① 云端状态必须先落地：这一步失败就绝不落任务（否则任务到点会拿旧上下文答话）。
+  const {
+    response: stateResponse,
+    body: stateBody,
+    cause: stateCause,
+  } = await forwardIdempotentPut('/client-state', body.statePayload, '云端状态');
+  if (!stateResponse.ok || (stateBody as { success?: unknown } | null)?.success === false) {
+    return json(stateResponse.ok ? 502 : stateResponse.status, {
       success: false,
       error: {
         code: 'INSTANT_CHAT_STATE_FAILED',
@@ -479,15 +529,18 @@ export const handleInstantChat = async (args: {
       },
     });
   }
-  // HTTP ok ≠ 都写进去了：上游按 updatedAt 做条件写（旧不盖新），被拦的条目在成功体的
-  // skippedEntries 里点名。fire_pack 被拦（典型成因：设备时钟在两次发送之间被回拨，
-  // 这次的 updatedAt 反而比云端存量旧）时绝不能落任务——到点的 fire 读到的是上一轮的
-  // chat 段，要么对旧消息答非所问、要么硬失败，用户却已经拿到 202 在等「正在输入」。
-  // 「状态没落地就不落任务」正是这条两步串行存在的意义，这里把它守完整。
+  const rejectedEntries = (stateBody as {
+    data?: { rejected?: Array<{ namespace?: unknown; key?: unknown }> };
+  } | null)?.data?.rejected;
+  if (Array.isArray(rejectedEntries) && rejectedEntries.some(entry =>
+    entry.namespace === INSTANT_INPUT_NAMESPACE && entry.key === inputKey)) {
+    return fail(409, 'INSTANT_CHAT_STATE_FAILED', '这一轮的输入未能保存，任务没有创建', { step: 'client-state', upstream: stateBody });
+  }
+  // 本轮输入必须落地。只有它自己的条件写被拒才拦下；其他共享状态仍以各自版本为准。
   const skippedEntries = (stateBody as {
     data?: { skippedEntries?: Array<{ namespace?: unknown; key?: unknown }> };
   } | null)?.data?.skippedEntries;
-  if (Array.isArray(skippedEntries) && skippedEntries.some((entry) => entry?.key === AMSG_FIRE_PACK_KEY)) {
+  if (Array.isArray(skippedEntries) && skippedEntries.some((entry) => entry?.namespace === INSTANT_INPUT_NAMESPACE && entry.key === inputKey)) {
     return json(409, {
       success: false,
       error: {
@@ -498,7 +551,35 @@ export const handleInstantChat = async (args: {
     });
   }
 
-  // ② 任务落库 = 受理（顶替上一条也在这一步里：任务体的 supersedesUuid 由上游在
+  // ② 这一轮的凭据行（credPayload，可选）：每一轮都照客户端给的覆盖一遍，再建任务。
+  //    客户端本来靠一份本地「上次传过什么」的底账决定传不传，可那份底账只代表这台设备、
+  //    这个浏览器——另一个入口（比如 iOS 上 Safari 和主屏 App 各存各的）或另一台 Worker
+  //    改过云端那行时，底账还写着「传过了」，任务就一直拿着别人留下的凭据跑，本地怎么
+  //    切 API 都没用。在这里跟任务同一个请求覆盖，云端那行就永远等于这一轮本地用的那份。
+  //    写失败同样不落任务：拿着旧凭据答话正是要堵的那种错。
+  const credPayload = body.credPayload;
+  if (credPayload !== undefined) {
+    const {
+      response: credResponse,
+      body: credBody,
+      cause: credCause,
+    } = await forwardIdempotentPut('/llm-credentials', credPayload, 'LLM 凭据');
+    // 上游有 200 包 success:false 的历史写法，两样一起看。
+    if (!credResponse.ok || (credBody as { success?: unknown } | null)?.success === false) {
+      return json(credResponse.ok ? 502 : credResponse.status, {
+        success: false,
+        error: {
+          code: 'INSTANT_CHAT_CREDENTIALS_FAILED',
+          message: '这一轮的 API 凭据没传上去，这条没发出去',
+          step: 'llm-credentials',
+          upstream: credBody,
+          ...(credCause ? { upstreamLog: credCause } : {}),
+        },
+      });
+    }
+  }
+
+  // ③ 任务落库 = 受理（顶替上一条也在这一步里：任务体的 supersedesUuid 由上游在
   //    同一事务里处理）。到这一步返回 202 之前，行已经在 D1 里了，
   //    下面那一跳只是让它快点跑起来，跑不成还有每分钟的 cron。
   const taskResponse = await upstream.fetch(
@@ -530,7 +611,7 @@ export const handleInstantChat = async (args: {
     });
   }
 
-  // ③ 叫醒 DO，让它立刻把这条捡走（immediate 任务落库即到期）。
+  // ④ 叫醒 DO，让它立刻把这条捡走（immediate 任务落库即到期）。
   //    生成跑在它的 alarm 里 —— 独立 invocation、15 分钟墙钟，见 kickInstantTick。
   const kicked = await kickInstantTick(env, uuid);
   if (!kicked.ok && kicked.reason === 'missing-binding') {
@@ -554,5 +635,11 @@ export const handleInstantChat = async (args: {
     console.warn('[amsg:instant-chat] 叫醒 DO 失败（等 cron 兜底）', kicked.error);
   }
 
-  return json(202, { status: 'accepted', uuid });
+  // credentialsSynced：告诉客户端「这一轮的凭据行已经照你给的覆盖过了」，它据此把本地
+  // 底账对齐。旧 bundle 不认 credPayload、也就不会带这个键——客户端见不到它就不记账。
+  return json(202, {
+    status: 'accepted',
+    uuid,
+    ...(credPayload !== undefined ? { credentialsSynced: true } : {}),
+  });
 };

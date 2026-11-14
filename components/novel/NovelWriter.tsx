@@ -1,3 +1,4 @@
+import { ContextBuilder } from '../../utils/context';
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { NovelBook, NovelSegment, CharacterProfile, UserProfile } from '../../types';
@@ -106,7 +107,7 @@ const PersonaPanel: React.FC<PersonaPanelProps> = ({
                                 await generateWriterPersonaDeep(char, userProfile, apiConfig, updateCharacter, true); 
                                 addToast('风格已更新', 'success'); 
                             } catch (e) { 
-                                addToast('失败', 'error'); 
+                                addToast(e instanceof Error ? e.message : '分析失败，请重试', 'error');
                             } finally { 
                                 setIsTyping(false); 
                             } 
@@ -207,6 +208,7 @@ const NovelWriter: React.FC<NovelWriterProps> = ({
     // --- Actions ---
 
     const runGeneration = async (char: CharacterProfile, userPrompt: string, contextSegments: NovelSegment[]) => {
+
         setIsTyping(true);
         setLastTokenUsage(null);
 
@@ -233,17 +235,22 @@ const NovelWriter: React.FC<NovelWriterProps> = ({
                 storyContext += `\n[${authorName}]: ${s.content}\n`;
             });
 
-            const prompt = buildPrompt(char, userProfile, activeBook, userPrompt, storyContext, genOptions, contextSegments, characters);
-            const traits = char.impression?.personality_core.observed_traits || [];
-            let temperature = 0.85;
-            if (traits.some(t => t.includes('电波') || t.includes('疯'))) temperature = 0.98;
-            if (traits.some(t => t.includes('理性') || t.includes('冷') || t.includes('逻辑'))) temperature = 0.6;
+            const prompt = await buildPrompt(char, userProfile, activeBook, userPrompt, storyContext, genOptions, contextSegments, characters);
+            // Sampling is a writing-task default, not inferred from the user's personality.
+            const temperature = 0.85;
 
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: "user", content: prompt }], temperature, max_tokens: 8000 })
-            });
+                body: JSON.stringify({ model: apiConfig.model, messages: (await ContextBuilder.buildCharacterRequest({ char, user: userProfile }, [{ role: "user", content: prompt }])), temperature, max_tokens: 8000 }),
+                __sullyMeta: {
+                    appId: 'novel',
+                    appName: '一起写小说',
+                    charId: char.id,
+                    charName: char.name,
+                    purpose: '小说共写生成',
+                },
+            } as RequestInit);
 
             if (response.ok) {
                 const data = await safeResponseJson(response);
@@ -390,11 +397,18 @@ ${chapterText.substring(0, 200000)}
 6. **写作格式**：使用清晰的结构化格式（可以分段或使用标记），让后续章节的AI仅凭此总结就能无缝衔接创作。
 
 请直接输出总结内容，不需要JSON格式。`;
+            const summaryChar = targetChar || (collaborators.length === 1 ? collaborators[0] : undefined);
             const response = await fetch(`${apiConfig.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiConfig.apiKey}` },
-                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: "user", content: prompt }] })
-            });
+                body: JSON.stringify({ model: apiConfig.model, messages: [{ role: "user", content: prompt }] }),
+                __sullyMeta: {
+                    appId: 'novel',
+                    appName: '一起写小说',
+                    ...(summaryChar ? { charId: summaryChar.id, charName: summaryChar.name } : {}),
+                    purpose: '小说章节总结',
+                },
+            } as RequestInit);
 
             if (response.ok) {
                 const data = await safeResponseJson(response);

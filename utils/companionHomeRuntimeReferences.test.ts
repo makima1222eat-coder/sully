@@ -97,7 +97,8 @@ describe('CompanionHome touch request boundaries', () => {
     expect(source).toContain('data-testid="companion-hud-thought"');
     expect(source).toContain('data-testid="companion-hud-chat"');
     expect(source).toContain('data-testid="companion-hud-schedule"');
-    expect(source).toContain('DB.getRecentMessagesByCharId');
+    expect(source).toContain('DB.getRecentMessagesWithCount(character.id, 1');
+    expect(source).toContain('isChatPreviewMessage(message)');
     expect(source).toContain('getLastInnerState(character.id)');
     expect(source).toContain('getDailyScheduleForChar(character)');
     expect(source).toContain('data-ui-scale="medium"');
@@ -337,7 +338,8 @@ describe('CompanionHome touch request boundaries', () => {
     expect(source).toContain("const COMPANION_WARDROBE_DISCOVERY_KEY = 'sully-companion-wardrobe-discovery-v1'");
     expect(source).toContain('data-wardrobe-hint-active={wardrobeDiscoveryActive');
     expect(source).toContain('data-testid="companion-wardrobe-discovery-nudge"');
-    expect(source).toContain("setEditingPanel(staticCompanionActive ? 'stage' : 'character')");
+    expect(source).toContain("setEditingPanel('character')");
+    expect(source).toContain('data-testid="companion-portrait-composition"');
     expect(source).toContain('staticMode={staticCompanionActive}');
     expect(wardrobeSource).toContain('data-testid="companion-wardrobe-discovery-tip"');
     expect(wardrobeSource).toContain('场景与构图');
@@ -405,7 +407,7 @@ describe('CompanionHome touch request boundaries', () => {
     expect(source).not.toContain('data-testid="companion-generate-startup"');
     expect(source).toContain('中文原文（界面显示）');
     expect(source).toContain('语音译文（实际朗读）');
-    expect(source).toContain("label: '开机自启'");
+    expect(source).toContain("label: '开场预演'");
     expect(source).toContain('onModelReady={handleStageModelReady}');
     expect(source).toContain('COMPANION_BOOT_LOCK_PERFORMANCE');
     expect(source).toContain('const companionStartupPlayedThisSession = new Set<string>()');

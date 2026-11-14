@@ -1,3 +1,8 @@
+import { isChatConversationEntry } from './trace';
+
+import { readMaintenanceSettings } from './maintenanceMode';
+import { loadRangeMessageContents } from './rangeMessagePage';
+import { loadCharacterContextMessages } from '../chatContextRange';
 /**
  * Memory Palace — 集成管线 (Pipeline)
  *
@@ -130,6 +135,8 @@ import {
  * 而不是主聊天模型。
  */
 export interface LightLLMConfig {
+    /** Manual wizard: compression must not start another plate request. */
+    deferPlateMaintenance?: boolean;
     baseUrl: string;
     apiKey: string;
     model: string;
@@ -198,8 +205,19 @@ async function loadMemoriesByDateRanges(
 export function buildAutoArchiveFragments(
     memories: { id: string; content: string; createdAt: number }[],
     hideBeforeMessageId: number,
+    linkToPalace = false,
 ): NonNullable<PipelineResult['autoArchive']> | null {
     if (memories.length === 0) return null;
+    if (linkToPalace) return {
+        hideBeforeMessageId,
+        fragments: memories.map(memory => ({
+            id: `mp_link_${memory.id}`,
+            date: getLocalDateKey(new Date(memory.createdAt)),
+            summary: memory.content,
+            mood: 'palace',
+            palaceMemoryId: memory.id,
+        })),
+    };
 
     const fmtDate = (ts: number): string => {
         const d = new Date(ts);
@@ -247,7 +265,7 @@ export function buildAutoArchiveFragments(
  */
 export function mergePalaceFragmentsIntoMemories(
     existing: import('../../types').MemoryFragment[],
-    incoming: { id: string; date: string; summary: string; mood: string }[],
+    incoming: { id: string; date: string; summary: string; mood: string; palaceMemoryId?: string }[],
 ): import('../../types').MemoryFragment[] {
     if (incoming.length === 0) return existing;
 
@@ -256,11 +274,17 @@ export function mergePalaceFragmentsIntoMemories(
     const result = existing.slice();
     for (let i = 0; i < result.length; i++) {
         const m = result[i];
-        if (m.mood === 'palace') palaceByDate.set(m.date, i);
+        if (m.mood === 'palace' && !m.palaceMemoryId) palaceByDate.set(m.date, i);
     }
 
     for (const frag of incoming) {
-        const existingIdx = palaceByDate.get(frag.date);
+        if (result.some(memory => memory.id === frag.id)) continue;
+        if (frag.palaceMemoryId) {
+            // Never merge a new link into a pre-upgrade daily snapshot, even on the same date.
+            if (!result.some(memory => memory.palaceMemoryId === frag.palaceMemoryId)) result.push(frag);
+            continue;
+        }
+        const existingIdx = frag.mood === 'palace' ? palaceByDate.get(frag.date) : undefined;
         if (existingIdx !== undefined) {
             // merge：把新 bullets 直接追加到 summary。
             // 不做字符串去重——LLM 偶尔写出相同短句的合法情况会被误杀，
@@ -275,7 +299,7 @@ export function mergePalaceFragmentsIntoMemories(
             };
         } else {
             result.push(frag);
-            palaceByDate.set(frag.date, result.length - 1);
+            if (frag.mood === 'palace') palaceByDate.set(frag.date, result.length - 1);
         }
     }
 
@@ -356,6 +380,8 @@ export interface RecallRetrievalOptions {
     recallPlan?: RecallPlan;
     /** 调用方专用的最终召回/格式化上限；默认聊天仍保持 15。 */
     formatterMaxOutputItems?: number;
+    /** 隐去召回结果上的现实日期与「今天/距今X天」标注（用于虚构剧场与关掉线下时间感知的见面）。 */
+    omitDates?: boolean;
 }
 
 export async function retrieveMemories(
@@ -1088,7 +1114,7 @@ export async function retrieveMemories(
         const anticipations = await tRetrieve('AnticipationDB.getByCharId', 'IDB', AnticipationDB.getByCharId(charId));
 
         // 10. 格式化
-        const formatted = await tRetrieve('expandAndFormat', 'IDB', expandAndFormat(results, charId, anticipations, userName, formatterCap));
+        const formatted = await tRetrieve('expandAndFormat', 'IDB', expandAndFormat(results, charId, anticipations, userName, formatterCap, { omitDates: recallOptions?.omitDates }));
 
         // ── 汇总打印 ──
         const perfTotal = Math.round(performance.now() - perfRetrieveT0);
@@ -1156,7 +1182,7 @@ export async function injectMemoryPalace(
     recentMessages?: Message[],
     queryHint?: string,
     userName?: string,
-    traceContext?: { entryPoint?: RecallEntryPoint; formatterMaxOutputItems?: number },
+    traceContext?: { entryPoint?: RecallEntryPoint; formatterMaxOutputItems?: number; omitDates?: boolean },
 ): Promise<RecallTrace> {
     const hadPreviousMemory = Boolean(char.memoryPalaceInjection);
     const hadPreviousRoomPlates = Boolean(char.roomPlatesInjection);
@@ -1188,11 +1214,12 @@ export async function injectMemoryPalace(
     }
 
     let explicitEntityAnalysis: ExplicitEntityAnalysis | undefined;
+    const interactiveRecall = isChatConversationEntry(trace.entryPoint) || trace.entryPoint === 'collaboration';
     if (!trace.featureFlagsSnapshot.recallRouter) {
         trace.explicitEntityRecall = { status: 'disabled' };
         trace.eventBoxMetadataRecall = { status: 'disabled' };
         trace.recallResolver = { status: 'disabled' };
-    } else if (trace.entryPoint !== 'chat_app') {
+    } else if (!interactiveRecall) {
         trace.explicitEntityRecall = { status: 'out_of_scope' };
         trace.eventBoxMetadataRecall = { status: 'out_of_scope' };
         trace.recallResolver = { status: 'out_of_scope' };
@@ -1246,7 +1273,7 @@ export async function injectMemoryPalace(
 
     if (!trace.featureFlagsSnapshot.interactionAdaptation) {
         trace.interactionAdaptation = { status: 'disabled' };
-    } else if (trace.entryPoint !== 'chat_app') {
+    } else if (!interactiveRecall) {
         trace.interactionAdaptation = { status: 'out_of_scope' };
     } else {
         const interactionStartedAt = performance.now();
@@ -1275,7 +1302,7 @@ export async function injectMemoryPalace(
 
     if (!trace.featureFlagsSnapshot.deepEngagement) {
         trace.deepEngagement = { status: 'disabled' };
-    } else if (trace.entryPoint !== 'chat_app') {
+    } else if (!interactiveRecall) {
         trace.deepEngagement = { status: 'out_of_scope' };
     } else {
         const depthStartedAt = performance.now();
@@ -1329,6 +1356,32 @@ export async function injectMemoryPalace(
         trace.stages.push({ name: 'finalize', durationMs: 0, outcome: 'skipped' });
         return finishRecallTrace(trace, 'skipped_palace_disabled');
     }
+    // 调用方没显式传 userName 时，兜底从全局用户档案取，保证各入口
+    // （群聊/通话/事件/学习等）召回的房间名都统一显示「{用户名}的房间」，
+    // 而不是回退成「用户房间」。
+    let resolvedUserName = userName;
+    if (!resolvedUserName) {
+        try { resolvedUserName = (await DB.getUserProfile())?.name || undefined; } catch {}
+    }
+
+    // 门牌（常驻语义层）：纯 IDB 读 + 格式化，不调 LLM。
+    // 无条件赋值（包括 ''）—— 门牌被清空/删除后，persist 过的旧注入必须被冲掉。
+    const roomPlatesStartedAt = performance.now();
+    let roomPlateOutcome: RecallTraceStage['outcome'] = 'ok';
+    try {
+        const { buildRoomPlatesInjection } = await import('./roomPlates');
+        char.roomPlatesInjection = await buildRoomPlatesInjection(char.id, resolvedUserName);
+    } catch {
+        char.roomPlatesInjection = '';
+        roomPlateOutcome = 'error';
+    }
+    trace.injection.roomPlateChars = char.roomPlatesInjection.length;
+    trace.stages.push({
+        name: 'room_plates',
+        durationMs: Math.round(performance.now() - roomPlatesStartedAt),
+        outcome: roomPlateOutcome,
+    });
+
     const embeddingConfig = getEmbeddingConfig(char.embeddingConfig);
     if (!embeddingConfig) {
         trace.stages.push({ name: 'finalize', durationMs: 0, outcome: 'skipped' });
@@ -1336,39 +1389,13 @@ export async function injectMemoryPalace(
     }
     try {
         const loadStartedAt = performance.now();
-        const msgs = recentMessages ?? await DB.getMessagesByCharId(char.id);
+        const msgs = recentMessages ?? await loadCharacterContextMessages(char.id);
         trace.stages.push({
             name: 'load_messages',
             durationMs: Math.round(performance.now() - loadStartedAt),
             outcome: 'ok',
         });
         const currentMood = char.activeBuffs?.[0]?.name;
-        // 调用方没显式传 userName 时，兜底从全局用户档案取，保证各入口
-        // （群聊/通话/事件/学习等）召回的房间名都统一显示「{用户名}的房间」，
-        // 而不是回退成「用户房间」。
-        let resolvedUserName = userName;
-        if (!resolvedUserName) {
-            try { resolvedUserName = (await DB.getUserProfile())?.name || undefined; } catch {}
-        }
-
-        // 门牌（常驻语义层）：纯 IDB 读 + 格式化，不调 LLM。
-        // 无条件赋值（包括 ''）—— 门牌被清空/删除后，persist 过的旧注入必须被冲掉。
-        const roomPlatesStartedAt = performance.now();
-        let roomPlateOutcome: RecallTraceStage['outcome'] = 'ok';
-        try {
-            const { buildRoomPlatesInjection } = await import('./roomPlates');
-            char.roomPlatesInjection = await buildRoomPlatesInjection(char.id, resolvedUserName);
-        } catch {
-            char.roomPlatesInjection = '';
-            roomPlateOutcome = 'error';
-        }
-        trace.injection.roomPlateChars = char.roomPlatesInjection.length;
-        trace.stages.push({
-            name: 'room_plates',
-            durationMs: Math.round(performance.now() - roomPlatesStartedAt),
-            outcome: roomPlateOutcome,
-        });
-
         const retrieveStartedAt = performance.now();
         let retrievalTelemetry: RecallRetrievalTelemetry | undefined;
         const context = await retrieveMemories(
@@ -1381,7 +1408,7 @@ export async function injectMemoryPalace(
             getRemoteVectorConfig(),
             char.name,
             telemetry => { retrievalTelemetry = telemetry; },
-            { explicitEntityAnalysis, formatterMaxOutputItems: traceContext?.formatterMaxOutputItems },
+            { explicitEntityAnalysis, formatterMaxOutputItems: traceContext?.formatterMaxOutputItems, omitDates: traceContext?.omitDates },
         );
         if (context || !legacyCompatibilityMode) {
             char.memoryPalaceInjection = context || '';
@@ -1419,7 +1446,7 @@ export async function injectMemoryPalace(
                 outcome: eventBox.status === 'error' ? 'error' : eventBox.status === 'miss' ? 'empty' : 'ok',
             });
         }
-        trace.injection.memoryChars = char.memoryPalaceInjection.length;
+        trace.injection.memoryChars = char.memoryPalaceInjection?.length ?? 0;
         trace.stages.push({
             name: 'retrieve',
             durationMs: Math.round(performance.now() - retrieveStartedAt),
@@ -1437,7 +1464,7 @@ export async function injectMemoryPalace(
         console.warn(`🏰 [MemoryPalace] injectMemoryPalace failed: ${e.message}`);
         if (!legacyCompatibilityMode) char.memoryPalaceInjection = '';
         trace.injection.memoryChars = 0;
-        trace.injection.roomPlateChars = char.roomPlatesInjection.length;
+        trace.injection.roomPlateChars = char.roomPlatesInjection?.length ?? 0;
         trace.stages.push({ name: 'finalize', durationMs: 0, outcome: 'error' });
         return finishRecallTrace(trace, 'error', 'injection_exception');
     }
@@ -1679,7 +1706,7 @@ export interface PipelineResult {
      */
     autoArchive?: {
         /** 按日期切好的新 MemoryFragment 列表，id 已生成，mood='palace' */
-        fragments: { id: string; date: string; summary: string; mood: string }[];
+        fragments: { id: string; date: string; summary: string; mood: string; palaceMemoryId?: string }[];
         /** 这一批 buffer 处理完后的水位线（= 最后一条被处理 Message.id），应设到 char.hideBeforeMessageId */
         hideBeforeMessageId: number;
     } | null;
@@ -1687,11 +1714,11 @@ export interface PipelineResult {
      * 软跳过原因（非错误）：LLM 根本没跑，原因可能是缓冲区未到阈值 / 热区还没被挤出 / 已有任务在跑。
      * caller 看到这个字段就应当提示"聊天还不够，继续聊"，而不是报"LLM 提取失败"。
      */
-    skipReason?: 'lock' | 'hot_zone' | 'threshold';
+    skipReason?: 'lock' | 'hot_zone' | 'threshold' | 'manual';
 }
 
 /** 构造一个"软跳过"结果，统一 caller 的分支处理 */
-function makeSkipResult(reason: 'lock' | 'hot_zone' | 'threshold'): PipelineResult {
+function makeSkipResult(reason: 'lock' | 'hot_zone' | 'threshold' | 'manual'): PipelineResult {
     return { stored: 0, skipped: 0, memories: [], batches: [], skipReason: reason };
 }
 
@@ -1964,7 +1991,7 @@ async function applyMemorySideEffects(
         }
 
         // 10c. EventBox 压缩：扫描刚被触达的盒，活节点 ≥ 4 → LLM 二次总结
-        if (touchedBoxIds.size > 0) {
+        if (touchedBoxIds.size > 0 && !llmConfig.deferPlateMaintenance && !readMaintenanceSettings().enabled) {
             try {
                 const { maybeCompressEventBoxes } = await import('./eventBoxCompression');
                 await maybeCompressEventBoxes(touchedBoxIds, llmConfig, embeddingConfig, charName, userName);
@@ -2031,6 +2058,8 @@ async function applyMemorySideEffects(
 }
 
 export interface ProcessNewMessagesOptions {
+    /** Explicit user step may run while automatic maintenance is paused. */
+    manualMaintenanceStep?: boolean;
     /** 一键存入后仍保留为聊天原文的最近消息数；只在 drainBuffer=true 时生效。 */
     retainRecentMessages?: number;
     /** 处理水位线到目标边界之间的全部内容，不套用日常档位热区与 85% 尾部保留。 */
@@ -2054,6 +2083,7 @@ export async function processNewMessages(
     onProgress?: (stage: string) => void,
     options: ProcessNewMessagesOptions = {},
 ): Promise<PipelineResult | null> {
+    if (!force && !options.manualMaintenanceStep && readMaintenanceSettings().enabled) return makeSkipResult('manual');
     // 并发锁：同一角色同时只能跑一次
     if (processingLocks.has(charId)) {
         console.log(`🏰 [Pipeline] 跳过：${charName} 已有处理任务在运行`);
@@ -2065,7 +2095,7 @@ export async function processNewMessages(
         // 1. 加载全部消息（含已处理的），计算热区和缓冲区
         //    过滤：保留任何有语义的消息类型（文字、带转写的语音、卡片、系统事件等），
         //    只排除纯视觉资源和无转写的纯音频，避免 URL / base64 污染 LLM。
-        const allMessages = await DB.getMessagesByCharId(charId, true);
+        const allMessages = await DB.getMessagesByCharId(charId, true, options.drainBuffer === true);
         const privateMessages = allMessages
             .filter(message => !message.groupId)
             .sort((a, b) => a.id - b.id);
@@ -2168,7 +2198,7 @@ export async function processNewMessages(
         //       消息不会被重复处理，去重在这条路径上收益小、误伤大。
         const core = await extractAndStoreMemories(
             toProcess, charId, charName, embeddingConfig, llmConfig, userName, onProgress, true,
-            options.requireAllBatches === true,
+            true, // A failed batch must never be hidden by another batch's successful waterline advance.
         );
 
         if (core.memories.length === 0) {
@@ -2198,15 +2228,16 @@ export async function processNewMessages(
         const newHighWaterMark = drainBuffer
             ? targetHighWaterMark
             : toProcess[toProcess.length - 1].id;
+        // Resolve committed nodes before advancing the waterline; read failures must not hide messages.
+        const storedNodes = (await Promise.all(core.memories.map(memory => MemoryNodeDB.getById(memory.id))))
+            .filter((node): node is import('./types').MemoryNode => !!node);
+        const autoArchive = buildAutoArchiveFragments(storedNodes, newHighWaterMark, true);
         await setReliableMemoryPalaceHighWaterMark(charId, newHighWaterMark);
         console.log(`✅ [Pipeline] 缓冲区处理完成：${core.stored} 条记忆, hwm ${lastProcessedId} → ${newHighWaterMark}`);
         onProgress?.(`记忆整理完成！新增 ${core.stored} 条记忆`);
 
-        // 9b. 自动归档建议：按日期 group 新记忆 → YAML bullets → 合成 MemoryFragment
-        //     caller（useChatAI / Chat）拿到后做"同日期 merge 进 char.memories + 推 hideBeforeMessageId"
-        //     这条路径让 palace 成功后自动同步到传统归档+聊天水位线
-        //     零 LLM 调用——风格化已经在 palace extraction 那次 LLM 调用里完成
-        const autoArchive = buildAutoArchiveFragments(core.memories, newHighWaterMark);
+        // 自动归档只关联实际落库的节点；去重跳过的候选不会生成悬空链接。
+        // 读取与建议构造在推进水位前完成，不额外调用 LLM / Embedding。
 
         // 构建返回结果
         const pipelineResult: PipelineResult = {
@@ -2424,8 +2455,8 @@ export async function processMessageRange(
         const lo = Math.min(fromMsgId, toMsgId);
         const hi = Math.max(fromMsgId, toMsgId);
 
-        // 加载全部消息（含已处理的），取区间内的语义相关消息，按 id 升序
-        const allMessages = await DB.getMessagesByCharId(charId, true);
+        // 只加载用户选区内的正文，含已处理消息，不推进水位线。
+        const allMessages = await loadRangeMessageContents(charId, lo, hi);
         const toProcess = allMessages
             .filter(m => isMessageSemanticallyRelevant(m))
             .filter(m => m.id >= lo && m.id <= hi)

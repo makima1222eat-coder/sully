@@ -183,7 +183,7 @@ describe('CallApp runtime references', () => {
     expect(source).toContain('await captureUserCameraEmotionContext()');
     expect(source).toContain("userCameraMode === 'snapshot'");
     expect(source).toContain('captureUserCameraSnapshotContext()');
-    expect(source).toContain('attachSnapshotToLatestUserMessage(messages, userCameraSnapshot)');
+    expect(source).toContain('prepareUserCameraSnapshot(messages, userCameraSnapshot)');
     expect(source).toContain('userCameraSnapshot ? 0 : 2');
     expect(source).toContain('isVisionInputUnsupportedError(error)');
     expect(source).toContain('await requestAssistantReply(input, userDbId, pendingTouchesForTurn, true, userCameraSnapshotForTurn)');

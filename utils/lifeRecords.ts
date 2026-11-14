@@ -1,3 +1,4 @@
+import { withReplyCancellation, type ReplyRun } from './chatReplyCancellation';
 
 import { DB } from './db';
 import {
@@ -5,7 +6,8 @@ import {
     LifeRecordSettings, MedPlan, Message,
 } from '../types';
 import { addLocalDays, getLocalDateKey } from './localDate';
-import { formatMoney, sumMoney } from './format';
+import { formatMoney } from './format';
+import { isExpense, ledgerTotals, parseLedgerAmount, transactionType } from './bankLedger';
 
 /**
  * 生活记录（档案 App：生理期 / 药盒 / 记账 / 锻炼）
@@ -14,7 +16,7 @@ import { formatMoney, sumMoney } from './format';
  *  1. 注入（读路径）：buildLifeRecordInjection —— 按角色开关把今日摘要 + 潜意识约束 +
  *     [[LIFE:...]] 指令说明 + 否决反馈拼成 system prompt section（chatPrompts 调用）。
  *  2. 代记（写路径）：executeLifeDirectives —— 解析角色输出里的 [[LIFE:...]] 指令，
- *     去重后落库并插入可交互的 life_card 消息（chatParser 调用，本地 / instant push 共用）。
+ *     去重后落库并插入可交互的 life_card 消息（chatParser 调用，本地 / 云端回复共用）。
  *  3. 裁决：resolveLifeRecordCard —— 用户点卡片「确认 / 否决」，否决时回滚（含银行流水）
  *     并给代记角色挂一条一次性反馈（Chat.tsx 调用）。
  *
@@ -177,7 +179,7 @@ export const summarizeLifeRecord = (module: LifeRecordModule, kind: string, payl
     switch (module) {
         case 'period': return kind === 'start' ? '生理期开始' : '生理期结束';
         case 'med': return `吃药 · ${payload.name || '药'}`;
-        case 'expense': return `支出 ${formatMoney(payload.amount)}${payload.note ? `（${payload.note}）` : ''}`;
+        case 'expense': return `${kind === 'income' ? '收入' : '支出'} ${formatMoney(payload.amount)}${payload.note ? `（${payload.note}）` : ''}`;
         case 'exercise': return `锻炼 · ${payload.activity || '运动'}${payload.duration ? ` ${payload.duration}` : ''}`;
     }
 };
@@ -286,21 +288,23 @@ const buildMedSummary = (
 const buildExpenseSummary = (txs: BankTransaction[], today: string, absolute = false): string => {
     if (absolute) {
         const recent = groupRecentByDate(txs, t => t.dateStr, today, 3);
-        if (recent.length === 0) return '- 记账：近期暂无支出记录。';
+        if (recent.length === 0) return '- 记账：近期暂无收支记录。';
         const parts = recent.map(({ date, items }) => {
-            const total = formatMoney(sumMoney(items.map(t => t.amount)));
-            const detail = items.slice(0, 5).map(t => `${t.note || '未备注'} ${formatMoney(t.amount)}`).join('、');
+            const totals = ledgerTotals(items);
+            const total = `支出 ${formatMoney(totals.expense)}、收入 ${formatMoney(totals.income)}`;
+            const detail = items.slice(0, 5).map(t => `${isExpense(t) ? '支出' : '收入'} ${t.note || '未备注'} ${formatMoney(t.amount)}`).join('、');
             const more = items.length > 5 ? ` 等 ${items.length} 笔` : '';
             return `${fmtCN(date)} 共 ${items.length} 笔、合计 ${total}（${detail}${more}）`;
         });
-        return `- 最近支出：${parts.join('；')}。`;
+        return `- 最近收支：${parts.join('；')}。`;
     }
     const todayTx = txs.filter(t => t.dateStr === today);
-    if (todayTx.length === 0) return '- 记账：今日暂无支出记录。';
-    const total = formatMoney(sumMoney(todayTx.map(t => t.amount)));
-    const items = todayTx.slice(0, 8).map(t => `${t.note || '未备注'} ${formatMoney(t.amount)}`).join('、');
+    if (todayTx.length === 0) return '- 记账：今日暂无收支记录。';
+    const totals = ledgerTotals(todayTx);
+    const total = `支出 ${formatMoney(totals.expense)}、收入 ${formatMoney(totals.income)}`;
+    const items = todayTx.slice(0, 8).map(t => `${isExpense(t) ? '支出' : '收入'} ${t.note || '未备注'} ${formatMoney(t.amount)}`).join('、');
     const more = todayTx.length > 8 ? ` 等 ${todayTx.length} 笔` : '';
-    return `- 今日支出：共 ${todayTx.length} 笔、合计 ${total}（${items}${more}）。`;
+    return `- 今日收支：共 ${todayTx.length} 笔、${total}（${items}${more}）。`;
 };
 
 /** 本周（周一起算）的起始日 */
@@ -417,7 +421,7 @@ export const buildLifeRecordInjection = async (
         tools.push(`- TA 明确说生理期来了 → \`[[LIFE:PERIOD_START]]\`；明确说结束了 → \`[[LIFE:PERIOD_END]]\``);
     }
     if (moduleActive('med')) tools.push(`- TA 明确说吃了什么药 → \`[[LIFE:MED|药名]]\``);
-    if (moduleActive('expense')) tools.push(`- TA 明确说花了多少钱买什么 → \`[[LIFE:EXPENSE|金额|用途]]\`（金额是纯数字）`);
+    if (moduleActive('expense')) tools.push(`- TA 明确说花了多少钱买什么 → \`[[LIFE:EXPENSE|金额|用途]]\`；明确说赚到钱、工资或奖金到账 → \`[[LIFE:INCOME|金额|来源]]\`。金额必须为正数，最多两位小数；收入绝不能记成支出。未到账的预期收入、余额和转移自己的钱不代记。`);
     if (moduleActive('exercise')) tools.push(`- TA 明确说做了什么运动 → \`[[LIFE:EXERCISE|运动|时长]]\`（时长可省略）`);
     if (tools.length > 0 && !forFirePack) {
         s += `**代记工具**：只有当 ${userName} 在对话中**明确说出**以下事实时，才单独起一行输出对应指令、帮 TA 顺手记一笔（一次一条）：\n${tools.join('\n')}\n`;
@@ -461,11 +465,12 @@ const parseLifeDirective = (verb: string, args: string[]): LifeDirective | null 
             const name = (args[0] || '').trim();
             return name ? { module: 'med', kind: 'taken', payload: { name } } : null;
         }
-        case 'EXPENSE': {
-            const amount = parseFloat((args[0] || '').replace(/[^\d.]/g, ''));
+        case 'EXPENSE':
+        case 'INCOME': {
+            const amount = parseLedgerAmount(args[0] || '');
             const note = (args[1] || '').trim();
-            if (isNaN(amount) || amount <= 0) return null;
-            return { module: 'expense', kind: 'expense', payload: { amount, note } };
+            if (amount === null) return null;
+            return { module: 'expense', kind: verb === 'INCOME' ? 'income' : 'expense', payload: { amount, note } };
         }
         case 'EXERCISE': {
             const activity = (args[0] || '').trim();
@@ -515,6 +520,7 @@ const findDuplicate = async (
             const txs = await DB.getAllTransactions().catch(() => [] as BankTransaction[]);
             const hit = txs.find(t =>
                 t.dateStr === today
+                && transactionType(t) === d.kind
                 && t.amount === d.payload.amount
                 && (t.note || '') === (d.payload.note || '')
                 // 老数据缺 timestamp 时保守按"重复"处理（回到旧行为），避免陈年脏数据被翻倍入账
@@ -551,8 +557,11 @@ export const executeLifeDirectives = async (
     messageTimestamp?: number,
     /** 这一轮消息统一继承的 metadata（主动消息 2.0 的标记，见 chatParser 的同名参数）。 */
     inheritMeta?: Record<string, any>,
+    replyRun?: ReplyRun,
 ): Promise<string> => {
     /** 生活卡跟同一条消息的正文气泡共用一个时间戳，别一条消息两个时间。 */
+    const replyStep = <T>(operation: () => Promise<T>) => withReplyCancellation(replyRun, operation);
+    replyRun?.check();
     const stamp = messageTimestamp != null ? { timestamp: messageTimestamp } : {};
     /** 卡片自己的字段优先，inheritMeta 只补它没有的键。 */
     const withInherited = (meta: Record<string, any>) => (inheritMeta ? { ...inheritMeta, ...meta } : meta);
@@ -563,7 +572,7 @@ export const executeLifeDirectives = async (
     let executed = 0;
     const MAX_PER_MESSAGE = 4; // 防 LLM 发疯连打十几条
     // 全局隐藏的模块：即使角色开关全开也不记（用户长按隐藏 = 不想看到这类内容），但会留条提示
-    const hidden = getHiddenLifeModules(await DB.getLifeRecordSettings().catch(() => null));
+    const hidden = getHiddenLifeModules(await replyStep(async () => DB.getLifeRecordSettings().catch(() => null)));
 
     /**
      * 想记但没记成（开关关了 / 模块被隐藏）时留一条系统提示。
@@ -573,13 +582,14 @@ export const executeLifeDirectives = async (
      */
     const noteSkipped = async (summary: string, reason: string) => {
         try {
-            await DB.saveMessage({
+            await replyStep(async () => (replyRun?.saveMessage ?? DB.saveMessage)({
                 ...stamp,
                 charId: char.id, role: 'system', type: 'text',
                 content: `[系统: ${char.name}想帮你记「${summary}」，但${reason}，这次没记成]`,
                 metadata: withInherited({ lifeRecordSkipped: true }),
-            });
+            }));
         } catch (e) {
+            replyRun?.check();
             console.warn('[LifeRecord] 记不成的提示也没落进去:', e);
         }
     };
@@ -598,21 +608,21 @@ export const executeLifeDirectives = async (
 
         const skipSummary = summarizeLifeRecord(d.module, d.kind, d.payload);
         if (!isLifeRecordOn(char)) {
-            await noteSkipped(skipSummary, '生活记录功能已关闭');
+            await replyStep(async () => noteSkipped(skipSummary, '生活记录功能已关闭'));
             continue;
         }
         if (!isLifeModuleOn(char, d.module) || hidden.has(d.module)) {
-            await noteSkipped(skipSummary, `「${LIFE_MODULE_LABELS[d.module]}」已关闭`);
+            await replyStep(async () => noteSkipped(skipSummary, `「${LIFE_MODULE_LABELS[d.module]}」已关闭`));
             continue;
         }
 
         try {
-            const records = await DB.getAllLifeRecords();
-            const dup = await findDuplicate(d, records, today);
+            const records = await replyStep(async () => DB.getAllLifeRecords());
+            const dup = await replyStep(async () => findDuplicate(d, records, today));
             const summary = summarizeLifeRecord(d.module, d.kind, d.payload);
 
             if (dup) {
-                await DB.saveMessage({
+                await replyStep(async () => (replyRun?.saveMessage ?? DB.saveMessage)({
                     ...stamp,
                     charId: char.id, role: 'assistant', type: 'life_card',
                     content: `[生活记录：${summary}（已有记录，未重复添加）]`,
@@ -620,7 +630,7 @@ export const executeLifeDirectives = async (
                         module: d.module, kind: d.kind, summary, dateStr: today,
                         recordedByName: char.name, duplicate: true, duplicateBy: dup.byName,
                     }),
-                });
+                }));
                 addToast(`${char.name} 想记「${summary}」，已有记录`, 'info');
                 continue;
             }
@@ -631,12 +641,13 @@ export const executeLifeDirectives = async (
                 const tx: BankTransaction = {
                     id: `tx-life-${Date.now()}-${Math.floor(Math.random() * 1e4)}`,
                     amount: d.payload.amount,
+                    type: d.kind === 'income' ? 'income' : 'expense',
                     category: 'general',
                     note: d.payload.note || `${char.name}代记`,
                     timestamp: Date.now(),
                     dateStr: today,
                 };
-                await DB.saveTransaction(tx);
+                await replyStep(async () => DB.saveTransaction(tx));
                 bankTxId = tx.id;
             }
 
@@ -648,9 +659,9 @@ export const executeLifeDirectives = async (
                 reviewStatus: 'active',
                 ...(bankTxId ? { bankTxId } : {}),
             };
-            await DB.saveLifeRecord(record);
+            await replyStep(async () => DB.saveLifeRecord(record));
 
-            await DB.saveMessage({
+            await replyStep(async () => (replyRun?.saveMessage ?? DB.saveMessage)({
                 ...stamp,
                 charId: char.id, role: 'assistant', type: 'life_card',
                 content: `[生活记录：${summary}]`,
@@ -658,9 +669,10 @@ export const executeLifeDirectives = async (
                     recordId: record.id, module: d.module, kind: d.kind, summary,
                     dateStr: today, recordedByName: char.name, reviewStatus: 'active',
                 }),
-            });
+            }));
             addToast(`${char.name} 帮你记录了「${summary}」`, 'success');
         } catch (e) {
+            replyRun?.check();
             console.error('[LifeRecord] directive failed:', verb, e);
         }
     }
