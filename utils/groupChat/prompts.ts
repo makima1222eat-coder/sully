@@ -90,7 +90,7 @@ export function buildGroupHistoryBlock(
     emojis: EmojiItem[],
     userName: string = '用户',
     maxAttachedImages: number = 3,
-    options?: { useVisionDescriptions?: boolean },
+    options?: { useVisionDescriptions?: boolean; timeAwarenessEnabled?: boolean },
 ): GroupHistoryBlock {
     const nameOf = (id: string) => (id === 'user' ? userName : characters.find(c => c.id === id)?.name || '成员');
     const now = Date.now();
@@ -114,11 +114,11 @@ export function buildGroupHistoryBlock(
     msgs.forEach((m, i) => {
         // 相邻消息隔得久时插一条分隔行，让导演直接在记录里"看见"时间跳变——
         // 否则用户隔几天回来发一句，模型会把几天前那条当"刚才"无缝续上旧话题。
-        if (prevTs != null && typeof m.timestamp === 'number' && m.timestamp - prevTs >= GROUP_HISTORY_GAP_THRESHOLD_MS) {
+        if (options?.timeAwarenessEnabled !== false && prevTs != null && typeof m.timestamp === 'number' && m.timestamp - prevTs >= GROUP_HISTORY_GAP_THRESHOLD_MS) {
             lines.push(`———（这里隔了 ${formatGapDuration(m.timestamp - prevTs)}，中间群里没人说话）———`);
         }
         if (typeof m.timestamp === 'number') prevTs = m.timestamp;
-        const timePrefix = typeof m.timestamp === 'number' ? `[${formatRelativeAge(m.timestamp, now)}] ` : '';
+        const timePrefix = options?.timeAwarenessEnabled !== false && typeof m.timestamp === 'number' ? `[${formatRelativeAge(m.timestamp, now)}] ` : '';
 
         let name = '用户';
         if (m.role === 'assistant') {

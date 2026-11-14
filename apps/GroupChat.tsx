@@ -556,6 +556,7 @@ const GroupChat: React.FC = () => {
     
     // Create/Edit Group State
     const [tempGroupName, setTempGroupName] = useState('');
+    const [tempTimeAwarenessEnabled, setTempTimeAwarenessEnabled] = useState(true);
     const [tempPrivateContextCap, setTempPrivateContextCap] = useState<number>(80);
     const [tempMemberTimelineCap, setTempMemberTimelineCap] = useState<number>(DEFAULT_MEMBER_TIMELINE_CAP);
     const [tempReplyMode, setTempReplyMode] = useState<'director' | 'roundRobin'>('director');
@@ -841,6 +842,7 @@ const GroupChat: React.FC = () => {
         if (!activeGroup) return;
         const updates = {
             name: tempGroupName || activeGroup.name,
+            timeAwarenessEnabled: tempTimeAwarenessEnabled,
             privateContextCap: tempPrivateContextCap,
             memberTimelineCap: tempMemberTimelineCap,
             replyMode: tempReplyMode,
@@ -1142,6 +1144,7 @@ const GroupChat: React.FC = () => {
 
     const openGroupSettings = () => {
         setTempGroupName(activeGroup?.name || '');
+        setTempTimeAwarenessEnabled(activeGroup?.timeAwarenessEnabled !== false);
         setTempPrivateContextCap(activeGroup?.privateContextCap ?? 80);
         setTempMemberTimelineCap(activeGroup?.memberTimelineCap ?? DEFAULT_MEMBER_TIMELINE_CAP);
         setTempReplyMode(activeGroup?.replyMode ?? 'director');
@@ -1193,8 +1196,7 @@ const GroupChat: React.FC = () => {
 
         const header = `【系统：群聊模拟器配置】
 当前群名: "${activeGroup?.name}"
-当前系统时间: ${currentTimeStr}
-时间流逝感知: ${timeGapInfo}
+${activeGroup?.timeAwarenessEnabled !== false ? `当前系统时间: ${currentTimeStr}\n时间流逝感知: ${timeGapInfo}` : ''}
 
 ${sharedScene.text}${activeGroup ? buildGroupTopicContext(activeGroup) : ''}`;
         return { header, sharedScene };
@@ -1206,6 +1208,7 @@ ${sharedScene.text}${activeGroup ? buildGroupTopicContext(activeGroup) : ''}`;
         currentMsgs: Message[],
         sharedScene: ReturnType<typeof ContextBuilder.buildGroupSharedScene>,
     ): Promise<string> => {
+        const timeAware = activeGroup?.timeAwarenessEnabled !== false;
         const timelineCap = activeGroup?.memberTimelineCap ?? DEFAULT_MEMBER_TIMELINE_CAP;
         // 记忆宫殿检索源用当前群线程（滤掉媒体消息，base64 不能进 embedding query）：
         // 角色应召回与"群里正聊的话题"相关的记忆，而不是私聊近况（旧行为，召回跑偏）
@@ -1219,15 +1222,16 @@ ${sharedScene.text}${activeGroup ? buildGroupTopicContext(activeGroup) : ''}`;
             skipWorldbookIds: sharedScene.sharedWorldbookIds,
             headerOverride: `[Group Member Profile: ${member.name}]`,
         // conversational：群聊同样是用户正在说话的场合（见 buildTimeAwarenessBlock）
-        }, { worldbookMessages: liveGroupMsgs, conversational: true });
+        }, { worldbookMessages: liveGroupMsgs, conversational: true, skipTimeAwareness: !timeAware });
         // Get private gap string
-        const privateGapInfo = await getPrivateTimeGap(member.id);
+        const privateGapInfo = timeAware ? await getPrivateTimeGap(member.id) : '';
 
         // 私聊+群聊合并时间线：让角色看清两条线的先后关系，感情才能衔接。
         // includeProcessed=true——被宫殿归档的私聊也是"底色"，不能漏
         const privateMsgs = await DB.getRecentMessagesByCharId(member.id, timelineCap, true);
         const memberTimeline = buildMemberTimeline({
             privateMsgs,
+            timeAwarenessEnabled: timeAware,
             groupMsgs: liveGroupMsgs,
             cap: timelineCap,
             resolveSpeaker: (m) => m.charId === member.id
@@ -1243,8 +1247,8 @@ ${sharedScene.text}${activeGroup ? buildGroupTopicContext(activeGroup) : ''}`;
 ${coreContext}
 
 [重点：私聊状态 (Private Context)]:
-- **私聊空窗期**: ${privateGapInfo}
-- **重要指令**: 如果 [私聊空窗期] 显示 "刚刚" 或 "几小时前"，请【忽略】群聊的时间流逝感知。哪怕群里很久没说话，只要你和用户私底下刚聊过，就【严禁】说 "好久不见" 或表现出疏离感。
+${timeAware ? `- **私聊空窗期**: ${privateGapInfo}
+- **重要指令**: 如果 [私聊空窗期] 显示 "刚刚" 或 "几小时前"，请【忽略】群聊的时间流逝感知。哪怕群里很久没说话，只要你和用户私底下刚聊过，就【严禁】说 "好久不见" 或表现出疏离感。` : ''}
 - 你的近期互动时间线（按时间排序；[私聊]=你和用户单独聊的，别人看不见；[群聊]=本群公开记录。仅作为你内心状态的底色，不要变成默认反应模板）：
 ${memberTimeline || '(暂无互动记录)'}
 - **先认清 U**：群聊里的用户，就是你一直在私聊、记忆和印象里认识的同一个人。已经建立的关系、承诺和亲密程度继续成立；公开场合可以换一种表达方式，但不能重置关系或突然把 U 当成普通陌生群友。
@@ -1428,7 +1432,7 @@ ${memberTimeline || '(暂无互动记录)'}
                 emojis,
                 userProfile.name,
                 3,
-                { useVisionDescriptions: apiConfig.visionApi?.enabled === true },
+                { useVisionDescriptions: apiConfig.visionApi?.enabled === true, timeAwarenessEnabled: activeGroup.timeAwarenessEnabled },
             );
             const emojiContextStr = buildEmojiContextStr(emojis, categories, activeGroup.members);
             // HTML 模块模式：群开关开启时追加提示词。导演模式输出的是 JSON 数组，
@@ -1545,7 +1549,7 @@ ${memberTimeline || '(暂无互动记录)'}
                         emojis,
                         userProfile.name,
                         3,
-                        { useVisionDescriptions: apiConfig.visionApi?.enabled === true },
+                        { useVisionDescriptions: apiConfig.visionApi?.enabled === true, timeAwarenessEnabled: activeGroup.timeAwarenessEnabled },
                     );
                     const emojiContextStr = buildEmojiContextStr(emojis, categories, activeGroup.members);
                     const htmlPromptExt = activeGroup.htmlModeEnabled
@@ -2110,6 +2114,18 @@ ${memberTimeline || '(暂无互动记录)'}
                         </div>
                     </div>
 
+                    <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-3">
+                        <div>
+                            <div className="text-xs font-bold text-slate-700">时间感知</div>
+                            <p className="text-[9px] text-slate-400 mt-1">关闭后不向模型发送当前时间、消息时间戳或回复间隔。</p>
+                        </div>
+                        <button type="button" role="switch" aria-label="群聊时间感知" aria-checked={tempTimeAwarenessEnabled}
+                            onClick={() => setTempTimeAwarenessEnabled(v => !v)}
+                            className={`w-11 h-6 rounded-full transition-colors relative shrink-0 ${tempTimeAwarenessEnabled ? 'bg-violet-500' : 'bg-slate-200'}`}>
+                            <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow transition-all ${tempTimeAwarenessEnabled ? 'left-[22px]' : 'left-0.5'}`} />
+                        </button>
+                    </div>
+
                     {/* Context Limit */}
                     <div className="pt-2 border-t border-slate-100">
                         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 block">AI 上下文条数 ({contextLimit})</label>
@@ -2121,9 +2137,9 @@ ${memberTimeline || '(暂无互动记录)'}
                     {/* Private Chat Group Context Cap */}
                     <div className="pt-2 border-t border-slate-100">
                         <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 block">私聊里"近期群活动"取条数 ({tempPrivateContextCap})</label>
-                        <input type="range" min="20" max="500" step="10" value={tempPrivateContextCap} onChange={e => setTempPrivateContextCap(parseInt(e.target.value))} className="w-full h-2 bg-slate-200 rounded-full appearance-none accent-violet-500" />
-                        <div className="flex justify-between text-[10px] text-slate-400 mt-1"><span>20 (省流)</span><span>500 (完整)</span></div>
-                        <p className="text-[9px] text-slate-400 mt-1 leading-tight">本群成员在自己的私聊里，最多看到本群最近多少条消息作为"近期群活动"上下文。</p>
+                        <input type="range" min="0" max="500" step="10" value={tempPrivateContextCap} onChange={e => setTempPrivateContextCap(parseInt(e.target.value))} className="w-full h-2 bg-slate-200 rounded-full appearance-none accent-violet-500" />
+                        <div className="flex justify-between text-[10px] text-slate-400 mt-1"><span>0 (关闭)</span><span>500 (完整)</span></div>
+                        <p className="text-[9px] text-slate-400 mt-1 leading-tight">本群成员在自己的私聊里，最多看到本群最近多少条消息作为"近期群活动"上下文。设为 0 时不注入本群近期消息；已归档的话题盒卡片保留。</p>
                     </div>
 
                     {/* Member Timeline Cap */}

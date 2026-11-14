@@ -43,3 +43,26 @@ describe('群聊背景注入 · 发言人真实标注', () => {
         expect(injected).not.toContain('Member:');
     });
 });
+
+
+describe('群聊背景开关', () => {
+    it('同步条数为 0 时不注入该群，其他群仍按上限注入', async () => {
+        await DB.saveMessage({ charId: 'user', groupId: 'g-zero', role: 'user', type: 'text', content: '零条群的消息' } as any);
+        await DB.saveMessage({ charId: 'user', groupId: 'g-on', role: 'user', type: 'text', content: '正常群的消息' } as any);
+        const parts = await ChatPrompts.buildSystemPromptParts(charA, userProfile, [
+            { id: 'g-zero', name: '关闭群', members: ['char-a'], privateContextCap: 0 },
+            { id: 'g-on', name: '开启群', members: ['char-a'], privateContextCap: 10 },
+        ] as any, [], [], []);
+        expect(parts.volatileState).not.toContain('零条群的消息');
+        expect(parts.volatileState).toContain('正常群的消息');
+    });
+
+    it('群关闭时间感知时，单聊开启也不会为该群记录附加时间', async () => {
+        await DB.saveMessage({ charId: 'user', groupId: 'g-notime', role: 'user', type: 'text', content: '明天八点见', timestamp: 1000 } as any);
+        const parts = await ChatPrompts.buildSystemPromptParts(charA, userProfile, [
+            { id: 'g-notime', name: '无时间群', members: ['char-a'], timeAwarenessEnabled: false },
+        ] as any, [], [], []);
+        const line = parts.volatileState.split('\n').find(line => line.includes('明天八点见'));
+        expect(line).toBe('[Group: 无时间群] 条条: 明天八点见');
+    });
+});
