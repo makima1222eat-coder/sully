@@ -92,3 +92,14 @@ describe('群聊中的 U 与关系连续性', () => {
         expect(prompt).toContain('按你自己和 U 的关系反应');
     });
 });
+
+
+describe('群聊关闭时间感知', () => {
+    it('移除相对时间和跨日间隔，保留用户自己说的时间', () => {
+        const history = buildGroupHistoryBlock([
+            msg(1, 'assistant', '在吗', 1000, 'c1'),
+            msg(2, 'user', '明天八点见', 1000 + 3 * 86400000),
+        ], [char('c1', '小夏')], [], '用户', 3, { timeAwarenessEnabled: false });
+        expect(history.text).toBe('小夏: 在吗\n用户: 明天八点见');
+    });
+});

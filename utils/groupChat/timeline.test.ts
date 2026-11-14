@@ -68,3 +68,13 @@ describe('buildMemberTimeline', () => {
         expect(buildMemberTimeline({ privateMsgs: [], groupMsgs: [], cap: 40, resolveSpeaker })).toBe('');
     });
 });
+
+
+it('关闭时间感知时保留来源和顺序，不附加时间', () => {
+    const text = buildMemberTimeline({
+        privateMsgs: [msg({ role: 'user', content: '明天见', timestamp: 2000 })],
+        groupMsgs: [msg({ content: '早啊', timestamp: 1000 })],
+        cap: 40, resolveSpeaker, timeAwarenessEnabled: false,
+    });
+    expect(text).toBe('[群聊] 小夏: 早啊\n[私聊] 用户: 明天见');
+});

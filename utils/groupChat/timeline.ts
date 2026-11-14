@@ -20,6 +20,7 @@ const formatTime = (ts: number): string => {
 };
 
 export interface MemberTimelineOptions {
+    timeAwarenessEnabled?: boolean;
     /** 该成员的私聊消息（建议 DB.getRecentMessagesByCharId(id, cap, true) 取最近 cap 条） */
     privateMsgs: Message[];
     /** 群聊消息（当前群，内存里已有的即可） */
@@ -58,7 +59,8 @@ export function buildMemberTimeline(opts: MemberTimelineOptions): string {
             // 私聊行的"我"= 该成员本人；群聊行用真名，成员才能分清谁说的
             const speaker = m.role === 'user' ? '用户' : (isGroup ? resolveSpeaker(m) : '我');
             const text = truncate(messageLogText(m, stickerName), LINE_MAX_CHARS);
-            return `${tag}[${formatTime(m.timestamp)} · ${formatRelativeAge(m.timestamp)}] ${speaker}: ${text}`;
+            const time = opts.timeAwarenessEnabled !== false ? `[${formatTime(m.timestamp)} · ${formatRelativeAge(m.timestamp)}]` : '';
+            return `${tag}${time} ${speaker}: ${text}`;
         })
         .join('\n');
 }

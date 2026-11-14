@@ -3117,6 +3117,8 @@ export interface CharacterGroup {
 }
 
 export interface GroupProfile {
+    /** 群聊时间感知：默认开启；关闭后不注入系统时间、消息时间或互动间隔。 */
+    timeAwarenessEnabled?: boolean;
     id: string;
     name: string;
     members: string[];
@@ -3130,7 +3132,7 @@ export interface GroupProfile {
     topicArchiveMode?: 'auto' | 'manual';
     /**
      * 私聊里"近期群活动"上下文从这个群最多取最后多少条消息。
-     * 不设默认 80。设大点能让活跃群更完整，设小点节省 token、避免某个活跃群把其他群挤掉。
+     * 不设默认 80；0 表示不注入近期群活动。设大点能让活跃群更完整，设小点节省 token、避免某个活跃群把其他群挤掉。
      */
     privateContextCap?: number;
     /**
